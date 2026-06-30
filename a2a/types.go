@@ -1,0 +1,355 @@
+package a2a
+
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+)
+
+// ---------------------------------------------------------------------------
+// Agent Card
+// ---------------------------------------------------------------------------
+
+// AgentCard is a self-describing manifest for an agent, published at
+// /.well-known/agent.json.
+type AgentCard struct {
+	Name               string              `json:"name"`
+	Description        string              `json:"description,omitempty"`
+	URL                string              `json:"url"`
+	Version            string              `json:"version,omitempty"`
+	DocumentationURL   string              `json:"documentationUrl,omitempty"`
+	Provider           *AgentProvider      `json:"provider,omitempty"`
+	Capabilities       AgentCapabilities   `json:"capabilities"`
+	Authentication     *AgentAuthentication `json:"authentication,omitempty"`
+	DefaultInputModes  []string            `json:"defaultInputModes,omitempty"`
+	DefaultOutputModes []string            `json:"defaultOutputModes,omitempty"`
+	Skills             []AgentSkill        `json:"skills,omitempty"`
+}
+
+// AgentProvider describes the organization or individual providing the agent.
+type AgentProvider struct {
+	Organization string `json:"organization,omitempty"`
+	URL          string `json:"url,omitempty"`
+}
+
+// AgentCapabilities defines optional capabilities supported by an agent.
+type AgentCapabilities struct {
+	Streaming              bool `json:"streaming,omitempty"`
+	PushNotifications      bool `json:"pushNotifications,omitempty"`
+	StateTransitionHistory bool `json:"stateTransitionHistory,omitempty"`
+}
+
+// AgentAuthentication describes the authentication requirements.
+type AgentAuthentication struct {
+	Schemes []string `json:"schemes,omitempty"`
+}
+
+// AgentSkill describes a specific skill the agent can perform.
+type AgentSkill struct {
+	ID          string         `json:"id"`
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Tags        []string       `json:"tags,omitempty"`
+	Examples    []string       `json:"examples,omitempty"`
+	InputModes  []string       `json:"inputModes,omitempty"`
+	OutputModes []string       `json:"outputModes,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// Task
+// ---------------------------------------------------------------------------
+
+// TaskState represents the lifecycle state of a task.
+type TaskState string
+
+const (
+	TaskStateSubmitted     TaskState = "submitted"
+	TaskStateWorking       TaskState = "working"
+	TaskStateInputRequired TaskState = "input-required"
+	TaskStateCompleted     TaskState = "completed"
+	TaskStateFailed        TaskState = "failed"
+	TaskStateCanceled      TaskState = "canceled"
+)
+
+// Task is the fundamental unit of work managed by A2A.
+type Task struct {
+	ID        string         `json:"id"`
+	SessionID string         `json:"sessionId,omitempty"`
+	State     TaskState      `json:"state"`
+	Messages  []Message      `json:"messages,omitempty"`
+	Artifacts []Artifact     `json:"artifacts,omitempty"`
+	History   []TaskStatus   `json:"history,omitempty"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
+}
+
+// TaskStatus represents a historical status entry for a task.
+type TaskStatus struct {
+	State     TaskState `json:"state"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// ---------------------------------------------------------------------------
+// Message and Part
+// ---------------------------------------------------------------------------
+
+// Role represents the sender of a message.
+type Role string
+
+const (
+	RoleUser  Role = "user"
+	RoleAgent Role = "agent"
+)
+
+// Message is a communication turn between a client and a remote agent.
+type Message struct {
+	Role  string `json:"role"`
+	Parts []Part `json:"parts"`
+}
+
+// PartType identifies the kind of content in a Part.
+type PartType string
+
+const (
+	PartTypeText PartType = "text"
+	PartTypeFile PartType = "file"
+	PartTypeData PartType = "data"
+)
+
+// Part is the fundamental content unit within a Message or Artifact.
+type Part struct {
+	Type PartType `json:"type"`
+
+	// Text part
+	Text string `json:"text,omitempty"`
+
+	// File part
+	File *FilePart `json:"file,omitempty"`
+
+	// Data part
+	Data *DataPart `json:"data,omitempty"`
+}
+
+// FilePart represents a file reference.
+type FilePart struct {
+	Name     string `json:"name,omitempty"`
+	MIMEType string `json:"mimeType,omitempty"`
+	Bytes    string `json:"bytes,omitempty"` // base64 encoded
+	URI      string `json:"uri,omitempty"`   // external reference
+}
+
+// DataPart represents structured JSON data.
+type DataPart struct {
+	MIMEType string         `json:"mimeType,omitempty"`
+	Data     map[string]any `json:"data"`
+}
+
+// ---------------------------------------------------------------------------
+// Artifact
+// ---------------------------------------------------------------------------
+
+// Artifact is an output generated by the agent as a result of a task.
+type Artifact struct {
+	Name      string         `json:"name,omitempty"`
+	Parts     []Part         `json:"parts"`
+	Index     int            `json:"index,omitempty"`
+	Append    *bool          `json:"append,omitempty"`
+	LastChunk *bool          `json:"lastChunk,omitempty"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// JSON-RPC 2.0 Types
+// ---------------------------------------------------------------------------
+
+// JSONRPCRequest is a JSON-RPC 2.0 request.
+type JSONRPCRequest struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      any             `json:"id,omitempty"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+// JSONRPCResponse is a JSON-RPC 2.0 response.
+type JSONRPCResponse struct {
+	JSONRPC string        `json:"jsonrpc"`
+	ID      any           `json:"id,omitempty"`
+	Result  any           `json:"result,omitempty"`
+	Error   *JSONRPCError `json:"error,omitempty"`
+}
+
+// JSONRPCError represents a JSON-RPC 2.0 error.
+type JSONRPCError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    any    `json:"data,omitempty"`
+}
+
+func (e *JSONRPCError) Error() string {
+	return fmt.Sprintf("jsonrpc error %d: %s", e.Code, e.Message)
+}
+
+// Standard JSON-RPC error codes.
+const (
+	JSONRPCParseError     = -32700
+	JSONRPCInvalidRequest = -32600
+	JSONRPCMethodNotFound = -32601
+	JSONRPCInvalidParams  = -32602
+	JSONRPCInternalError  = -32603
+
+	// A2A-specific error codes.
+	A2AErrorTaskNotFound            = -32001
+	A2AErrorTaskNotCancelable       = -32002
+	A2AErrorPushNotSupported        = -32003
+	A2AErrorUnsupportedOperation    = -32004
+	A2AErrorContentTypeNotSupported = -32005
+)
+
+// ---------------------------------------------------------------------------
+// Request/Response Params
+// ---------------------------------------------------------------------------
+
+// SendTaskRequest params for tasks/send.
+type SendTaskRequest struct {
+	ID        string         `json:"id"`
+	SessionID string         `json:"sessionId,omitempty"`
+	Message   Message        `json:"message"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
+
+	inputOverride string
+}
+
+// GetTaskRequest params for tasks/get.
+type GetTaskRequest struct {
+	ID            string `json:"id"`
+	HistoryLength int    `json:"historyLength,omitempty"`
+}
+
+// CancelTaskRequest params for tasks/cancel.
+type CancelTaskRequest struct {
+	ID string `json:"id"`
+}
+
+// QueryTasksRequest params for tasks/query.
+type QueryTasksRequest struct {
+	SessionID string    `json:"sessionId,omitempty"`
+	State     TaskState `json:"state,omitempty"`
+	Limit     int       `json:"limit,omitempty"`
+}
+
+// QueryTasksResult is the result for tasks/query.
+type QueryTasksResult struct {
+	Tasks []*Task `json:"tasks"`
+}
+
+// SetPushNotificationRequest params.
+type SetPushNotificationRequest struct {
+	ID     string                 `json:"id"`
+	Config PushNotificationConfig `json:"config"`
+}
+
+// PushNotificationConfig describes a webhook endpoint for async updates.
+type PushNotificationConfig struct {
+	URL     string            `json:"url"`
+	Token   string            `json:"token,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// SSE Streaming
+// ---------------------------------------------------------------------------
+
+// TaskUpdateEvent is an SSE event for task status or artifact updates.
+type TaskUpdateEvent struct {
+	ID       any           `json:"id"`
+	Result   *Task         `json:"result,omitempty"`
+	Artifact *Artifact     `json:"artifact,omitempty"`
+	Error    *JSONRPCError `json:"error,omitempty"`
+	Final    bool          `json:"final,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// NewTextPart creates a text part.
+func NewTextPart(text string) Part {
+	return Part{Type: PartTypeText, Text: text}
+}
+
+// NewDataPart creates a data part.
+func NewDataPart(data map[string]any) Part {
+	return Part{Type: PartTypeData, Data: &DataPart{Data: data}}
+}
+
+// NewFilePartBytes creates a file part from base64 bytes.
+func NewFilePartBytes(name, mimeType, bytes string) Part {
+	return Part{Type: PartTypeFile, File: &FilePart{Name: name, MIMEType: mimeType, Bytes: bytes}}
+}
+
+// NewFilePartURI creates a file part from a URI.
+func NewFilePartURI(name, mimeType, uri string) Part {
+	return Part{Type: PartTypeFile, File: &FilePart{Name: name, MIMEType: mimeType, URI: uri}}
+}
+
+// ---------------------------------------------------------------------------
+// Input Mode Validation
+// ---------------------------------------------------------------------------
+
+// ValidateInputModes checks if the requested input modes are supported by the agent.
+func ValidateInputModes(requested []string, supported []string) error {
+	if len(requested) == 0 || len(supported) == 0 {
+		return nil
+	}
+	supportedSet := make(map[string]struct{}, len(supported))
+	for _, m := range supported {
+		supportedSet[m] = struct{}{}
+	}
+	for _, m := range requested {
+		if _, ok := supportedSet[m]; !ok {
+			return fmt.Errorf("unsupported input mode: %q", m)
+		}
+	}
+	return nil
+}
+
+// ValidateOutputModes checks if the requested output modes are supported by the agent.
+func ValidateOutputModes(requested []string, supported []string) error {
+	if len(requested) == 0 || len(supported) == 0 {
+		return nil
+	}
+	supportedSet := make(map[string]struct{}, len(supported))
+	for _, m := range supported {
+		supportedSet[m] = struct{}{}
+	}
+	for _, m := range requested {
+		if _, ok := supportedSet[m]; !ok {
+			return fmt.Errorf("unsupported output mode: %q", m)
+		}
+	}
+	return nil
+}
+
+// ExtractInputModes extracts input modes from a message's parts.
+func ExtractInputModes(msg Message) []string {
+	modes := make(map[string]struct{})
+	for _, p := range msg.Parts {
+		switch p.Type {
+		case PartTypeText:
+			modes["text"] = struct{}{}
+		case PartTypeFile:
+			if p.File != nil && p.File.MIMEType != "" {
+				modes[p.File.MIMEType] = struct{}{}
+			} else {
+				modes["file"] = struct{}{}
+			}
+		case PartTypeData:
+			modes["data"] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(modes))
+	for m := range modes {
+		result = append(result, m)
+	}
+	return result
+}
