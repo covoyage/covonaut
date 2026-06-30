@@ -646,4 +646,4 @@ agent := agentcore.New(agentcore.Config{
 
 ## License
 
-MIT
+[MIT](LICENSE)
