@@ -448,6 +448,197 @@ func TestJoinOutputs_Empty(t *testing.T) {
 	}
 }
 
+// ---- State Sharing ----
+
+func TestGraphStateSharing(t *testing.T) {
+	g := NewGraph()
+
+	// Node A writes to shared state.
+	_ = g.AddNode("a", &testStep{name: "a", fn: func(ctx context.Context, input string) (string, error) {
+		gs := GetGraphState(ctx)
+		if gs == nil {
+			t.Fatal("expected GraphState in context")
+		}
+		gs.Set("user", "alice")
+		return "from_a", nil
+	}})
+
+	// Node B reads from shared state (runs in same layer, in parallel).
+	_ = g.AddNode("b", &testStep{name: "b", fn: func(ctx context.Context, input string) (string, error) {
+		gs := GetGraphState(ctx)
+		user := gs.GetString("user")
+		if user == "" {
+			return "no_user", nil
+		}
+		return "hello " + user, nil
+	}})
+
+	_ = g.AddEdge("a", "b")
+
+	cg, err := g.Compile(CompileOptions{
+		EntryNode: "a",
+		StateFn:   func(_ context.Context) *GraphState { return NewGraphState() },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := cg.Run(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "hello alice" {
+		t.Fatalf("expected 'hello alice', got %q", out)
+	}
+}
+
+func TestGraphStateSharingNoStateFn(t *testing.T) {
+	g := NewGraph()
+
+	_ = g.AddNode("a", &testStep{name: "a", fn: func(ctx context.Context, input string) (string, error) {
+		gs := GetGraphState(ctx)
+		if gs != nil {
+			t.Fatal("expected nil GraphState when StateFn is not set")
+		}
+		return "ok", nil
+	}})
+
+	cg, err := g.Compile(CompileOptions{EntryNode: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := cg.Run(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "ok" {
+		t.Fatalf("expected 'ok', got %q", out)
+	}
+}
+
+func TestGraphStateConcurrentAccess(t *testing.T) {
+	g := NewGraph()
+
+	_ = g.AddNode("entry", constStep("entry", "go"))
+	_ = g.AddNode("collector", &testStep{name: "collector", fn: func(ctx context.Context, input string) (string, error) {
+		gs := GetGraphState(ctx)
+		for i := 0; i < 10; i++ {
+			v := gs.Get(fmt.Sprintf("key_%d", i))
+			if v == nil {
+				t.Fatalf("missing key_%d from shared state", i)
+			}
+		}
+		return "all_good", nil
+	}})
+
+	// 10 parallel writer nodes, all reachable from entry.
+	for i := 0; i < 10; i++ {
+		name := fmt.Sprintf("writer_%d", i)
+		i := i
+		_ = g.AddNode(name, &testStep{name: name, fn: func(ctx context.Context, input string) (string, error) {
+			gs := GetGraphState(ctx)
+			gs.Set(fmt.Sprintf("key_%d", i), fmt.Sprintf("val_%d", i))
+			return "ok", nil
+		}})
+		_ = g.AddEdge("entry", name)
+		_ = g.AddEdge(name, "collector")
+	}
+
+	cg, err := g.Compile(CompileOptions{
+		EntryNode: "entry",
+		StateFn:   func(_ context.Context) *GraphState { return NewGraphState() },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := cg.Run(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "all_good" {
+		t.Fatalf("expected 'all_good', got %q", out)
+	}
+}
+
+func TestGraphStateGetMessages(t *testing.T) {
+	gs := NewGraphState()
+	msgs := []agentcore.Message{{Role: agentcore.RoleUser, Content: "hello"}}
+	gs.SetMessages("history", msgs)
+
+	got := gs.GetMessages("history")
+	if len(got) != 1 || got[0].Content != "hello" {
+		t.Fatal("unexpected messages from GraphState")
+	}
+
+	if gs.GetMessages("nonexistent") != nil {
+		t.Fatal("expected nil for missing key")
+	}
+}
+
+func TestRunnerDAGStateSharing(t *testing.T) {
+	g := NewGraph()
+	_ = g.AddNode("a", &testStep{name: "a", fn: func(ctx context.Context, input string) (string, error) {
+		GetGraphState(ctx).Set("key", "val")
+		return "from_a", nil
+	}})
+	_ = g.AddNode("b", &testStep{name: "b", fn: func(ctx context.Context, input string) (string, error) {
+		return GetGraphState(ctx).GetString("key"), nil
+	}})
+	_ = g.AddEdge("a", "b")
+
+	cg, err := g.Compile(CompileOptions{
+		EntryNode: "a",
+		StateFn:   func(_ context.Context) *GraphState { return NewGraphState() },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewDAGRunner(cg)
+	out, err := r.Run(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "val" {
+		t.Fatalf("expected 'val', got %q", out)
+	}
+}
+
+func TestRunnerDAGStateFnOverride(t *testing.T) {
+	g := NewGraph()
+	_ = g.AddNode("a", &testStep{name: "a", fn: func(ctx context.Context, input string) (string, error) {
+		gs := GetGraphState(ctx)
+		if gs == nil {
+			return "no_state", nil
+		}
+		return gs.GetString("x"), nil
+	}})
+
+	cg, err := g.Compile(CompileOptions{
+		EntryNode: "a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Override StateFn via RunnerConfig.
+	r := NewDAGRunner(cg, RunnerConfig{
+		StateFn: func(_ context.Context) *GraphState {
+			s := NewGraphState()
+			s.Set("x", "overridden")
+			return s
+		},
+	})
+	out, err := r.Run(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "overridden" {
+		t.Fatalf("expected 'overridden', got %q", out)
+	}
+}
+
 // ---- Interface ----
 
 func TestGraphCompiledGraphImplementsStep(t *testing.T) {

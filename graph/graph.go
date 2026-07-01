@@ -86,6 +86,12 @@ func (cb *conditionalBridge) Run(ctx context.Context, input string) (string, err
 type CompileOptions struct {
 	EntryNode string
 	MaxSteps  int64
+	// StateFn, if set, is called at the start of each Run to create a
+	// GraphState that is shared across all nodes via context. Use
+	// GetGraphState(ctx) inside node implementations to access it.
+	// Nodes in the same layer execute concurrently; the state is
+	// mutex-protected for safe concurrent reads and writes.
+	StateFn GenStateFn
 }
 
 // CompiledGraph is a validated, ready-to-execute DAG.
@@ -96,6 +102,7 @@ type CompiledGraph struct {
 	MaxSteps int64
 	InDegree map[string]int64
 	RevEdges map[string][]string
+	StateFn  GenStateFn
 }
 
 func (g *Graph) Compile(opts CompileOptions) (*CompiledGraph, error) {
@@ -136,6 +143,7 @@ func (g *Graph) Compile(opts CompileOptions) (*CompiledGraph, error) {
 		MaxSteps: maxSteps,
 		InDegree: inDegree,
 		RevEdges: revEdges,
+		StateFn:  opts.StateFn,
 	}, nil
 }
 
@@ -172,6 +180,12 @@ func topoSort(nodes map[string]Step, edges map[string][]string, inDegreeOrig map
 
 // Run executes the compiled graph.
 func (cg *CompiledGraph) Run(ctx context.Context, input string) (string, error) {
+	if cg.StateFn != nil {
+		state := cg.StateFn(ctx)
+		if state != nil {
+			ctx = WithGraphState(ctx, state)
+		}
+	}
 	outputs := make(map[string]string)
 	outputs[cg.Entry] = ""
 

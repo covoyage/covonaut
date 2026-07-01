@@ -32,6 +32,7 @@ type RunnerConfig struct {
 	Trigger  NodeTriggerMode // all or any
 	MaxSteps int64
 	Store    CheckpointStore // optional: enable checkpointing
+	StateFn  GenStateFn      // optional: per-run GraphState generator
 }
 
 // Runner is the unified execution engine for both DAG and Pregel graphs.
@@ -44,11 +45,13 @@ type Runner struct {
 	entry    string
 	config   RunnerConfig
 	sorted   [][]string // only for DAG mode
+	stateFn  GenStateFn
 }
 
 // NewDAGRunner creates a runner from a CompiledGraph.
 func NewDAGRunner(cg *CompiledGraph, opts ...RunnerConfig) *Runner {
 	cfg := RunnerConfig{Mode: RunModeDAG, Trigger: TriggerAllPredecessors, MaxSteps: cg.MaxSteps}
+	stateFn := cg.StateFn
 	if len(opts) > 0 {
 		cfg = opts[0]
 		if cfg.Mode == "" {
@@ -59,6 +62,9 @@ func NewDAGRunner(cg *CompiledGraph, opts ...RunnerConfig) *Runner {
 		}
 		if cfg.MaxSteps <= 0 {
 			cfg.MaxSteps = cg.MaxSteps
+		}
+		if cfg.StateFn != nil {
+			stateFn = cfg.StateFn
 		}
 	}
 
@@ -74,6 +80,7 @@ func NewDAGRunner(cg *CompiledGraph, opts ...RunnerConfig) *Runner {
 		entry:    cg.Entry,
 		config:   cfg,
 		sorted:   cg.Sorted,
+		stateFn:  stateFn,
 	}
 }
 
@@ -148,6 +155,12 @@ func (r *Runner) Run(ctx context.Context, input string) (string, error) {
 }
 
 func (r *Runner) runDAG(ctx context.Context, input string) (string, error) {
+	if r.stateFn != nil {
+		state := r.stateFn(ctx)
+		if state != nil {
+			ctx = WithGraphState(ctx, state)
+		}
+	}
 	outputs := make(map[string]string)
 	outputs[r.entry] = ""
 
@@ -206,6 +219,12 @@ func (r *Runner) runDAG(ctx context.Context, input string) (string, error) {
 }
 
 func (r *Runner) runPregelStyle(ctx context.Context, input string) (string, error) {
+	if r.stateFn != nil {
+		state := r.stateFn(ctx)
+		if state != nil {
+			ctx = WithGraphState(ctx, state)
+		}
+	}
 	active := []string{r.entry}
 	var steps int64
 
