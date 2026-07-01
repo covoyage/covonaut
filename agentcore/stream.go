@@ -1,6 +1,9 @@
 package agentcore
 
-import "sync"
+import (
+	"strings"
+	"sync"
+)
 
 // StreamReader[T] is a managed stream with explicit lifecycle control.
 // Unlike raw channels, it tracks errors, supports Close() for producer cleanup,
@@ -145,6 +148,23 @@ func Map[I, O any](src *StreamReader[I], fn func(I) (O, error)) *StreamReader[O]
 		}
 	}()
 	return out
+}
+
+// NewStreamFromValue creates a single-element stream containing val.
+func NewStreamFromValue[T any](val T) *StreamReader[T] {
+	s := NewStreamReader[T](1)
+	s.Send(val)
+	s.Close()
+	return s
+}
+
+// CollectString drains a string stream and joins all chunks.
+func CollectString(s *StreamReader[string]) (string, error) {
+	items, err := s.Collect()
+	if err != nil {
+		return "", err
+	}
+	return strings.Join(items, ""), nil
 }
 
 // Merge combines multiple StreamReaders into one. Items arrive in non-deterministic order.

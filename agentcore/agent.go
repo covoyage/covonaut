@@ -96,6 +96,7 @@ type Agent struct {
 	extensions    *ExtensionRegistry
 	contextEngine ContextEngine
 	engineReg     *EngineRegistry
+	interrupted   *InterruptReason
 }
 
 func New(cfg Config) *Agent {
@@ -391,8 +392,8 @@ func (a *Agent) SaveCheckpoint(ctx context.Context) (int64, error) {
 // RestoreLatestCheckpoint loads the latest snapshot for threadID into this agent.
 // If threadID is empty, Config.Checkpoint.ThreadID (or "default") is used.
 // The restored Status is whatever was saved (e.g. StatusFinished after a completed
-// reply); call State().SetStatus(StatusRunning) before Continue if you intend to
-// extend a finished run with follow-ups.
+// reply, StatusInterrupted after an interrupt); call Resume() to continue from
+// an interrupt, or SetStatus(StatusRunning) before Continue for a normal follow-up.
 func (a *Agent) RestoreLatestCheckpoint(ctx context.Context, threadID string) error {
 	if a.config.Checkpoint == nil || a.config.Checkpoint.Saver == nil {
 		return fmt.Errorf("checkpoint: no saver configured")
@@ -406,6 +407,7 @@ func (a *Agent) RestoreLatestCheckpoint(ctx context.Context, threadID string) er
 		return err
 	}
 	a.state.Restore(snap)
+	a.interrupted = a.state.GetInterruptReason()
 	return nil
 }
 
@@ -497,7 +499,37 @@ func (a *Agent) Continue(ctx context.Context) (string, error) {
 	return output, err
 }
 
-// runLoop is the core turn loop shared by Run and Continue.
+// Interrupted returns the interrupt reason if the agent was interrupted,
+// or nil if it completed normally or hasn't run yet.
+func (a *Agent) Interrupted() *InterruptReason {
+	return a.interrupted
+}
+
+// Resume continues execution after an interrupt. The agent must have
+// StatusInterrupted (check Interrupted() != nil). It replays the
+// conversation from the tool result that triggered the interrupt,
+// allowing the LLM to continue naturally.
+func (a *Agent) Resume(ctx context.Context) (string, error) {
+	ir := a.Interrupted()
+	if ir == nil {
+		return "", fmt.Errorf("agent is not interrupted (status: %s)", a.state.Status())
+	}
+	a.interrupted = nil
+	a.state.ClearInterruptReason()
+	a.state.SetStatus(StatusRunning)
+	a.emit(&AgentStartEvent{
+		baseEvent: newBase(EventAgentStart),
+		AgentName: a.config.Name,
+	})
+	defer a.eventBus.Drain()
+	output, err := a.runLoop(ctx)
+	if err != nil {
+		return "", WrapNodeError(err, "resume")
+	}
+	return output, nil
+}
+
+// runLoop is the core turn loop shared by Run, Continue, and Resume.
 // Outer loop handles follow-up messages; inner loop handles tool call turns.
 // MaxTurns is enforced per runLoop invocation (not cumulative across the session).
 func (a *Agent) runLoop(ctx context.Context) (string, error) {
@@ -736,10 +768,30 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 			}
 
 			if err := a.executeToolCalls(ctx, resp.ToolCalls); err != nil {
+				if IsInterrupt(err) {
+					a.state.SetStatus(StatusInterrupted)
+					a.state.SetInterruptReason(a.interrupted)
+					a.emit(&AgentInterruptEvent{
+						baseEvent: newBase(EventAgentInterrupt),
+						AgentName: a.config.Name,
+						Reason:    a.interrupted,
+					})
+					return "", nil
+				}
 				ne := NewNodeError("tool execution persist failed", err, a.config.Name, fmt.Sprintf("turn:%d", turn))
 				a.state.SetStatus(StatusError)
 				a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
 				return "", ne
+			}
+
+			// Context cancellation during tool execution — exit cleanly.
+			if errors.Is(ctx.Err(), context.Canceled) {
+				a.state.SetStatus(StatusFinished)
+				a.emit(&AgentEndEvent{
+					baseEvent: newBase(EventAgentEnd),
+					AgentName: a.config.Name,
+				})
+				return "", nil
 			}
 			a.emit(&TurnEndEvent{
 				baseEvent: newBase(EventTurnEnd),
@@ -1163,10 +1215,21 @@ func (a *Agent) executeToolCalls(ctx context.Context, calls []ToolCall) error {
 
 	for i, tc := range calls {
 		r := results[i]
+
+		// Skip unexecuted tools (serial mode stopped early after interrupt).
+		if r.ToolCallID == "" && r.ToolName == "" && r.Result == "" && r.Err == nil {
+			continue
+		}
+
 		content := r.Result
 		if r.Err != nil {
 			if errors.Is(r.Err, context.Canceled) {
 				content = "Tool execution was interrupted"
+			} else if IsInterrupt(r.Err) {
+				content = r.Result
+				if content == "" {
+					content = r.Err.Error()
+				}
 			} else {
 				content = fmt.Sprintf("Error: %s", r.Err.Error())
 			}
@@ -1178,6 +1241,20 @@ func (a *Agent) executeToolCalls(ctx context.Context, calls []ToolCall) error {
 			Name:       tc.Name,
 		}); err != nil {
 			return err
+		}
+
+		if IsInterrupt(r.Err) {
+			a.interrupted = &InterruptReason{
+				ToolCallID: tc.ID,
+				ToolName:   tc.Name,
+				Reason:     InterruptMessage(r.Err),
+				Data:       InterruptData(r.Err),
+			}
+			a.state.SetInterruptReason(a.interrupted)
+			if err := a.appendCheckpoint(ctx); err != nil {
+				return err
+			}
+			return ErrInterrupt
 		}
 	}
 	return nil
@@ -1225,6 +1302,12 @@ func (a *Agent) executeWithLoopHooks(ctx context.Context, calls []ToolCall, cb *
 			if modified := a.config.AfterToolCall(ctx, tc, &results[i]); modified != nil {
 				results[i] = *modified
 			}
+		}
+
+		// Stop executing subsequent tools on interrupt so unexecuted
+		// results are skipped by executeToolCalls.
+		if IsInterrupt(results[i].Err) {
+			break
 		}
 	}
 

@@ -149,6 +149,18 @@ func (e *Executor) coreExecute(ctx context.Context, tc ToolCall) (string, error)
 
 	result, err := tool.Func(ctx, json.RawMessage(tc.Arguments))
 	if err != nil {
+		// Interrupt signals pass through without wrapping so the result
+		// string and the interrupt error are both preserved.
+		if IsInterrupt(err) {
+			var resultStr string
+			if str, ok := result.(string); ok {
+				resultStr = str
+			} else if result != nil {
+				data, _ := json.Marshal(result)
+				resultStr = string(data)
+			}
+			return resultStr, err
+		}
 		return "", fmt.Errorf("tool %s execution failed: %w", tc.Name, err)
 	}
 

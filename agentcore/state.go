@@ -8,10 +8,11 @@ import (
 type Status string
 
 const (
-	StatusIdle     Status = "idle"
-	StatusRunning  Status = "running"
-	StatusFinished Status = "finished"
-	StatusError    Status = "error"
+	StatusIdle         Status = "idle"
+	StatusRunning      Status = "running"
+	StatusFinished     Status = "finished"
+	StatusError        Status = "error"
+	StatusInterrupted  Status = "interrupted"
 )
 
 // AgentState holds the mutable conversation state across turns.
@@ -22,6 +23,7 @@ type AgentState struct {
 	turn           int64
 	pendingHandoff *PendingHandoff
 	totalUsage     TokenUsage
+	interrupt      *InterruptReason
 }
 
 func NewState() *AgentState {
@@ -135,10 +137,11 @@ func (s *AgentState) TotalUsage() TokenUsage {
 
 // Snapshot serializes the current state for persistence / resume.
 type StateSnapshot struct {
-	Status     Status     `json:"status"`
-	Messages   []Message  `json:"messages"`
-	Turn       int64      `json:"turn"`
-	TotalUsage TokenUsage `json:"total_usage"`
+	Status          Status           `json:"status"`
+	Messages        []Message        `json:"messages"`
+	Turn            int64            `json:"turn"`
+	TotalUsage      TokenUsage       `json:"total_usage"`
+	InterruptReason *InterruptReason `json:"interrupt_reason,omitempty"`
 }
 
 func (s *AgentState) Snapshot() StateSnapshot {
@@ -148,11 +151,17 @@ func (s *AgentState) Snapshot() StateSnapshot {
 	for i, m := range s.messages {
 		msgs[i] = m.Clone()
 	}
+	ir := s.interrupt
+	if ir != nil {
+		c := *ir
+		ir = &c
+	}
 	return StateSnapshot{
-		Status:     s.status,
-		Messages:   msgs,
-		Turn:       s.turn,
-		TotalUsage: s.totalUsage,
+		Status:          s.status,
+		Messages:        msgs,
+		Turn:            s.turn,
+		TotalUsage:      s.totalUsage,
+		InterruptReason: ir,
 	}
 }
 
@@ -163,6 +172,37 @@ func (s *AgentState) Restore(snap StateSnapshot) {
 	s.messages = snap.Messages
 	s.turn = snap.Turn
 	s.totalUsage = snap.TotalUsage
+	if snap.InterruptReason != nil {
+		c := *snap.InterruptReason
+		s.interrupt = &c
+	} else {
+		s.interrupt = nil
+	}
+}
+
+// SetInterruptReason records why the agent was interrupted.
+func (s *AgentState) SetInterruptReason(r *InterruptReason) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.interrupt = r
+}
+
+// GetInterruptReason returns the interrupt reason, if any.
+func (s *AgentState) GetInterruptReason() *InterruptReason {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.interrupt == nil {
+		return nil
+	}
+	c := *s.interrupt
+	return &c
+}
+
+// ClearInterruptReason removes the interrupt reason.
+func (s *AgentState) ClearInterruptReason() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.interrupt = nil
 }
 
 func (s *AgentState) MarshalJSON() ([]byte, error) {

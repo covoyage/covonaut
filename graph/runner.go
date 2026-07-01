@@ -39,13 +39,14 @@ type RunnerConfig struct {
 // It replaces the separate CompiledGraph.Run() and CompiledPregelGraph.Run()
 // with a single execution model.
 type Runner struct {
-	nodes    map[string]Step
-	edges    map[string][]string
-	revEdges map[string][]string
-	entry    string
-	config   RunnerConfig
-	sorted   [][]string // only for DAG mode
-	stateFn  GenStateFn
+	nodes       map[string]Step
+	streamNodes map[string]agentcore.StreamStep
+	edges       map[string][]string
+	revEdges    map[string][]string
+	entry       string
+	config      RunnerConfig
+	sorted      [][]string // only for DAG mode
+	stateFn     GenStateFn
 }
 
 // NewDAGRunner creates a runner from a CompiledGraph.
@@ -73,14 +74,20 @@ func NewDAGRunner(cg *CompiledGraph, opts ...RunnerConfig) *Runner {
 		revEdges[k] = v
 	}
 
+	streamNodes := make(map[string]agentcore.StreamStep, len(cg.StreamNodes))
+	for k, v := range cg.StreamNodes {
+		streamNodes[k] = v
+	}
+
 	return &Runner{
-		nodes:    cg.graph.nodes,
-		edges:    cg.graph.edges,
-		revEdges: revEdges,
-		entry:    cg.Entry,
-		config:   cfg,
-		sorted:   cg.Sorted,
-		stateFn:  stateFn,
+		nodes:       cg.graph.nodes,
+		streamNodes: streamNodes,
+		edges:       cg.graph.edges,
+		revEdges:    revEdges,
+		entry:       cg.Entry,
+		config:      cfg,
+		sorted:      cg.Sorted,
+		stateFn:     stateFn,
 	}
 }
 
@@ -154,6 +161,134 @@ func (r *Runner) Run(ctx context.Context, input string) (string, error) {
 	}
 }
 
+// RunStream executes the graph in streaming mode. Each node receives a
+// *StreamReader[string] as input and produces one as output. Nodes that only
+// implement Step are automatically adapted (input stream collected → Run →
+// result wrapped as single-element stream). The final output is returned as a
+// stream so the caller can consume chunks progressively.
+func (r *Runner) RunStream(ctx context.Context, input string) (*agentcore.StreamReader[string], error) {
+	if r.config.Mode != RunModeDAG {
+		return nil, fmt.Errorf("streaming mode only supports RunModeDAG")
+	}
+	if r.stateFn != nil {
+		state := r.stateFn(ctx)
+		if state != nil {
+			ctx = WithGraphState(ctx, state)
+		}
+	}
+
+	inputStream := agentcore.NewStreamFromValue(input)
+	streams := map[string]*agentcore.StreamReader[string]{}
+	streams[r.entry] = inputStream
+
+	var steps int64
+	for _, layer := range r.sorted {
+		var layerNodes []string
+		for _, name := range layer {
+			if _, reachable := streams[name]; reachable || name == r.entry {
+				layerNodes = append(layerNodes, name)
+			}
+		}
+		if len(layerNodes) == 0 {
+			continue
+		}
+
+		type streamResult struct {
+			name   string
+			stream *agentcore.StreamReader[string]
+		}
+		resultCh := make(chan streamResult, len(layerNodes))
+		errCh := make(chan error, len(layerNodes))
+		var wg sync.WaitGroup
+
+		for _, name := range layerNodes {
+			steps++
+			if steps > r.config.MaxSteps {
+				return nil, agentcore.WrapNodeError(agentcore.ErrExceedMaxSteps, "runner:dag:stream")
+			}
+
+			inStream := r.resolveInputStream(name, inputStream, streams)
+			streamStep := r.nodeAsStreamStep(name)
+
+			wg.Add(1)
+			go func(nodeName string, ss agentcore.StreamStep, in *agentcore.StreamReader[string]) {
+				defer wg.Done()
+				out, err := ss.RunStream(ctx, in)
+				if err != nil {
+					errCh <- agentcore.WrapNodeError(err, "runner:dag:stream:"+nodeName)
+					return
+				}
+				resultCh <- streamResult{name: nodeName, stream: out}
+			}(name, streamStep, inStream)
+		}
+
+		wg.Wait()
+		close(resultCh)
+		close(errCh)
+
+		if err, ok := <-errCh; ok {
+			return nil, err
+		}
+
+		for res := range resultCh {
+			streams[res.name] = res.stream
+			for _, to := range r.edges[res.name] {
+				if _, exists := streams[to]; !exists {
+					streams[to] = agentcore.NewStreamReader[string](1)
+				}
+			}
+		}
+	}
+
+	terminalStream := r.mergeTerminalStreams(streams)
+	return terminalStream, nil
+}
+
+// nodeAsStreamStep returns the node as a StreamStep. StreamStep nodes are
+// used directly; Step nodes are auto-wrapped via AsStreamStep.
+func (r *Runner) nodeAsStreamStep(name string) agentcore.StreamStep {
+	if ss, ok := r.streamNodes[name]; ok {
+		return ss
+	}
+	return agentcore.AsStreamStep(r.nodes[name])
+}
+
+func (r *Runner) resolveInputStream(name string, graphInput *agentcore.StreamReader[string], streams map[string]*agentcore.StreamReader[string]) *agentcore.StreamReader[string] {
+	preds := r.revEdges[name]
+	if len(preds) == 0 {
+		return graphInput
+	}
+	var predStreams []*agentcore.StreamReader[string]
+	for _, p := range preds {
+		if s, ok := streams[p]; ok {
+			predStreams = append(predStreams, s)
+		}
+	}
+	if len(predStreams) == 1 {
+		return predStreams[0]
+	}
+	return agentcore.Merge(predStreams...)
+}
+
+func (r *Runner) mergeTerminalStreams(streams map[string]*agentcore.StreamReader[string]) *agentcore.StreamReader[string] {
+	terminal := make(map[string]bool)
+	for name := range r.nodes {
+		if edges, hasEdges := r.edges[name]; !hasEdges || len(edges) == 0 {
+			terminal[name] = true
+		}
+	}
+	var terminalStreams []*agentcore.StreamReader[string]
+	for name := range terminal {
+		if s, ok := streams[name]; ok {
+			terminalStreams = append(terminalStreams, s)
+		}
+	}
+	if len(terminalStreams) == 1 {
+		return terminalStreams[0]
+	}
+	return agentcore.Merge(terminalStreams...)
+}
+
 func (r *Runner) runDAG(ctx context.Context, input string) (string, error) {
 	if r.stateFn != nil {
 		state := r.stateFn(ctx)
@@ -192,7 +327,7 @@ func (r *Runner) runDAG(ctx context.Context, input string) (string, error) {
 			wg.Add(1)
 			go func(nodeName, nodeIn string) {
 				defer wg.Done()
-				out, err := r.nodes[nodeName].Run(ctx, nodeIn)
+				out, err := r.runnerGetNode(nodeName).Run(ctx, nodeIn)
 				mu.Lock()
 				results[nodeName] = out
 				errs[nodeName] = err
@@ -215,7 +350,19 @@ func (r *Runner) runDAG(ctx context.Context, input string) (string, error) {
 		}
 	}
 
-	return FindTerminalOutput(r.nodes, r.edges, outputs), nil
+	return FindTerminalOutput(allNodes(r.nodes, r.streamNodes), r.edges, outputs), nil
+}
+
+// runnerGetNode resolves a node name to a Step. StreamStep nodes are auto-adapted
+// via StreamStepToStep for the non-streaming execution path.
+func (r *Runner) runnerGetNode(name string) Step {
+	if step, ok := r.nodes[name]; ok {
+		return step
+	}
+	if ss, ok := r.streamNodes[name]; ok {
+		return agentcore.StreamStepToStep(ss)
+	}
+	return nil
 }
 
 func (r *Runner) runPregelStyle(ctx context.Context, input string) (string, error) {

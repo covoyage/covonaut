@@ -172,7 +172,7 @@ func (ig *InterruptableGraph) runFrom(ctx context.Context, input string, startLa
 	}
 
 	ig.mu.Lock()
-	result := FindTerminalOutput(ig.graph.graph.nodes, ig.graph.graph.edges, ig.nodeOutputs)
+	result := FindTerminalOutput(allNodes(ig.graph.graph.nodes, ig.graph.StreamNodes), ig.graph.graph.edges, ig.nodeOutputs)
 	ig.mu.Unlock()
 	return result, nil, nil
 }

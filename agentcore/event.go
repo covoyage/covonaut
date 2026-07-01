@@ -33,6 +33,7 @@ const (
 	EventCompactionStart EventType = "compaction_start"
 	EventCompactionEnd   EventType = "compaction_end"
 	EventAutoRetry       EventType = "auto_retry"
+	EventAgentInterrupt  EventType = "agent_interrupt"
 )
 
 // Event is the common interface for all agent lifecycle events.
@@ -68,6 +69,12 @@ type AgentEndEvent struct {
 type AgentErrorEvent struct {
 	baseEvent
 	Err error `json:"error"`
+}
+
+type AgentInterruptEvent struct {
+	baseEvent
+	AgentName string          `json:"agent_name,omitempty"`
+	Reason    *InterruptReason `json:"reason,omitempty"`
 }
 
 type SkillLoadedEvent struct {
