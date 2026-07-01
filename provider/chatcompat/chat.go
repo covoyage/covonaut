@@ -1,4 +1,4 @@
-package openai
+package chatcompat
 
 import (
 	"bufio"
@@ -22,14 +22,14 @@ type Config struct {
 	OrgID   string
 	Client  *http.Client // Optional: custom HTTP client, defaults to http.Client with 5m timeout
 
-	// Protocol selects which OpenAI API protocol to use.
+	// Protocol selects which API protocol to use.
 	//   "" (default)          — Chat Completions API (/v1/chat/completions)
 	//   "responses"           — Responses API (/v1/responses)
 	Protocol APIProtocol
 
 	// EndpointPath overrides the chat completions endpoint path.
 	// Defaults to "/chat/completions". Useful for providers that use a
-	// different path while remaining OpenAI-compatible.
+	// different path while remaining Chat Completions-compatible.
 	// Ignored when Protocol is "responses".
 	EndpointPath string
 
@@ -46,9 +46,16 @@ type Config struct {
 	// to merge into the request body. Return nil if no extra fields are
 	// needed.
 	BuildExtraBody func(*agentcore.ProviderRequest) map[string]any
+
+	// DisableSystemPrompt strips system messages from the request before
+	// sending. Needed for providers (e.g. DeepSeek reasoner) that do not
+	// support a system role. Applied after PrepareMessages when both are set.
+	DisableSystemPrompt bool
 }
 
-// Provider implements agentcore.Provider for the OpenAI chat completions API.
+// Provider implements agentcore.Provider for the Chat Completions
+// protocol, which is also used by DeepSeek, Qwen, Moonshot, Groq, Together,
+// Mistral, and dozens of other vendors. See doc.go for the full list.
 type Provider struct {
 	config Config
 	client *http.Client
@@ -75,7 +82,7 @@ func New(cfg Config) *Provider {
 	}
 }
 
-// --- OpenAI API wire types ---
+// --- Chat Completions wire types ---
 
 type chatRequest struct {
 	Model          string              `json:"model"`
@@ -306,7 +313,7 @@ func (p *Provider) Complete(ctx context.Context, req *agentcore.ProviderRequest)
 
 	if httpResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
-		return nil, fmt.Errorf("openai api error (status %d): %s", httpResp.StatusCode, body)
+		return nil, fmt.Errorf("api error (status %d): %s", httpResp.StatusCode, formatError(body))
 	}
 
 	var chatResp chatResponse
@@ -366,7 +373,7 @@ func (p *Provider) Stream(ctx context.Context, req *agentcore.ProviderRequest) (
 	if httpResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
 		httpResp.Body.Close()
-		return nil, fmt.Errorf("openai api error (status %d): %s", httpResp.StatusCode, body)
+		return nil, fmt.Errorf("api error (status %d): %s", httpResp.StatusCode, formatError(body))
 	}
 
 	ch := make(chan agentcore.StreamDelta, 64)
@@ -457,6 +464,15 @@ func (p *Provider) buildRequest(req *agentcore.ProviderRequest, stream bool) (ch
 	msgs := req.Messages
 	if p.config.PrepareMessages != nil {
 		msgs = p.config.PrepareMessages(msgs)
+	}
+	if p.config.DisableSystemPrompt {
+		filtered := make([]agentcore.Message, 0, len(msgs))
+		for _, m := range msgs {
+			if m.Role != agentcore.RoleSystem {
+				filtered = append(filtered, m)
+			}
+		}
+		msgs = filtered
 	}
 
 	cr := chatRequest{
@@ -551,4 +567,40 @@ func (p *Provider) doHTTP(ctx context.Context, body any, extra map[string]any) (
 	}
 
 	return p.client.Do(httpReq)
+}
+
+// formatError attempts to extract a structured error message from API error
+// responses. Handles multiple vendor formats:
+//
+//	{"error": {"message": "..."}}           — OpenAI / DeepSeek / Moonshot / Groq
+//	{"code": "...", "message": "..."}       — Qwen (DashScope)
+//
+// Falls back to the raw body if no structured format is detected.
+func formatError(body []byte) string {
+	if len(body) == 0 {
+		return "empty response body"
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return string(body)
+	}
+	if e, ok := raw["error"]; ok {
+		if em, ok := e.(map[string]any); ok {
+			if msg, ok := em["message"].(string); ok && msg != "" {
+				if code, ok := em["code"].(string); ok && code != "" {
+					return fmt.Sprintf("[%s] %s", code, msg)
+				}
+				if typ, ok := em["type"].(string); ok && typ != "" {
+					return fmt.Sprintf("[%s] %s", typ, msg)
+				}
+				return msg
+			}
+		}
+	}
+	if code, ok := raw["code"].(string); ok && code != "" {
+		if msg, ok := raw["message"].(string); ok && msg != "" {
+			return fmt.Sprintf("[%s] %s", code, msg)
+		}
+	}
+	return strings.TrimSpace(string(body))
 }

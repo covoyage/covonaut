@@ -11,7 +11,7 @@ import (
 	"strings"
 
 	"github.com/covoyage/covonaut/agentcore"
-	"github.com/covoyage/covonaut/provider/openai"
+	"github.com/covoyage/covonaut/provider/chatcompat"
 )
 
 const defaultBaseURL = "https://api.githubcopilot.com"
@@ -49,7 +49,7 @@ func New(cfg Config) (agentcore.Provider, error) {
 	if baseURL == "" {
 		baseURL = defaultBaseURL
 	}
-	return openai.New(openai.Config{
+	return chatcompat.New(chatcompat.Config{
 		APIKey:  token,
 		BaseURL: baseURL,
 		ExtraHeaders: map[string]string{

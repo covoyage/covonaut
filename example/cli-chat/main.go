@@ -17,7 +17,7 @@ import (
 	"github.com/covoyage/covonaut/pkg/util"
 	"github.com/covoyage/covonaut/provider/anthropic"
 	"github.com/covoyage/covonaut/provider/gemini"
-	"github.com/covoyage/covonaut/provider/openai"
+	"github.com/covoyage/covonaut/provider/chatcompat"
 	"github.com/covoyage/covonaut/session"
 	"github.com/covoyage/covonaut/skill"
 	agentstore "github.com/covoyage/covonaut/store"
@@ -562,7 +562,7 @@ func buildProvider() agentcore.Provider {
 		if apiKey == "" {
 			log.Fatal("OPENAI_API_KEY or API_KEY is required")
 		}
-		return openai.New(openai.Config{
+		return chatcompat.New(chatcompat.Config{
 			APIKey:  apiKey,
 			BaseURL: os.Getenv("OPENAI_BASE_URL"),
 		})

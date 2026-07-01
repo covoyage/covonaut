@@ -1,4 +1,4 @@
-package openai
+package chatcompat
 
 import (
 	"bufio"
@@ -256,7 +256,7 @@ func (p *Provider) completeResponses(ctx context.Context, req *agentcore.Provide
 
 	if httpResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
-		return nil, fmt.Errorf("openai responses api error (status %d): %s", httpResp.StatusCode, body)
+		return nil, fmt.Errorf("responses api error (status %d): %s", httpResp.StatusCode, formatError(body))
 	}
 
 	var resp responsesResponse
@@ -265,7 +265,7 @@ func (p *Provider) completeResponses(ctx context.Context, req *agentcore.Provide
 	}
 
 	if resp.Error != nil {
-		return nil, fmt.Errorf("openai responses api error: %s: %s", resp.Error.Code, resp.Error.Message)
+		return nil, fmt.Errorf("responses api error: %s: %s", resp.Error.Code, resp.Error.Message)
 	}
 
 	return p.convertResponsesOutput(&resp, req)
@@ -287,7 +287,7 @@ func (p *Provider) streamResponses(ctx context.Context, req *agentcore.ProviderR
 	if httpResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
 		httpResp.Body.Close()
-		return nil, fmt.Errorf("openai responses api error (status %d): %s", httpResp.StatusCode, body)
+		return nil, fmt.Errorf("responses api error (status %d): %s", httpResp.StatusCode, formatError(body))
 	}
 
 	ch := make(chan agentcore.StreamDelta, 64)
