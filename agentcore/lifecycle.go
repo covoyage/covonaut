@@ -2,6 +2,7 @@ package agentcore
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -309,16 +310,20 @@ func (a *AuditHook) AfterMessagePersist(_ context.Context, _ *AgentRunContext, m
 type RateLimitHook struct {
 	BaseLifecycleHook
 	MaxTurnsPerMinute int64
+	mu                sync.Mutex
 	turnTimestamps    []time.Time
 }
 
 func (r *RateLimitHook) BeforeAgentRun(_ context.Context, _ *AgentRunContext) error {
+	r.mu.Lock()
 	r.turnTimestamps = nil
+	r.mu.Unlock()
 	return nil
 }
 
 func (r *RateLimitHook) BeforeModelCall(_ context.Context, _ *AgentRunContext, _ *ModelCallContext) error {
 	now := time.Now()
+	r.mu.Lock()
 	r.turnTimestamps = append(r.turnTimestamps, now)
 
 	if r.MaxTurnsPerMinute > 0 {
@@ -330,8 +335,10 @@ func (r *RateLimitHook) BeforeModelCall(_ context.Context, _ *AgentRunContext, _
 			}
 		}
 		if int64(count) > r.MaxTurnsPerMinute {
+			r.mu.Unlock()
 			return NewNodeError("rate limit exceeded", nil, "lifecycle", "rate_limit")
 		}
 	}
+	r.mu.Unlock()
 	return nil
 }

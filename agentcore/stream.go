@@ -7,10 +7,10 @@ import (
 
 // StreamReader[T] is a managed stream with explicit lifecycle control.
 // Unlike raw channels, it tracks errors, supports Close() for producer cleanup,
-// and prevents goroutine leaks by closing the done channel when the consumer is finished.
+// and prevents goroutine leaks by closing the stop channel when the consumer is finished.
 type StreamReader[T any] struct {
 	ch     chan T
-	done   chan struct{}
+	stop   chan struct{}
 	err    error
 	mu     sync.Mutex
 	closed bool
@@ -23,16 +23,16 @@ func NewStreamReader[T any](bufSize int64) *StreamReader[T] {
 	}
 	return &StreamReader[T]{
 		ch:   make(chan T, bufSize),
-		done: make(chan struct{}),
+		stop: make(chan struct{}),
 	}
 }
 
-// Send pushes a value into the stream. Returns false if the stream is closed.
+// Send pushes a value into the stream. Returns false if the stream is closed or the consumer cancelled.
 func (s *StreamReader[T]) Send(val T) bool {
 	select {
 	case s.ch <- val:
 		return true
-	case <-s.done:
+	case <-s.stop:
 		return false
 	}
 }
@@ -46,7 +46,7 @@ func (s *StreamReader[T]) SetError(err error) {
 	}
 	s.err = err
 	s.closed = true
-	close(s.ch)
+	close(s.stop)
 }
 
 // Close signals end-of-stream from the producer side.
@@ -57,30 +57,40 @@ func (s *StreamReader[T]) Close() {
 		return
 	}
 	s.closed = true
-	close(s.ch)
+	close(s.stop)
 }
 
 // Recv reads the next value. Returns (zero, false) when the stream is exhausted.
 func (s *StreamReader[T]) Recv() (T, bool) {
-	val, ok := <-s.ch
-	return val, ok
+	select {
+	case val := <-s.ch:
+		return val, true
+	default:
+	}
+	select {
+	case val := <-s.ch:
+		return val, true
+	case <-s.stop:
+		var zero T
+		return zero, false
+	}
 }
 
 // Cancel tells the producer the consumer no longer needs data.
-// Producers watching the done channel should stop sending.
+// Producers watching the stop channel should stop sending.
 func (s *StreamReader[T]) Cancel() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	select {
-	case <-s.done:
+	case <-s.stop:
 	default:
-		close(s.done)
+		close(s.stop)
 	}
 }
 
-// Done returns a channel that is closed when the consumer cancels the stream.
+// Done returns a channel that is closed when the consumer cancels the stream or the stream is done.
 func (s *StreamReader[T]) Done() <-chan struct{} {
-	return s.done
+	return s.stop
 }
 
 // Err returns the terminal error, if any.
@@ -175,6 +185,11 @@ func Merge[T any](readers ...*StreamReader[T]) *StreamReader[T] {
 		wg.Add(1)
 		go func(src *StreamReader[T]) {
 			defer wg.Done()
+			defer func() {
+				if err := src.Err(); err != nil {
+					out.SetError(err)
+				}
+			}()
 			for {
 				val, ok := src.Recv()
 				if !ok {

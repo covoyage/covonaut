@@ -785,7 +785,10 @@ func (s *Server) releaseAgent(agent *agentcore.Agent, threadID string) {
 	}
 	s.poolMu.Unlock()
 
-	s.agentPool.Store(threadID, agent)
+	if prev, loaded := s.agentPool.LoadOrStore(threadID, agent); loaded {
+		prev.(*agentcore.Agent).Close()
+		s.agentPool.Store(threadID, agent)
+	}
 }
 
 func (s *Server) saveAgentState(ctx context.Context, agent *agentcore.Agent, threadID string) error {

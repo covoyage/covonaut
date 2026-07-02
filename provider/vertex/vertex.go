@@ -6,6 +6,7 @@
 package vertex
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -55,8 +56,9 @@ func NewGemini(cfg Config) (agentcore.Provider, error) {
 	baseURL := fmt.Sprintf("https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/publishers/google",
 		cfg.Region, cfg.Project, cfg.Region)
 	return gemini.New(gemini.Config{
-		APIKey:  token,
-		BaseURL: baseURL,
+		APIKey:        token,
+		BaseURL:       baseURL,
+		UseBearerAuth: true,
 	}), nil
 }
 
@@ -178,50 +180,7 @@ func (p *anthropicVertex) call(ctx context.Context, req *agentcore.ProviderReque
 	}, nil
 }
 
-func (p *anthropicVertex) callStream(ctx context.Context, req *agentcore.ProviderRequest) (<-chan agentcore.StreamDelta, error) {
-	body, err := p.buildRequest(req, true)
-	if err != nil {
-		return nil, err
-	}
-	url := p.endpoint(req.Model)
-	httpReq, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
-	httpReq.Header.Set("Authorization", "Bearer "+p.token)
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
 
-	resp, err := p.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("vertex stream: %w", err)
-	}
-	if resp.StatusCode != 200 {
-		defer resp.Body.Close()
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("vertex stream: HTTP %d: %s", resp.StatusCode, string(b))
-	}
-
-	ch := make(chan agentcore.StreamDelta, 10)
-	go func() {
-		defer resp.Body.Close()
-		defer close(ch)
-		dec := json.NewDecoder(resp.Body)
-		for dec.More() {
-			var vr vertexAnthropicResponse
-			if err := dec.Decode(&vr); err != nil {
-				return
-			}
-			var textParts []string
-			for _, c := range vr.Content {
-				if c.Type == "text" && c.Text != "" {
-					textParts = append(textParts, c.Text)
-				}
-			}
-			if content := strings.Join(textParts, ""); content != "" {
-				ch <- agentcore.StreamDelta{Content: content}
-			}
-		}
-	}()
-	return ch, nil
-}
 
 func (p *anthropicVertex) endpoint(model string) string {
 	return fmt.Sprintf("https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/publishers/anthropic/models/%s:streamRawPredict",
@@ -268,6 +227,193 @@ func (p *anthropicVertex) buildRequest(req *agentcore.ProviderRequest, stream bo
 	}
 
 	return json.Marshal(vr)
+}
+
+// --- Anthropic Vertex SSE streaming types ---
+
+type vertexAnthropicContentBlockStart struct {
+	Type         string                           `json:"type"`
+	Index        int64                            `json:"index"`
+	ContentBlock vertexAnthropicContentBlock      `json:"content_block"`
+}
+
+type vertexAnthropicContentBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+	ID   string `json:"id,omitempty"`
+	Name string `json:"name,omitempty"`
+}
+
+type vertexAnthropicContentBlockDelta struct {
+	Type  string                    `json:"type"`
+	Index int64                     `json:"index"`
+	Delta vertexAnthropicBlockDelta `json:"delta"`
+}
+
+type vertexAnthropicBlockDelta struct {
+	Type        string `json:"type"`
+	Text        string `json:"text,omitempty"`
+	Thinking    string `json:"thinking,omitempty"`
+	PartialJSON string `json:"partial_json,omitempty"`
+	Signature   string `json:"signature,omitempty"`
+}
+
+type vertexMessageDelta struct {
+	Type  string           `json:"type"`
+	Delta vertexDeltaField `json:"delta"`
+	Usage vertexUsage      `json:"usage"`
+}
+
+type vertexDeltaField struct {
+	StopReason   string `json:"stop_reason"`
+	StopSequence string `json:"stop_sequence"`
+}
+
+type vertexUsage struct {
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
+}
+
+func (p *anthropicVertex) callStream(ctx context.Context, req *agentcore.ProviderRequest) (<-chan agentcore.StreamDelta, error) {
+	body, err := p.buildRequest(req, true)
+	if err != nil {
+		return nil, err
+	}
+	url := p.endpoint(req.Model)
+	httpReq, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	httpReq.Header.Set("Authorization", "Bearer "+p.token)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+
+	resp, err := p.client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("vertex stream: %w", err)
+	}
+	if resp.StatusCode != 200 {
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("vertex stream: HTTP %d: %s", resp.StatusCode, string(b))
+	}
+
+	ch := make(chan agentcore.StreamDelta, 64)
+
+	go func() {
+		defer resp.Body.Close()
+		defer close(ch)
+
+		scanner := bufio.NewScanner(resp.Body)
+		var eventType string
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "event: ") {
+				eventType = strings.TrimPrefix(line, "event: ")
+				continue
+			}
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := strings.TrimPrefix(line, "data: ")
+
+			switch eventType {
+			case "content_block_start":
+				var ev vertexAnthropicContentBlockStart
+				if err := json.Unmarshal([]byte(data), &ev); err != nil {
+					continue
+				}
+				if ev.ContentBlock.Type == "tool_use" {
+					sd := agentcore.StreamDelta{
+						ToolCalls: []agentcore.ToolCallDelta{{
+							Index: ev.Index,
+							ID:    ev.ContentBlock.ID,
+							Name:  ev.ContentBlock.Name,
+						}},
+						Blocks: []agentcore.ContentBlock{{
+							Kind:       agentcore.BlockKindToolCall,
+							ToolCallID: ev.ContentBlock.ID,
+							Name:       ev.ContentBlock.Name,
+						}},
+					}
+					select {
+					case ch <- sd:
+					case <-ctx.Done():
+						return
+					}
+				}
+
+			case "content_block_delta":
+				var ev vertexAnthropicContentBlockDelta
+				if err := json.Unmarshal([]byte(data), &ev); err != nil {
+					continue
+				}
+				var sd agentcore.StreamDelta
+				switch ev.Delta.Type {
+				case "text_delta":
+					sd.Content = ev.Delta.Text
+					if ev.Delta.Text != "" {
+						sd.Blocks = []agentcore.ContentBlock{{
+							Kind: agentcore.BlockKindText,
+							Text: ev.Delta.Text,
+						}}
+					}
+				case "thinking_delta":
+					if ev.Delta.Thinking != "" {
+						sd.Blocks = []agentcore.ContentBlock{{
+							Kind: agentcore.BlockKindThinking,
+							Text: ev.Delta.Thinking,
+						}}
+					}
+				case "input_json_delta":
+					sd.ToolCalls = []agentcore.ToolCallDelta{{
+						Index:     ev.Index,
+						Arguments: ev.Delta.PartialJSON,
+					}}
+					sd.Blocks = []agentcore.ContentBlock{{
+						Kind:      agentcore.BlockKindToolCall,
+						Arguments: ev.Delta.PartialJSON,
+					}}
+				case "signature_delta":
+					if ev.Delta.Signature != "" {
+						sd.Blocks = []agentcore.ContentBlock{{
+							Kind:      agentcore.BlockKindThinking,
+							Signature: ev.Delta.Signature,
+						}}
+					}
+				default:
+					continue
+				}
+				select {
+				case ch <- sd:
+				case <-ctx.Done():
+					return
+				}
+
+			case "message_delta":
+				var ev vertexMessageDelta
+				if err := json.Unmarshal([]byte(data), &ev); err != nil {
+					continue
+				}
+				if ev.Usage.OutputTokens > 0 {
+					sd := agentcore.StreamDelta{
+						Usage: &agentcore.TokenUsage{
+							CompletionTokens: ev.Usage.OutputTokens,
+							TotalTokens:      ev.Usage.InputTokens + ev.Usage.OutputTokens,
+						},
+					}
+					select {
+					case ch <- sd:
+					case <-ctx.Done():
+						return
+					}
+				}
+
+			case "message_stop":
+				return
+			}
+		}
+	}()
+
+	return ch, nil
 }
 
 var _ agentcore.Provider = (*anthropicVertex)(nil)

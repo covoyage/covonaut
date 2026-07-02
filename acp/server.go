@@ -20,6 +20,7 @@ type Server struct {
 	authProv   AuthProvider
 	logger     *slog.Logger
 	reader     *bufio.Reader
+	rawReader  io.Reader // underlying reader for read deadline support
 	writer     io.Writer
 	writerMu   sync.Mutex
 
@@ -29,7 +30,8 @@ type Server struct {
 	pendingMu sync.Mutex
 
 	// Capabilities advertised by the client in initialize (fs, terminal).
-	clientCaps *ClientCapabilities
+	clientCaps   *ClientCapabilities
+	clientCapsMu sync.RWMutex
 }
 
 // acpResponse carries a routed client response to a waiting outbound request.
@@ -67,9 +69,18 @@ func NewServer(cfg ServerConfig) *Server {
 		authProv:   cfg.AuthProvider,
 		logger:     cfg.Logger,
 		reader:     bufio.NewReader(cfg.Reader),
+		rawReader:  cfg.Reader,
 		writer:     cfg.Writer,
 		pending:    make(map[string]chan acpResponse),
 	}
+}
+
+// isTimeoutError returns true when an I/O error is due to a read deadline expiry.
+func isTimeoutError(err error) bool {
+	if e, ok := err.(interface{ Timeout() bool }); ok {
+		return e.Timeout()
+	}
+	return false
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -82,10 +93,21 @@ func (s *Server) Run(ctx context.Context) error {
 		default:
 		}
 
+		// Set a read deadline on the raw reader (e.g. stdin) so that
+		// ReadBytes doesn't block forever on a partial line. If the
+		// underlying reader doesn't support deadlines, this is a no-op.
+		if f, ok := s.rawReader.(interface{ SetReadDeadline(t time.Time) error }); ok {
+			f.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		}
+
 		line, err := s.reader.ReadBytes('\n')
 		if err != nil {
 			if err == io.EOF {
 				return nil
+			}
+			// Timeout is not fatal — loop back to check ctx.Done().
+			if isTimeoutError(err) {
+				continue
 			}
 			return fmt.Errorf("read stdin: %w", err)
 		}
@@ -204,6 +226,8 @@ func DefaultPermissionOptions() []PermissionOption {
 // meaning the agent should read/write through the editor (seeing unsaved
 // buffers) instead of touching disk directly.
 func (s *Server) clientSupportsFS() bool {
+	s.clientCapsMu.RLock()
+	defer s.clientCapsMu.RUnlock()
 	return s.clientCaps != nil && s.clientCaps.FS != nil &&
 		(s.clientCaps.FS.ReadTextFile || s.clientCaps.FS.WriteTextFile)
 }
@@ -299,6 +323,13 @@ func (s *Server) writeError(id any, code int, message string, data any) {
 }
 
 func (s *Server) handleRequest(ctx context.Context, req *JSONRPCRequest) {
+	defer func() {
+		if r := recover(); r != nil {
+			err := fmt.Errorf("panic in ACP handler: %v", r)
+			s.logger.Error("ACP handler panic", "err", err)
+			s.writeError(req.ID, -32603, "Internal error", err.Error())
+		}
+	}()
 	switch req.Method {
 	case "initialize":
 		s.handleInitialize(req)
@@ -341,7 +372,9 @@ func (s *Server) handleInitialize(req *JSONRPCRequest) {
 	if params.ClientInfo != nil {
 		clientName = params.ClientInfo.Name
 	}
+	s.clientCapsMu.Lock()
 	s.clientCaps = params.ClientCapabilities
+	s.clientCapsMu.Unlock()
 	s.logger.Info("ACP initialize", "client", clientName)
 
 	result := InitializeResult{

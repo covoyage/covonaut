@@ -145,7 +145,7 @@ func (ig *InterruptableGraph) runFrom(ctx context.Context, input string, startLa
 
 			nodeInput := ig.resolveNodeInput(name, input)
 
-			step := ig.graph.graph.nodes[name]
+			step := ig.graph.getNode(name)
 			out, err := step.Run(ctx, nodeInput)
 			if err != nil {
 				return "", nil, agentcore.WrapNodeError(err, "interruptable_graph:"+name)
@@ -262,11 +262,14 @@ func (s *MemoryCheckpointStore) Load(_ context.Context, id string) (*Checkpoint,
 	return &cp, nil
 }
 
-func (s *MemoryCheckpointStore) List(_ context.Context, _ string) ([]Checkpoint, error) {
+func (s *MemoryCheckpointStore) List(_ context.Context, graphID string) ([]Checkpoint, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	result := make([]Checkpoint, 0, len(s.checkpoints))
 	for _, cp := range s.checkpoints {
+		if graphID != "" && cp.GraphID != graphID {
+			continue
+		}
 		result = append(result, cp)
 	}
 	return result, nil

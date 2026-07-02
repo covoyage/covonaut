@@ -486,17 +486,16 @@ func (eb *EventBus) offAllID(id uint64) {
 // a stalled agent — consumers that need guaranteed delivery should use a
 // persistent store or checkpoint mechanism instead.
 func (eb *EventBus) Emit(e Event) {
-	eb.mu.RLock()
-	closed := eb.closed
-	eb.mu.RUnlock()
-	if closed {
+	eb.mu.Lock()
+	if eb.closed {
+		eb.mu.Unlock()
 		return
 	}
 	select {
 	case eb.ch <- e:
 	default:
-		// Buffer full — drop event rather than block the agent loop.
 	}
+	eb.mu.Unlock()
 }
 
 // Close shuts down the event bus. All queued events are processed before Close returns.
@@ -520,18 +519,18 @@ func (eb *EventBus) Drain() {
 	ack := make(chan struct{})
 	ds := &drainSentinel{baseEvent: newBase("drain"), ack: ack}
 	for {
-		eb.mu.RLock()
-		closed := eb.closed
-		eb.mu.RUnlock()
-		if closed {
+		eb.mu.Lock()
+		if eb.closed {
+			eb.mu.Unlock()
 			return
 		}
 		select {
 		case eb.ch <- ds:
+			eb.mu.Unlock()
 			<-ack
 			return
 		default:
-			// Yield to allow the dispatch goroutine to process events.
+			eb.mu.Unlock()
 			runtime.Gosched()
 		}
 	}

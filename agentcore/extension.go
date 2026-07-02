@@ -1,6 +1,9 @@
 package agentcore
 
-import "context"
+import (
+	"context"
+	"sync"
+)
 
 // Extension is a plugin that can augment an agent with tools, hooks, and lifecycle callbacks.
 type Extension interface {
@@ -54,6 +57,7 @@ type EventSnapshotProvider interface {
 
 // ExtensionRegistry manages the lifecycle of extensions attached to an agent.
 type ExtensionRegistry struct {
+	mu         sync.RWMutex
 	extensions []Extension
 }
 
@@ -107,7 +111,9 @@ func (r *ExtensionRegistry) Register(ctx context.Context, agent *Agent, exts ...
 		}
 		agent.configMu.Unlock()
 
+		r.mu.Lock()
 		r.extensions = append(r.extensions, ext)
+		r.mu.Unlock()
 	}
 	return nil
 }
@@ -127,6 +133,8 @@ func appendLifecycleHook(existing, next LifecycleHook) LifecycleHook {
 
 // Dispose tears down all registered extensions in reverse order.
 func (r *ExtensionRegistry) Dispose() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	var firstErr error
 	for i := len(r.extensions) - 1; i >= 0; i-- {
 		if err := r.extensions[i].Dispose(); err != nil && firstErr == nil {
@@ -139,6 +147,8 @@ func (r *ExtensionRegistry) Dispose() error {
 
 // Names returns the names of all registered extensions.
 func (r *ExtensionRegistry) Names() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	names := make([]string, len(r.extensions))
 	for i, ext := range r.extensions {
 		names[i] = ext.Name()
@@ -148,6 +158,8 @@ func (r *ExtensionRegistry) Names() []string {
 
 // Visit calls fn for the extension with the given name.
 func (r *ExtensionRegistry) Visit(name string, fn func(Extension)) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	for _, ext := range r.extensions {
 		if ext.Name() == name {
 			fn(ext)
@@ -158,6 +170,8 @@ func (r *ExtensionRegistry) Visit(name string, fn func(Extension)) {
 
 // SnapshotEvents collects current-state events from extensions that expose them.
 func (r *ExtensionRegistry) SnapshotEvents() []Event {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	var out []Event
 	for _, ext := range r.extensions {
 		if sp, ok := ext.(EventSnapshotProvider); ok {

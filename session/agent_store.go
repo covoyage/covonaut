@@ -271,9 +271,10 @@ func (s *AgentStore) syncMessages(ctx context.Context, mgr *Manager, want []agen
 func (s *AgentStore) rewriteSession(ctx context.Context, prev *Manager, msgs []agentcore.Message) (*Manager, error) {
 	header := prev.Header()
 	threadCfg, threadCfgSet := latestThreadConfig(prev)
-	if err := s.sessions.Delete(ctx, header.ID); err != nil {
-		return nil, fmt.Errorf("delete diverged session: %w", err)
-	}
+
+	// Create the new session first (overwrites the old file in place),
+	// then purge the stale lock — this avoids the data-loss window that
+	// would exist if we deleted before creating.
 	mgr, err := s.sessions.Create(ctx, CreateOptions{
 		ID:            header.ID,
 		Cwd:           header.Cwd,
@@ -282,6 +283,10 @@ func (s *AgentStore) rewriteSession(ctx context.Context, prev *Manager, msgs []a
 	if err != nil {
 		return nil, fmt.Errorf("recreate diverged session: %w", err)
 	}
+
+	// File already created — safe to purge the stale lock without a delete.
+	s.sessions.lockCleanup(header.ID)
+
 	for _, msg := range msgs {
 		if err := mgr.AppendMessage(ctx, msg); err != nil {
 			return nil, fmt.Errorf("rewrite session message: %w", err)

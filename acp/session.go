@@ -107,6 +107,11 @@ func (sm *SessionManager) CreateSession(cwd, sessionID string) (*sessionState, e
 	}
 
 	sm.mu.Lock()
+	if prev, ok := sm.sessions[sessionID]; ok {
+		if prev.Agent != nil && prev.Agent.Core() != nil {
+			prev.Agent.Core().Close()
+		}
+	}
 	sm.sessions[sessionID] = state
 	sm.mu.Unlock()
 

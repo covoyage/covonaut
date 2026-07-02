@@ -1034,6 +1034,9 @@ func (a *Agent) callProviderWithRetry(ctx context.Context, req *ProviderRequest)
 // --- internal helpers ---
 
 func (a *Agent) callProvider(ctx context.Context, req *ProviderRequest) (*ProviderResponse, error) {
+	if a.config.Provider == nil {
+		return nil, errors.New("agent: provider is nil")
+	}
 	ctx, span := a.tracer().Start(ctx, "agent.llm",
 		Attr("model", req.Model),
 		Attr("streaming", a.config.Streaming),

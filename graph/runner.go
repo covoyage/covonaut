@@ -109,10 +109,10 @@ func NewPregelRunner(cpg *CompiledPregelGraph, state *PregelState, opts ...Runne
 	}
 
 	nodes := make(map[string]Step)
+	var stateMu sync.Mutex
 	for name, fn := range cpg.pg.nodes {
 		nodeFn := fn
-		sharedState := state
-		nodes[name] = &pregelStepAdapter{fn: nodeFn, state: sharedState}
+		nodes[name] = &pregelStepAdapter{fn: nodeFn, state: state, stateMu: &stateMu}
 	}
 
 	revEdges := make(map[string][]string)
@@ -134,18 +134,22 @@ func NewPregelRunner(cpg *CompiledPregelGraph, state *PregelState, opts ...Runne
 }
 
 type pregelStepAdapter struct {
-	fn    PregelNode
-	state *PregelState
+	fn      PregelNode
+	state   *PregelState
+	stateMu *sync.Mutex
 }
 
 func (a *pregelStepAdapter) Run(ctx context.Context, _ string) (string, error) {
-	out, err := a.fn(ctx, *a.state)
+	stateClone := a.state.Clone()
+	out, err := a.fn(ctx, stateClone)
 	if err != nil {
 		return "", err
 	}
+	a.stateMu.Lock()
 	for k, v := range out {
 		(*a.state)[k] = v
 	}
+	a.stateMu.Unlock()
 	return "ok", nil
 }
 

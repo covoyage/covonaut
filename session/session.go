@@ -822,6 +822,15 @@ func (s *FileStore) Delete(_ context.Context, sessionID string) error {
 	return nil
 }
 
+// lockCleanup removes the per-session lock cache entry without touching the
+// underlying file. Useful when a session file has already been replaced
+// (e.g. during rewriteSession) and only the stale lock needs to be purged.
+func (s *FileStore) lockCleanup(sessionID string) {
+	s.locksMu.Lock()
+	delete(s.locks, sessionID)
+	s.locksMu.Unlock()
+}
+
 func (s *FileStore) Has(_ context.Context, sessionID string) (bool, error) {
 	_, err := os.Stat(s.path(sessionID))
 	if err == nil {

@@ -22,6 +22,11 @@ type Config struct {
 	BaseURL string
 	Model   string       // e.g. "gemini-2.5-flash", "gemini-2.5-pro"
 	Client  *http.Client // Optional: custom HTTP client, defaults to http.Client with 5m timeout
+
+	// UseBearerAuth sends APIKey as "Authorization: Bearer <key>" instead of
+	// "x-goog-api-key: <key>". Required for GCP Vertex AI endpoints which
+	// expect an OAuth access token in the Authorization header.
+	UseBearerAuth bool
 }
 
 // Provider implements agentcore.Provider for the Gemini native REST API.
@@ -578,7 +583,11 @@ func (p *Provider) doHTTP(ctx context.Context, url string, body any) (*http.Resp
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-goog-api-key", p.config.APIKey)
+	if p.config.UseBearerAuth {
+		httpReq.Header.Set("Authorization", "Bearer "+p.config.APIKey)
+	} else {
+		httpReq.Header.Set("x-goog-api-key", p.config.APIKey)
+	}
 
 	return p.client.Do(httpReq)
 }

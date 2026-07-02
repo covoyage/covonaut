@@ -63,7 +63,6 @@ func AgentAsToolWithEventBus(cfg Config, parentBus *EventBus) *Tool {
 		name = "sub_agent"
 	}
 
-	originalFunc := tool.Func
 	tool.Func = func(ctx context.Context, args json.RawMessage) (any, error) {
 		var params struct {
 			Input string `json:"input"`
@@ -85,7 +84,5 @@ func AgentAsToolWithEventBus(cfg Config, parentBus *EventBus) *Tool {
 		}
 		return result, nil
 	}
-	_ = originalFunc
-
 	return tool
 }
