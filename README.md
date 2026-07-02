@@ -21,14 +21,14 @@ import (
     "fmt"
 
     "github.com/covoyage/covonaut/agentcore"
-    "github.com/covoyage/covonaut/provider/openai"
+    "github.com/covoyage/covonaut/provider/chatcompat"
 )
 
 func main() {
     agent := agentcore.New(agentcore.Config{
         Name:         "assistant",
         SystemPrompt: "You are a helpful assistant.",
-        Provider:     openai.New(openai.Config{APIKey: "sk-..."}),
+        Provider:     chatcompat.New(chatcompat.Config{APIKey: "sk-..."}),
         Tools: []*agentcore.Tool{{
             Name:        "greet",
             Description: "Say hello",
@@ -290,9 +290,27 @@ router := &workflow.Router{
 ### Providers
 
 ```go
-// OpenAI
-p := openai.New(openai.Config{
+// OpenAI / Chat Completions protocol (also works with DeepSeek, Qwen, Moonshot, Groq, Together...)
+p := chatcompat.New(chatcompat.Config{
     APIKey: os.Getenv("OPENAI_API_KEY"),
+})
+
+// DeepSeek (OpenAI-compatible)
+p := chatcompat.New(chatcompat.Config{
+    APIKey:  os.Getenv("DEEPSEEK_API_KEY"),
+    BaseURL: "https://api.deepseek.com/v1",
+})
+
+// Qwen / Tongyi Qianwen (OpenAI-compatible)
+p := chatcompat.New(chatcompat.Config{
+    APIKey:  os.Getenv("QWEN_API_KEY"),
+    BaseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+})
+
+// Moonshot / Kimi (OpenAI-compatible)
+p := chatcompat.New(chatcompat.Config{
+    APIKey:  os.Getenv("MOONSHOT_API_KEY"),
+    BaseURL: "https://api.moonshot.cn/v1",
 })
 
 // Anthropic
@@ -340,7 +358,7 @@ All providers accept the same high-level request shape.
 ```go
 agent := agentcore.New(agentcore.Config{
     Model:    "gpt-4o-mini",
-    Provider: openai.New(openai.Config{APIKey: os.Getenv("OPENAI_API_KEY")}),
+    Provider: chatcompat.New(chatcompat.Config{APIKey: os.Getenv("OPENAI_API_KEY")}),
     ResponseFormat: agentcore.NewJSONSchemaResponseFormat("answer", map[string]any{
         "type": "object",
         "properties": map[string]any{
@@ -357,7 +375,7 @@ out, err := agent.Run(ctx, "Reply with JSON only")
 For provider-level use, `ProviderRequest.ResponseFormat` is forwarded directly to providers, and
 responses populate `ProviderResponse.Structured` when the returned content is valid JSON.
 
-- `openai`: uses native `response_format`
+- `chatcompat`: uses native `response_format`
 - `gemini`: uses native `generationConfig.responseMimeType` / `responseSchema`
 - `anthropic`: currently uses a schema-aware system instruction fallback and extracts valid JSON from the model text response
 - `bedrock`: uses native Converse API `toolConfig` / `confluenceConfig`
@@ -395,7 +413,7 @@ agent := agentcore.New(agentcore.Config{
 - `Budget` caps reasoning tokens; for Gemini, `-1` means dynamic budget
 - `gemini`: maps to `generationConfig.thinkingConfig`
 - `anthropic`: maps to `thinking: { type: "adaptive", display: ..., effort: ... }`
-- `openai`: currently ignores this setting
+- `chatcompat`: currently ignores this setting
 
 ### Richer Message Blocks
 
@@ -409,7 +427,7 @@ msg := agentcore.Message{
 }.AppendImageURLBlock("https://example.com/cat.png")
 ```
 
-- `openai`: sends image blocks as `image_url` multipart content
+- `chatcompat`: sends image blocks as `image_url` multipart content
 - `anthropic`: sends `data:` URLs as native `image` blocks with base64 source payloads
 - `gemini`: sends `data:` URLs as `inlineData` and `gs://` / `file://` URIs as `fileData`
 

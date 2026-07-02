@@ -34,7 +34,7 @@ import (
 
     "github.com/covoyage/covonaut/agentcore"
     "github.com/covoyage/covonaut/a2a"
-    "github.com/covoyage/covonaut/provider/openai"
+    "github.com/covoyage/covonaut/provider/chatcompat"
 )
 
 func main() {
@@ -42,7 +42,7 @@ func main() {
     agent := agentcore.New(agentcore.Config{
         Name:         "weather-agent",
         SystemPrompt: "You are a weather assistant.",
-        Provider:     openai.New(openai.Config{APIKey: "sk-..."}),
+        Provider:     chatcompat.New(chatcompat.Config{APIKey: "sk-..."}),
     })
 
     // Define your agent card
