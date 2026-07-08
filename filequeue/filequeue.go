@@ -6,31 +6,53 @@ import (
 	"sync"
 )
 
+// fileLock is a per-path mutex with a reference count so the owning
+// FileMutationQueue can remove it from its map once nobody is using it
+// anymore, instead of retaining an entry forever for every path ever seen.
+type fileLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
 // FileMutationQueue serializes write operations per real file path.
 type FileMutationQueue struct {
 	mu     sync.Mutex
-	queues map[string]*sync.Mutex
+	queues map[string]*fileLock
 }
 
 func New() *FileMutationQueue {
-	return &FileMutationQueue{queues: make(map[string]*sync.Mutex)}
+	return &FileMutationQueue{queues: make(map[string]*fileLock)}
 }
 
 // WithFile executes fn while holding the mutex for the resolved real path.
+// The per-path lock entry is reference-counted and removed from the internal
+// map once the last concurrent caller for that path finishes, so the map
+// does not grow without bound as new/short-lived paths are processed over
+// the lifetime of the queue.
 func (fmq *FileMutationQueue) WithFile(path string, fn func() error) error {
 	key := resolveKey(path)
 
 	fmq.mu.Lock()
-	m, ok := fmq.queues[key]
+	l, ok := fmq.queues[key]
 	if !ok {
-		m = &sync.Mutex{}
-		fmq.queues[key] = m
+		l = &fileLock{}
+		fmq.queues[key] = l
+	}
+	l.refs++
+	fmq.mu.Unlock()
+
+	l.mu.Lock()
+	err := fn()
+	l.mu.Unlock()
+
+	fmq.mu.Lock()
+	l.refs--
+	if l.refs == 0 {
+		delete(fmq.queues, key)
 	}
 	fmq.mu.Unlock()
 
-	m.Lock()
-	defer m.Unlock()
-	return fn()
+	return err
 }
 
 // WithFileResult is a generic version of WithFile that returns a value.

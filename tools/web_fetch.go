@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -62,6 +65,12 @@ func (d *DefaultWebFetchOperations) defaults() {
 	if d.Client == nil {
 		d.Client = &http.Client{
 			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout:   10 * time.Second,
+					Control:   safeDialControl,
+				}).DialContext,
+			},
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				if len(via) >= 5 {
 					return fmt.Errorf("too many redirects")
@@ -79,6 +88,56 @@ func (d *DefaultWebFetchOperations) defaults() {
 	if d.RetryDelay <= 0 {
 		d.RetryDelay = 2 * time.Second
 	}
+}
+
+// isDisallowedIP reports whether ip must never be dialed by the web fetch
+// tool: loopback, link-local (this also covers cloud metadata endpoints such
+// as 169.254.169.254), private, unspecified, and multicast addresses.
+func isDisallowedIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	return ip.IsLoopback() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified() ||
+		ip.IsMulticast() ||
+		ip.IsPrivate()
+}
+
+// safeDialControl is invoked by net.Dialer right before connecting to the
+// fully-resolved address (i.e. after DNS resolution), so it also protects
+// against DNS-rebinding and blocks SSRF via HTTP redirects since the same
+// Transport/Dialer is reused for redirected requests.
+func safeDialControl(network, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("BLOCKED: refusing to dial %q: %w", address, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("BLOCKED: refusing to dial non-IP address %q", address)
+	}
+	if isDisallowedIP(ip) {
+		return fmt.Errorf("BLOCKED: refusing to dial internal/private address %s", ip)
+	}
+	return nil
+}
+
+// validateFetchURL restricts web_fetch to public http/https URLs, rejecting
+// other schemes (file://, ftp://, gopher://, etc.) up front.
+func validateFetchURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("unsupported URL scheme %q: only http and https are allowed", u.Scheme)
+	}
+	if u.Hostname() == "" {
+		return fmt.Errorf("URL must include a host")
+	}
+	return nil
 }
 
 func (d *DefaultWebFetchOperations) newRequest(url string) (*http.Request, error) {
@@ -107,6 +166,10 @@ func (d *DefaultWebFetchOperations) newRequest(url string) (*http.Request, error
 
 func (d *DefaultWebFetchOperations) Fetch(url string) (string, error) {
 	d.defaults()
+
+	if err := validateFetchURL(url); err != nil {
+		return "", err
+	}
 
 	var lastErr error
 	for attempt := 0; attempt <= d.MaxRetries; attempt++ {

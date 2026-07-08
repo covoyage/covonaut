@@ -127,3 +127,49 @@ func TestResolveKeySymlink(t *testing.T) {
 		t.Errorf("resolveKey: symlink %q != real %q", key2, key1)
 	}
 }
+
+func TestQueueEntriesReleasedAfterUse(t *testing.T) {
+	dir := t.TempDir()
+	fmq := New()
+
+	// Touch many distinct paths sequentially; none should leave a residual
+	// entry behind once WithFile returns.
+	for i := 0; i < 100; i++ {
+		path := filepath.Join(dir, filepath.Base(t.TempDir()), "file.txt")
+		if err := fmq.WithFile(path, func() error { return nil }); err != nil {
+			t.Fatalf("WithFile: %v", err)
+		}
+	}
+
+	fmq.mu.Lock()
+	n := len(fmq.queues)
+	fmq.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("expected queues map to be empty after use, got %d entries", n)
+	}
+}
+
+func TestQueueEntryReleasedUnderConcurrency(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shared.txt")
+	fmq := New()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := fmq.WithFile(path, func() error { return nil }); err != nil {
+				t.Errorf("WithFile: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	fmq.mu.Lock()
+	n := len(fmq.queues)
+	fmq.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("expected queues map to be empty after all concurrent users finish, got %d entries", n)
+	}
+}

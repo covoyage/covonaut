@@ -25,6 +25,24 @@ func TestIsRetryableErrorContextOverflow(t *testing.T) {
 	}
 }
 
+func TestIsRetryableErrorDoesNotMatchEmbeddedNumbers(t *testing.T) {
+	// Regression test: the 429/5xx patterns must require word boundaries so
+	// they don't match arbitrary digit substrings inside unrelated numbers
+	// (e.g. counts, IDs, durations) that happen to contain "429" or a 5xx
+	// sequence.
+	cases := []string{
+		"processed 1500 records successfully",
+		"user 1429 created",
+		"waited 15000 ms before giving up",
+		"order #54290 not found",
+	}
+	for _, c := range cases {
+		if IsRetryableError(errors.New(c)) {
+			t.Errorf("expected not retryable (embedded number, not a status code): %s", c)
+		}
+	}
+}
+
 func TestIsRetryableHttpCodes(t *testing.T) {
 	cases := []string{
 		"429 Too Many Requests",
@@ -131,5 +149,24 @@ func TestRetryDelayCustomBaseMax(t *testing.T) {
 	d = retryDelay(3, cfg)
 	if d != 2000*time.Millisecond {
 		t.Fatalf("expected 2000ms (capped), got %v", d)
+	}
+}
+
+func TestApplyFullJitterBounds(t *testing.T) {
+	const delay = 1000 * time.Millisecond
+	for i := 0; i < 200; i++ {
+		got := applyFullJitter(delay)
+		if got < 0 || got > delay {
+			t.Fatalf("jittered delay %v out of bounds [0, %v]", got, delay)
+		}
+	}
+}
+
+func TestApplyFullJitterNonPositive(t *testing.T) {
+	if got := applyFullJitter(0); got != 0 {
+		t.Fatalf("expected 0 delay to stay 0, got %v", got)
+	}
+	if got := applyFullJitter(-5 * time.Millisecond); got != -5*time.Millisecond {
+		t.Fatalf("expected negative delay to be returned unchanged, got %v", got)
 	}
 }

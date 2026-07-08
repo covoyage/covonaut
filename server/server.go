@@ -31,6 +31,8 @@ type Server struct {
 	agentPool sync.Map // threadID -> *agentcore.Agent; cached agents for reuse
 	poolMu    sync.Mutex
 	poolLimit int
+
+	maxRequestBodyBytes int64
 }
 
 type CORSConfig struct {
@@ -114,10 +116,38 @@ type SkillRegistryStatusResponse struct {
 
 func New(cfg agentcore.Config) *Server {
 	return &Server{
-		config:    cfg,
-		eventBus:  agentcore.NewEventBus(),
-		poolLimit: 64,
+		config:              cfg,
+		eventBus:            agentcore.NewEventBus(),
+		poolLimit:           64,
+		maxRequestBodyBytes: defaultMaxRequestBodyBytes,
 	}
+}
+
+// defaultMaxRequestBodyBytes caps the size of incoming JSON request bodies to
+// guard against memory-exhaustion denial-of-service via oversized payloads.
+const defaultMaxRequestBodyBytes = 10 << 20 // 10 MiB
+
+// SetMaxRequestBodyBytes overrides the maximum accepted request body size in
+// bytes. Values <= 0 reset it to the default (10 MiB).
+func (s *Server) SetMaxRequestBodyBytes(n int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n <= 0 {
+		n = defaultMaxRequestBodyBytes
+	}
+	s.maxRequestBodyBytes = n
+}
+
+// limitedBody wraps the request body with http.MaxBytesReader so that JSON
+// decoding fails fast instead of buffering an unbounded payload into memory.
+func (s *Server) limitedBody(w http.ResponseWriter, r *http.Request) io.Reader {
+	s.mu.RLock()
+	limit := s.maxRequestBodyBytes
+	s.mu.RUnlock()
+	if limit <= 0 {
+		limit = defaultMaxRequestBodyBytes
+	}
+	return http.MaxBytesReader(w, r.Body, limit)
 }
 
 func (s *Server) On(t agentcore.EventType, h agentcore.EventHandler) func() { return s.eventBus.On(t, h) }
@@ -199,7 +229,7 @@ type ChatResponse struct {
 
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var req ChatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(s.limitedBody(w, r)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, ChatResponse{Error: "invalid request body"})
 		return
 	}
@@ -607,7 +637,7 @@ func (s *Server) handlePutThreadConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req ThreadConfigRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(s.limitedBody(w, r)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
@@ -647,7 +677,7 @@ func (s *Server) handlePutThreadThinking(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var req ThreadThinkingRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(s.limitedBody(w, r)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
@@ -670,7 +700,7 @@ func (s *Server) handleBranchThread(w http.ResponseWriter, r *http.Request) {
 	}
 	var req BranchThreadRequest
 	if r.Body != nil {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		if err := json.NewDecoder(s.limitedBody(w, r)).Decode(&req); err != nil && err != io.EOF {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 			return
 		}

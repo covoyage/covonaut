@@ -1004,7 +1004,7 @@ func (a *Agent) callProviderWithRetry(ctx context.Context, req *ProviderRequest)
 	}
 
 	for attempt := int64(1); attempt <= maxRetries; attempt++ {
-		delay := retryDelay(attempt, cfg)
+		delay := applyFullJitter(retryDelay(attempt, cfg))
 		a.emit(&AutoRetryEvent{
 			baseEvent:  newBase(EventAutoRetry),
 			Attempt:    attempt,

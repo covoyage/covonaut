@@ -647,9 +647,24 @@ func (s *FileStore) path(sessionID string) string {
 	return filepath.Join(s.dir, sessionID+".jsonl")
 }
 
+// validateSessionID rejects session IDs that could escape the store
+// directory (path separators, ".", "..", or empty strings). IDs must resolve
+// to a single path segment so that s.path never writes/reads outside s.dir.
+func validateSessionID(id string) error {
+	if id == "" {
+		return fmt.Errorf("session id must not be empty")
+	}
+	if id == "." || id == ".." || id != filepath.Base(id) {
+		return fmt.Errorf("invalid session id %q: must be a single path segment", id)
+	}
+	return nil
+}
+
 func (s *FileStore) Create(_ context.Context, opts CreateOptions) (*Manager, error) {
 	if opts.ID == "" {
 		opts.ID = generateID()
+	} else if err := validateSessionID(opts.ID); err != nil {
+		return nil, err
 	}
 
 	header := Header{
@@ -681,6 +696,9 @@ func (s *FileStore) Create(_ context.Context, opts CreateOptions) (*Manager, err
 }
 
 func (s *FileStore) Open(_ context.Context, sessionID string) (*Manager, error) {
+	if err := validateSessionID(sessionID); err != nil {
+		return nil, err
+	}
 	lock := s.sessionLock(sessionID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -807,6 +825,9 @@ func (s *FileStore) List(_ context.Context) ([]Info, error) {
 }
 
 func (s *FileStore) Delete(_ context.Context, sessionID string) error {
+	if err := validateSessionID(sessionID); err != nil {
+		return err
+	}
 	lock := s.sessionLock(sessionID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -832,6 +853,9 @@ func (s *FileStore) lockCleanup(sessionID string) {
 }
 
 func (s *FileStore) Has(_ context.Context, sessionID string) (bool, error) {
+	if err := validateSessionID(sessionID); err != nil {
+		return false, err
+	}
 	_, err := os.Stat(s.path(sessionID))
 	if err == nil {
 		return true, nil

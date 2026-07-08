@@ -1855,6 +1855,72 @@ func TestServer_SendTask_AppendMessage(t *testing.T) {
 	}
 }
 
+func TestDefaultAgentHandler_EvictsOldestTerminalTasksOverCapacity(t *testing.T) {
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer webhook.Close()
+
+	agent := agentcore.New(agentcore.Config{
+		ModelConfig: agentcore.ModelConfig{Name: "test"},
+	})
+
+	handler := NewDefaultAgentHandler(AgentCard{
+		Name: "test-agent",
+		URL:  "http://localhost:8080",
+	}, agent, agentcore.Config{
+		ModelConfig: agentcore.ModelConfig{Name: "test"},
+	})
+	handler.SetMaxTasks(2)
+
+	ctx := context.Background()
+	ids := []string{"evict-1", "evict-2", "evict-3"}
+	for _, id := range ids {
+		if err := handler.SetPushNotification(ctx, SetPushNotificationRequest{
+			ID:     id,
+			Config: PushNotificationConfig{URL: webhook.URL},
+		}); err != nil {
+			t.Fatalf("SetPushNotification(%s): %v", id, err)
+		}
+		// No provider is configured, so agent.Run fails immediately and the
+		// task lands in TaskStateFailed (a terminal state), making it
+		// eligible for eviction.
+		task, err := handler.SendTask(ctx, SendTaskRequest{
+			ID:      id,
+			Message: Message{Role: string(RoleUser), Parts: []Part{NewTextPart("hi")}},
+		})
+		if err != nil {
+			t.Fatalf("SendTask(%s): %v", id, err)
+		}
+		if task.State != TaskStateFailed {
+			t.Fatalf("expected task %s to fail without a provider, got %s", id, task.State)
+		}
+	}
+
+	handler.tasksMu.RLock()
+	numTasks := len(handler.tasks)
+	_, oldestStillPresent := handler.tasks["evict-1"]
+	_, newestPresent := handler.tasks["evict-3"]
+	handler.tasksMu.RUnlock()
+
+	if numTasks > 2 {
+		t.Fatalf("expected at most 2 tasks retained, got %d", numTasks)
+	}
+	if oldestStillPresent {
+		t.Fatal("expected oldest task evict-1 to be evicted")
+	}
+	if !newestPresent {
+		t.Fatal("expected newest task evict-3 to be retained")
+	}
+
+	handler.pushMu.RLock()
+	_, pushStillPresent := handler.pushCfg["evict-1"]
+	handler.pushMu.RUnlock()
+	if pushStillPresent {
+		t.Fatal("expected push notification config for evicted task to be removed")
+	}
+}
+
 func TestStreamingHandler_Interface(t *testing.T) {
 	agent := agentcore.New(agentcore.Config{
 		ModelConfig: agentcore.ModelConfig{Name: "test"},

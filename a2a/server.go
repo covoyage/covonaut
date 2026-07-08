@@ -1118,8 +1118,9 @@ type DefaultAgentHandler struct {
 	config      agentcore.Config
 	taskTimeout time.Duration
 
-	tasksMu sync.RWMutex
-	tasks   map[string]*Task
+	tasksMu  sync.RWMutex
+	tasks    map[string]*Task
+	maxTasks int
 
 	pushMu  sync.RWMutex
 	pushCfg map[string]*PushNotificationConfig
@@ -1133,6 +1134,11 @@ type DefaultAgentHandler struct {
 	cancelFuncs map[string]context.CancelFunc
 }
 
+// defaultMaxTasks caps how many task records DefaultAgentHandler retains in
+// memory. Once exceeded, the oldest terminal-state tasks (completed, failed,
+// or canceled) are evicted first; in-flight tasks are never evicted.
+const defaultMaxTasks = 10000
+
 func NewDefaultAgentHandler(card AgentCard, agent *agentcore.Agent, cfg agentcore.Config) *DefaultAgentHandler {
 	return &DefaultAgentHandler{
 		card:        card,
@@ -1140,10 +1146,61 @@ func NewDefaultAgentHandler(card AgentCard, agent *agentcore.Agent, cfg agentcor
 		config:      cfg,
 		taskTimeout: defaultTaskTimeout,
 		tasks:       make(map[string]*Task),
+		maxTasks:    defaultMaxTasks,
 		pushCfg:     make(map[string]*PushNotificationConfig),
 		notifier:    NewPushNotifier(),
 		execSem:     make(chan struct{}, 10),
 		cancelFuncs: make(map[string]context.CancelFunc),
+	}
+}
+
+// SetMaxTasks overrides how many task records are retained in memory before
+// the oldest terminal-state tasks start being evicted. Values <= 0 reset it
+// to the default (10000).
+func (h *DefaultAgentHandler) SetMaxTasks(n int) {
+	h.tasksMu.Lock()
+	defer h.tasksMu.Unlock()
+	if n <= 0 {
+		n = defaultMaxTasks
+	}
+	h.maxTasks = n
+	h.evictOldTasksLocked()
+}
+
+// evictOldTasksLocked drops the oldest terminal-state tasks (and their
+// associated push-notification config) once len(h.tasks) exceeds
+// h.maxTasks. Callers must already hold h.tasksMu for writing. Tasks that
+// are not yet in a terminal state are never evicted, so clients polling or
+// continuing them never lose access.
+func (h *DefaultAgentHandler) evictOldTasksLocked() {
+	limit := h.maxTasks
+	if limit <= 0 {
+		limit = defaultMaxTasks
+	}
+	for len(h.tasks) > limit {
+		oldestID := ""
+		var oldestTime time.Time
+		for id, t := range h.tasks {
+			if !isTerminalState(t.State) {
+				continue
+			}
+			var ts time.Time
+			if n := len(t.History); n > 0 {
+				ts = t.History[n-1].Timestamp
+			}
+			if oldestID == "" || ts.Before(oldestTime) {
+				oldestID = id
+				oldestTime = ts
+			}
+		}
+		if oldestID == "" {
+			// Nothing evictable: every remaining task is still in flight.
+			return
+		}
+		delete(h.tasks, oldestID)
+		h.pushMu.Lock()
+		delete(h.pushCfg, oldestID)
+		h.pushMu.Unlock()
 	}
 }
 
@@ -1289,6 +1346,7 @@ func (h *DefaultAgentHandler) runAgent(ctx context.Context, task *Task, input st
 			State:     TaskStateFailed,
 			Timestamp: time.Now(),
 		})
+		h.evictOldTasksLocked()
 		h.notify(task)
 		return task, nil
 	}
@@ -1321,6 +1379,7 @@ func (h *DefaultAgentHandler) runAgent(ctx context.Context, task *Task, input st
 		Timestamp: time.Now(),
 	})
 
+	h.evictOldTasksLocked()
 	h.notify(task)
 	return task, nil
 }
@@ -1439,6 +1498,7 @@ func (h *DefaultAgentHandler) CancelTask(ctx context.Context, req CancelTaskRequ
 		Timestamp: time.Now(),
 	})
 
+	h.evictOldTasksLocked()
 	h.notify(task)
 	return task, nil
 }

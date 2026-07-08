@@ -1,6 +1,7 @@
 package agentcore
 
 import (
+	"math/rand"
 	"regexp"
 	"time"
 )
@@ -13,10 +14,10 @@ type RetryConfig struct {
 }
 
 var retryablePatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)429`),
+	regexp.MustCompile(`(?i)\b429\b`),
 	regexp.MustCompile(`(?i)rate.?limit`),
 	regexp.MustCompile(`(?i)too.?many.?requests`),
-	regexp.MustCompile(`(?i)5\d{2}`),
+	regexp.MustCompile(`(?i)\b5\d{2}\b`),
 	regexp.MustCompile(`(?i)server.?error`),
 	regexp.MustCompile(`(?i)internal.?server`),
 	regexp.MustCompile(`(?i)service.?unavailable`),
@@ -74,7 +75,11 @@ func IsContextOverflowError(err error) bool {
 	return false
 }
 
-// retryDelay computes the wait duration for a given attempt using exponential backoff.
+// retryDelay computes the base wait duration for a given attempt using
+// exponential backoff (no jitter). Callers performing an actual sleep should
+// pass the result through applyFullJitter to avoid a thundering-herd effect
+// when many clients retry in lockstep (e.g. after a shared rate limit or
+// outage clears).
 func retryDelay(attempt int64, cfg *RetryConfig) time.Duration {
 	base := cfg.BaseDelayMs
 	if base <= 0 {
@@ -93,4 +98,15 @@ func retryDelay(attempt int64, cfg *RetryConfig) time.Duration {
 		}
 	}
 	return time.Duration(delay) * time.Millisecond
+}
+
+// applyFullJitter returns a random duration in [0, delay], implementing the
+// "full jitter" strategy for exponential backoff: spreading retries out
+// randomly instead of having every caller wake up and retry at the exact
+// same instant. A non-positive delay is returned unchanged.
+func applyFullJitter(delay time.Duration) time.Duration {
+	if delay <= 0 {
+		return delay
+	}
+	return time.Duration(rand.Int63n(int64(delay) + 1))
 }
