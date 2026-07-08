@@ -3,6 +3,7 @@ package a2a
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1039,14 +1040,14 @@ func withAuth(next http.Handler, cfg AuthConfig) http.Handler {
 		authenticated := false
 
 		if cfg.APIKey != "" {
-			if r.Header.Get("X-API-Key") == cfg.APIKey {
+			if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-API-Key")), []byte(cfg.APIKey)) == 1 {
 				authenticated = true
 			}
 		}
 
 		if !authenticated && cfg.BearerToken != "" {
 			auth := r.Header.Get("Authorization")
-			if strings.HasPrefix(auth, "Bearer ") && strings.TrimPrefix(auth, "Bearer ") == cfg.BearerToken {
+			if strings.HasPrefix(auth, "Bearer ") && subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, "Bearer ")), []byte(cfg.BearerToken)) == 1 {
 				authenticated = true
 			}
 		}
@@ -1076,8 +1077,12 @@ func withCORS(next http.Handler, cfg CORSConfig) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		allowed := false
+		// Note: a bare "*" entry only grants a match when credentials are not
+		// allowed. Reflecting an arbitrary Origin while also sending
+		// Access-Control-Allow-Credentials: true would let any site make
+		// credentialed requests, defeating CORS protection.
 		for _, o := range cfg.AllowOrigins {
-			if o == "*" || o == origin {
+			if o == origin || (o == "*" && !cfg.AllowCredentials) {
 				allowed = true
 				break
 			}

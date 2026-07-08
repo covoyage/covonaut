@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -920,7 +921,8 @@ func (s *Server) authorizeSkillAPI(w http.ResponseWriter, r *http.Request, reloa
 		return false
 	}
 	auth := strings.TrimSpace(r.Header.Get("Authorization"))
-	if auth == "Bearer "+token {
+	expected := "Bearer " + token
+	if subtle.ConstantTimeCompare([]byte(auth), []byte(expected)) == 1 {
 		return true
 	}
 	w.Header().Set("WWW-Authenticate", `Bearer realm="skills"`)
@@ -1103,9 +1105,14 @@ func withCORS(next http.Handler, cfg CORSConfig) http.Handler {
 		if len(origins) == 1 && origins[0] == "*" && !cfg.AllowCredentials {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 		} else if origin != "" {
+			// Note: a bare "*" entry only grants a match when credentials are not
+			// allowed. Reflecting an arbitrary Origin while also sending
+			// Access-Control-Allow-Credentials: true would let any site make
+			// credentialed requests, defeating CORS protection.
 			for _, allowed := range origins {
-				if allowed == "*" || allowed == origin {
+				if allowed == origin || (allowed == "*" && !cfg.AllowCredentials) {
 					w.Header().Set("Access-Control-Allow-Origin", origin)
+					w.Header().Set("Vary", "Origin")
 					break
 				}
 			}

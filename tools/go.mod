@@ -26,4 +26,3 @@ require (
 
 replace github.com/covoyage/covonaut => ../
 
-replace github.com/ning/covonaut => github.com/covoyage/covonaut v0.0.0

@@ -2,6 +2,7 @@ package a2a
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -95,10 +96,10 @@ func (s *Server) wsPingLoop(wc *wsConn) {
 }
 
 func (s *Server) checkWSAuth(key, token string) bool {
-	if s.auth.APIKey != "" && key == s.auth.APIKey {
+	if s.auth.APIKey != "" && subtle.ConstantTimeCompare([]byte(key), []byte(s.auth.APIKey)) == 1 {
 		return true
 	}
-	if s.auth.BearerToken != "" && token == s.auth.BearerToken {
+	if s.auth.BearerToken != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.auth.BearerToken)) == 1 {
 		return true
 	}
 	return false
