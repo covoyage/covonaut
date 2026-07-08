@@ -1,5 +1,7 @@
 # covonaut
 
+[![CI](https://github.com/covoyage/covonaut/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/covoyage/covonaut/actions/workflows/ci.yml)
+
 Production-ready Agent framework for Go. Zero external dependencies, 82k+ lines of pure Go.
 
 ## Install
