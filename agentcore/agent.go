@@ -282,6 +282,23 @@ func (a *Agent) UnregisterTools(names ...string) { a.registry.Unregister(names..
 func (a *Agent) ToolNames() []string             { return a.registry.Names() }
 func (a *Agent) GetTool(name string) (*Tool, bool) { return a.registry.Get(name) }
 
+// InvokeTool runs a single named tool through the exact same hook pipeline
+// as a normal model-issued tool call (tool-before -> global-before ->
+// middleware chain -> global-after -> tool-after), rather than calling its
+// Func directly. Use this instead of GetTool+Func when a caller needs to
+// invoke a tool programmatically -- e.g. from a sandboxed script via
+// Programmatic Tool Calling -- while still getting audit logging,
+// guardrails, and any other configured hooks applied exactly as they would
+// be for the model's own tool calls.
+func (a *Agent) InvokeTool(ctx context.Context, name string, args json.RawMessage) (string, error) {
+	tc := ToolCall{Name: name, Arguments: string(args)}
+	result := a.executor.Execute(ctx, tc, a.state)
+	if result.Err != nil {
+		return "", result.Err
+	}
+	return result.EffectiveResult(), nil
+}
+
 // --- steering & follow-up ---
 
 // Steer injects a message that will be picked up before the next LLM call.

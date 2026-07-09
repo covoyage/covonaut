@@ -60,6 +60,27 @@ type ExecuteCodeToolConfig struct {
 	CommandTimeout time.Duration
 	// MaxOutputBytes is the max stdout bytes. Default: 50KB.
 	MaxOutputBytes int64
+
+	// ToolResolver, when set, enables Programmatic Tool Calling (PTC): the
+	// executed script can call back into other agent tools via RPC without
+	// their responses ever entering the LLM's context -- only the script's
+	// own stdout does. Nil (default) disables PTC entirely; existing callers
+	// that don't set this get identical behavior to before PTC existed.
+	//
+	// The invoker is expected to run the tool through the same hook
+	// pipeline as normal model-issued tool calls (e.g.
+	// agentcore.Agent.InvokeTool), so audit logging, guardrails, etc. still
+	// apply to PTC calls.
+	ToolInvoker func(ctx context.Context, name string, args json.RawMessage) (string, error)
+
+	// AllowedTools restricts which tool names a script may call via PTC.
+	// Ignored if ToolInvoker is nil. Empty means a conservative read-only
+	// default set (see defaultPTCAllowedTools).
+	AllowedTools []string
+
+	// MaxToolCalls caps the number of PTC calls per script execution.
+	// Default: 50. Ignored if ToolInvoker is nil.
+	MaxToolCalls int
 }
 
 func resolvePython(pythonCommand string) (string, error) {
@@ -93,7 +114,8 @@ func NewExecuteCodeTool(cfg *ExecuteCodeToolConfig) *agentcore.Tool {
 			"The code runs in a clean environment (API keys and secrets are scrubbed). " +
 			"Useful for data processing, analysis, computation, generating content, " +
 			"or any task that benefits from programmatic logic. " +
-			fmt.Sprintf("Timeout: %s. Output limit: %s.", cfg.CommandTimeout, FormatSize(cfg.MaxOutputBytes)),
+			fmt.Sprintf("Timeout: %s. Output limit: %s.", cfg.CommandTimeout, FormatSize(cfg.MaxOutputBytes)) +
+			ptcDescriptionSuffix(cfg),
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -147,6 +169,27 @@ func NewExecuteCodeTool(cfg *ExecuteCodeToolConfig) *agentcore.Tool {
 				return nil, fmt.Errorf("failed to write script: %w", err)
 			}
 
+			// Programmatic Tool Calling (PTC): start an RPC server the script can
+			// reach via the covo_tools.py stub, so it can call a whitelisted
+			// subset of agent tools without those responses entering the LLM's
+			// context.
+			var ptc *ptcServer
+			if cfg.ToolInvoker != nil {
+				var ptcErr error
+				ptc, ptcErr = newPTCServer(cfg.AllowedTools, cfg.ToolInvoker, cfg.MaxToolCalls)
+				if ptcErr != nil {
+					return nil, ptcErr
+				}
+				defer ptc.Close()
+				go ptc.Serve(execCtx)
+
+				stubPath := filepath.Join(tmpDir, "covo_tools.py")
+				stub := generatePTCStub(ptc.allowedToolNames())
+				if err := os.WriteFile(stubPath, []byte(stub), 0644); err != nil {
+					return nil, fmt.Errorf("failed to write PTC stub: %w", err)
+				}
+			}
+
 			cmd := exec.CommandContext(execCtx, python, scriptPath)
 			cmd.Dir = tmpDir
 			applySubprocessIsolation(cmd) // prevent /dev/tty access
@@ -157,6 +200,12 @@ func NewExecuteCodeTool(cfg *ExecuteCodeToolConfig) *agentcore.Tool {
 				"PYTHONIOENCODING=utf-8",
 				"PYTHONUNBUFFERED=1",
 			)
+			if ptc != nil {
+				cleanEnv = append(cleanEnv,
+					fmt.Sprintf("COVO_TOOLS_PORT=%d", ptc.port),
+					"COVO_TOOLS_TOKEN="+ptc.token,
+				)
+			}
 			cmd.Env = cleanEnv
 
 			var stdout, stderr bytes.Buffer
@@ -212,5 +261,3 @@ func NewExecuteCodeTool(cfg *ExecuteCodeToolConfig) *agentcore.Tool {
 		},
 	}
 }
-
-
