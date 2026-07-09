@@ -240,8 +240,8 @@ func TestCtrlCPrefersCopyOverInterrupt(t *testing.T) {
 	if interrupted {
 		t.Fatalf("expected Ctrl+C to copy the active selection instead of interrupting")
 	}
-	if app.editor.GetSelectedText() != "" {
-		t.Fatalf("expected selection to be cleared after copy")
+	if app.editor.GetSelectedText() != "hello" {
+		t.Fatalf("expected selection to remain visible after copy (matching standard clipboard UX), got %q", app.editor.GetSelectedText())
 	}
 }
 

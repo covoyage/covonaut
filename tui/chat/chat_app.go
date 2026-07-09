@@ -921,10 +921,14 @@ func (l *chatLayout) Render(width int64) []string {
 func (l *chatLayout) Invalidate() {}
 
 func doCopy(l *chatLayout) {
-	// Copy editor selection first
+	// Copy editor selection first. The selection is intentionally left
+	// intact after copying — matching standard clipboard UX (browsers, VS
+	// Code, Terminal.app all keep the selection visible after Cmd+C) — so
+	// the user can see what was copied, copy it again, or extend the
+	// selection afterward. It's cleared by the usual triggers instead:
+	// typing, clicking elsewhere, starting a new drag, etc.
 	if sel, ok := l.editor.(textSelectionComponent); ok {
 		if text := sel.GetSelectedText(); text != "" {
-			sel.ClearSelection()
 			go func() {
 				if err := CopyToClipboard(text); err != nil {
 					l.app.PrintError(fmt.Errorf("clipboard: %w", err))
@@ -936,7 +940,6 @@ func doCopy(l *chatLayout) {
 	// Copy history selection
 	text := l.history.GetSelectedText()
 	if text != "" {
-		l.history.ClearSelection()
 		go func() {
 			if err := CopyToClipboard(text); err != nil {
 				l.app.PrintError(fmt.Errorf("clipboard: %w", err))
