@@ -245,6 +245,22 @@ func TestCtrlCPrefersCopyOverInterrupt(t *testing.T) {
 	}
 }
 
+func TestCmdASelectsAllEditorText(t *testing.T) {
+	app, _ := newTestChatApp(t, ChatAppConfig{})
+	app.editor.Update(core.KeyMsg{Data: "hello world"})
+
+	// Kitty CSI-u encoding for Cmd+A (Super+A): the same dual-dispatch path
+	// as TestCtrlCPrefersCopyOverInterrupt — the focused editor sees the key
+	// first, then chatLayout.
+	keyMsg := core.KeyMsg{Data: "\x1b[97;9u"}
+	app.editor.Update(keyMsg)
+	app.layout.Update(keyMsg)
+
+	if got := app.editor.GetSelectedText(); got != "hello world" {
+		t.Fatalf("expected Cmd+A to select all editor text, got %q", got)
+	}
+}
+
 func TestChatAppSubscribe(t *testing.T) {
 	app, _ := newTestChatApp(t, ChatAppConfig{})
 

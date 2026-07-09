@@ -213,7 +213,7 @@ func DefaultKeybindings() map[string]KeybindingDef {
 		"tui.editor.yank":               {DefaultKeys: []KeyID{"ctrl+y"}, Description: "Yank"},
 		"tui.editor.yankPop":            {DefaultKeys: []KeyID{"alt+y"}, Description: "Yank pop"},
 		"tui.editor.undo":               {DefaultKeys: []KeyID{"ctrl+-", "ctrl+z"}, Description: "Undo"},
-		"tui.editor.selectAll":          {DefaultKeys: []KeyID{"super+a", "meta+a", "ctrl+super+a", "ctrl+meta+a"}, Description: "Select all editor text"},
+		"tui.editor.selectAll":          {DefaultKeys: []KeyID{"super+a", "meta+a", "ctrl+super+a", "ctrl+meta+a", "alt+a"}, Description: "Select all editor text"},
 
 		"tui.input.newLine": {DefaultKeys: []KeyID{"shift+enter", "alt+enter"}, Description: "Insert newline"},
 		"tui.input.submit":  {DefaultKeys: []KeyID{"enter"}, Description: "Submit input"},
