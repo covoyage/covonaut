@@ -34,6 +34,23 @@ type Editor struct {
 
 	allSelected bool // editor-scoped selection created by Select All
 
+	// Mouse-drag text selection — independent of allSelected/Select All.
+	// selStart/selEnd are buffer positions (hard row + rune column);
+	// selDragging is true while the mouse button is held down.
+	selDragging bool
+	selActive   bool
+	selStart    editorSelPos
+	selEnd      editorSelPos
+
+	// lastVisuals/lastPadX/lastPromptW* cache the layout computed by the
+	// most recent Render call, so MouseMsg events (which arrive between
+	// renders, with screen-relative row/col) can be translated back into
+	// logical buffer positions for hit-testing.
+	lastVisuals      []editorVisualRow
+	lastPadX         int64
+	lastPromptWFirst int64
+	lastPromptWCont  int64
+
 	minRows int64
 	maxRows int64
 	padX    int64
@@ -72,6 +89,24 @@ type editorSnapshot struct {
 	lines [][]rune
 	row   int64
 	col   int64
+}
+
+// editorSelPos identifies a buffer position for mouse-drag selection: row is
+// an index into Editor.lines (a "hard" line), col is a rune offset within it.
+type editorSelPos struct {
+	row int64
+	col int64
+}
+
+// editorVisualRow records, for one rendered screen row, which hard line it
+// came from and the rune range [colStart, colEnd) of that line it displays.
+// hardRow is -1 for rows with no backing content (e.g. MinRows growth
+// padding beyond the buffer's actual line count).
+type editorVisualRow struct {
+	hardRow    int64
+	colStart   int64
+	colEnd     int64
+	isFirstSeg bool
 }
 
 // NewEditor creates a multi-line editor bound to km (nil = global).
@@ -160,6 +195,8 @@ func (e *Editor) SetValue(s string) {
 	e.row = int64(len(lines) - 1)
 	e.col = int64(len(e.lines[e.row]))
 	e.allSelected = false
+	e.selActive = false
+	e.selDragging = false
 	fn := e.onChange
 	val := e.valueLocked()
 	e.mu.Unlock()
@@ -189,6 +226,7 @@ func (e *Editor) Clear() { e.SetValue("") }
 // SelectAll selects the editor buffer without affecting terminal-level text selection.
 func (e *Editor) SelectAll() {
 	e.mu.Lock()
+	e.clearMouseSelectionLocked()
 	e.allSelected = e.valueLocked() != ""
 	e.row = int64(len(e.lines) - 1)
 	e.col = int64(len(e.lines[e.row]))
@@ -198,16 +236,170 @@ func (e *Editor) SelectAll() {
 func (e *Editor) GetSelectedText() string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	if !e.allSelected {
+	if e.allSelected {
+		return e.valueLocked()
+	}
+	start, end, ok := e.normalizedSelectionLocked()
+	if !ok || start.row < 0 || end.row >= int64(len(e.lines)) {
 		return ""
 	}
-	return e.valueLocked()
+	var b strings.Builder
+	for r := start.row; r <= end.row; r++ {
+		line := e.lines[r]
+		lo, hi := int64(0), int64(len(line))
+		if r == start.row {
+			lo = start.col
+		}
+		if r == end.row {
+			hi = end.col
+		}
+		if lo < 0 {
+			lo = 0
+		}
+		if hi > int64(len(line)) {
+			hi = int64(len(line))
+		}
+		if hi < lo {
+			hi = lo
+		}
+		b.WriteString(string(line[lo:hi]))
+		if r != end.row {
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// normalizedSelectionLocked returns the current mouse-drag selection with
+// start <= end (row/col order), and whether a non-empty selection exists.
+// Must be called with e.mu held (read or write lock).
+func (e *Editor) normalizedSelectionLocked() (start, end editorSelPos, ok bool) {
+	if !e.selActive || e.selStart == e.selEnd {
+		return editorSelPos{}, editorSelPos{}, false
+	}
+	start, end = e.selStart, e.selEnd
+	if start.row > end.row || (start.row == end.row && start.col > end.col) {
+		start, end = end, start
+	}
+	return start, end, true
 }
 
 func (e *Editor) ClearSelection() {
 	e.mu.Lock()
 	e.allSelected = false
+	e.selActive = false
+	e.selDragging = false
 	e.mu.Unlock()
+}
+
+// clearMouseSelection discards any active mouse-drag text selection. Exposed
+// for callers outside the lock (e.g. explicit resets); mutating operations
+// use clearMouseSelectionLocked directly since they already hold e.mu.
+func (e *Editor) clearMouseSelection() {
+	e.mu.Lock()
+	e.clearMouseSelectionLocked()
+	e.mu.Unlock()
+}
+
+// clearMouseSelectionLocked resets mouse-drag selection state. Must be
+// called with e.mu already held.
+func (e *Editor) clearMouseSelectionLocked() {
+	e.selActive = false
+	e.selDragging = false
+}
+
+// handleMouse implements click-drag text selection, mirroring ChatHistory's
+// selection model but scoped to the editor's own buffer. This is purely an
+// in-app mechanism layered on top of received MouseMsg events — it never
+// needs (or benefits from) disabling terminal mouse reporting, so it has no
+// effect on scroll-wheel/click behavior elsewhere in the app.
+func (e *Editor) handleMouse(m core.MouseMsg) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	switch m.Action {
+	case core.MousePress:
+		row, col, ok := e.hitTestLocked(m.Row, m.Col)
+		if !ok {
+			return
+		}
+		e.allSelected = false
+		e.selDragging = true
+		e.selActive = true
+		e.selStart = editorSelPos{row: row, col: col}
+		e.selEnd = e.selStart
+	case core.MouseMotion:
+		if !e.selDragging {
+			return
+		}
+		if row, col, ok := e.hitTestLocked(m.Row, m.Col); ok {
+			e.selEnd = editorSelPos{row: row, col: col}
+		}
+	case core.MouseRelease:
+		if !e.selDragging {
+			return
+		}
+		e.selDragging = false
+		if e.selStart == e.selEnd {
+			e.selActive = false
+		}
+	}
+}
+
+// hitTestLocked translates a screen (row, col) coordinate — as delivered in
+// a MouseMsg, relative to the editor's own rendered area — into a logical
+// (hardRow, runeCol) buffer position, using the layout cached by the most
+// recent Render call. ok is false when the coordinate falls outside any
+// rendered content (e.g. growth-padding rows or stale layout).
+func (e *Editor) hitTestLocked(screenRow, screenCol int64) (row, col int64, ok bool) {
+	if screenRow < 0 || screenRow >= int64(len(e.lastVisuals)) {
+		return 0, 0, false
+	}
+	v := e.lastVisuals[screenRow]
+	if v.hardRow < 0 || v.hardRow >= int64(len(e.lines)) {
+		return 0, 0, false
+	}
+	promptW := e.lastPromptWFirst
+	if !v.isFirstSeg {
+		promptW = e.lastPromptWCont
+	}
+	innerCol := screenCol - e.lastPadX - promptW
+	if innerCol < 0 {
+		innerCol = 0
+	}
+	line := e.lines[v.hardRow]
+	segStart, segEnd := v.colStart, v.colEnd
+	if segStart < 0 {
+		segStart = 0
+	}
+	if segEnd > int64(len(line)) {
+		segEnd = int64(len(line))
+	}
+	if segEnd < segStart {
+		segEnd = segStart
+	}
+	seg := line[segStart:segEnd]
+	idx := runeIndexAtCell(seg, innerCol)
+	return v.hardRow, segStart + idx, true
+}
+
+// runeIndexAtCell returns the rune index within runes whose cumulative
+// visible cell width first reaches or exceeds targetCell, clamped to
+// len(runes). Used to map a mouse click's screen column back to a rune
+// offset in CJK-aware (variable cell width) text.
+func runeIndexAtCell(runes []rune, targetCell int64) int64 {
+	if targetCell <= 0 {
+		return 0
+	}
+	var col int64
+	for i, r := range runes {
+		w := core.RuneWidth(r)
+		if col+w > targetCell {
+			return int64(i)
+		}
+		col += w
+	}
+	return int64(len(runes))
 }
 
 // OnSubmit / OnChange / OnCancel register callbacks.
@@ -268,8 +460,15 @@ func (e *Editor) Render(width int64) []string {
 		contInner = 1
 	}
 
+	// Cache layout metrics so mouse events arriving between renders can be
+	// translated back into logical (row, col) buffer positions.
+	e.lastPadX = e.padX
+	e.lastPromptWFirst = promptWFirst
+	e.lastPromptWCont = promptWCont
+
 	// Empty + unfocused = placeholder.
 	if len(e.lines) == 1 && len(e.lines[0]) == 0 && !e.focused && placeText != "" {
+		e.lastVisuals = nil
 		line := pad + promptFn(firstPrompt) + placeFn(core.TruncateToWidth(placeText, innerWidth, "…"))
 		out := []string{core.PadToWidth(line, width)}
 		for int64(len(out)) < e.minRows {
@@ -334,7 +533,10 @@ func (e *Editor) Render(width int64) []string {
 		}
 	}
 
+	selStart, selEnd, hasSel := e.normalizedSelectionLocked()
+
 	var out []string
+	rowsMeta := make([]editorVisualRow, 0, len(visuals))
 	for idx, v := range visuals {
 		prompt := firstPrompt
 		innerW := innerWidth
@@ -342,10 +544,32 @@ func (e *Editor) Render(width int64) []string {
 			prompt = contPrompt
 			innerW = contInner
 		}
-		bodyText := textFn(v.text)
-		if e.allSelected && v.text != "" {
-			bodyText = "\x1b[48;5;33m" + core.StripAnsi(bodyText) + "\x1b[0m"
+		segRunes := []rune(v.text)
+		segLen := int64(len(segRunes))
+		rowsMeta = append(rowsMeta, editorVisualRow{
+			hardRow:    v.hardRow,
+			colStart:   v.colOffset,
+			colEnd:     v.colOffset + segLen,
+			isFirstSeg: v.isFirstSeg,
+		})
+
+		var bodyText string
+		switch {
+		case e.allSelected && v.text != "":
+			bodyText = "\x1b[48;5;33m" + core.StripAnsi(textFn(v.text)) + "\x1b[0m"
+		case hasSel:
+			if from, to, ok := selRangeInSegment(v.hardRow, v.colOffset, segLen, selStart, selEnd); ok && from < to {
+				before := string(segRunes[:from])
+				sel := string(segRunes[from:to])
+				after := string(segRunes[to:])
+				bodyText = before + "\x1b[48;5;33m" + sel + "\x1b[0m" + after
+			} else {
+				bodyText = textFn(v.text)
+			}
+		default:
+			bodyText = textFn(v.text)
 		}
+
 		body := core.PadToWidth(bodyText, innerW)
 		if int64(idx) == cursorV {
 			body = core.InsertMarker(body, cursorCol)
@@ -361,14 +585,17 @@ func (e *Editor) Render(width int64) []string {
 		body := core.PadToWidth("", emptyInner)
 		line := emptyPad + promptFn(emptyPrompt) + body
 		out = append(out, core.PadToWidth(line, width))
+		rowsMeta = append(rowsMeta, editorVisualRow{hardRow: -1})
 	}
 	if int64(len(out)) > e.maxRows {
 		// Keep the segment containing the cursor visible; drop leading rows.
 		if cursorV >= e.maxRows {
 			drop := cursorV - e.maxRows + 1
 			out = out[drop:]
+			rowsMeta = rowsMeta[drop:]
 		} else {
 			out = out[:e.maxRows]
+			rowsMeta = rowsMeta[:e.maxRows]
 		}
 	}
 
@@ -379,7 +606,37 @@ func (e *Editor) Render(width int64) []string {
 		}
 	}
 
+	e.lastVisuals = rowsMeta
 	return out
+}
+
+// selRangeInSegment computes the selected rune range [from, to) within a
+// single visual segment of hardRow — which spans rune offsets
+// [segStart, segStart+segLen) of that hard line — given a normalized
+// mouse-drag selection. ok is false when hardRow falls outside the
+// selection entirely; from/to may still fall outside [0, segLen) when the
+// selection doesn't reach this particular segment, so callers must check
+// from < to before using the range (guaranteeing 0 <= from < to <= segLen).
+func selRangeInSegment(hardRow, segStart, segLen int64, selStart, selEnd editorSelPos) (from, to int64, ok bool) {
+	if hardRow < selStart.row || hardRow > selEnd.row {
+		return 0, 0, false
+	}
+	rowFrom, rowTo := int64(0), segLen+segStart
+	if hardRow == selStart.row {
+		rowFrom = selStart.col
+	}
+	if hardRow == selEnd.row {
+		rowTo = selEnd.col
+	}
+	from = rowFrom - segStart
+	to = rowTo - segStart
+	if from < 0 {
+		from = 0
+	}
+	if to > segLen {
+		to = segLen
+	}
+	return from, to, true
 }
 
 // Invalidate is a no-op (no cache).
@@ -393,6 +650,8 @@ func (e *Editor) Update(msg core.Msg) core.Cmd {
 		e.processKeys(m.Text)
 	case core.WindowSizeMsg:
 		e.Invalidate()
+	case core.MouseMsg:
+		e.handleMouse(m)
 	}
 	return nil
 }
@@ -433,11 +692,13 @@ func (e *Editor) processKeys(data string) {
 		case km.Matches(raw, "tui.editor.cursorLineStart"):
 			e.mu.Lock()
 			e.allSelected = false
+			e.clearMouseSelectionLocked()
 			e.col = 0
 			e.mu.Unlock()
 		case km.Matches(raw, "tui.editor.cursorLineEnd"):
 			e.mu.Lock()
 			e.allSelected = false
+			e.clearMouseSelectionLocked()
 			e.col = int64(len(e.lines[e.row]))
 			e.mu.Unlock()
 		case km.Matches(raw, "tui.editor.deleteCharBackward"):
@@ -477,6 +738,7 @@ func (e *Editor) processKeys(data string) {
 
 func (e *Editor) insertRune(r rune) {
 	e.mu.Lock()
+	e.clearMouseSelectionLocked()
 	e.pushSnapshotLocked()
 	if e.allSelected {
 		e.clearSelectionContentLocked()
@@ -515,6 +777,7 @@ func (e *Editor) insertRune(r rune) {
 func (e *Editor) moveCursor(dRow, dCol int64) {
 	e.mu.Lock()
 	e.allSelected = false
+	e.clearMouseSelectionLocked()
 	if dRow != 0 {
 		e.row += dRow
 		if e.row < 0 {
@@ -554,6 +817,7 @@ func (e *Editor) moveWord(delta int64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.allSelected = false
+	e.clearMouseSelectionLocked()
 	if delta < 0 {
 		if e.col == 0 && e.row > 0 {
 			e.row--
@@ -574,6 +838,7 @@ func (e *Editor) moveWord(delta int64) {
 
 func (e *Editor) deleteBackward() {
 	e.mu.Lock()
+	e.clearMouseSelectionLocked()
 	e.pushSnapshotLocked()
 	if e.allSelected {
 		e.clearSelectionContentLocked()
@@ -613,6 +878,7 @@ func (e *Editor) deleteBackward() {
 
 func (e *Editor) deleteForward() {
 	e.mu.Lock()
+	e.clearMouseSelectionLocked()
 	e.pushSnapshotLocked()
 	if e.allSelected {
 		e.clearSelectionContentLocked()
@@ -648,6 +914,7 @@ func (e *Editor) deleteForward() {
 
 func (e *Editor) deleteWordBackward() {
 	e.mu.Lock()
+	e.clearMouseSelectionLocked()
 	e.pushSnapshotLocked()
 	if e.allSelected {
 		e.clearSelectionContentLocked()
@@ -688,6 +955,7 @@ func (e *Editor) deleteWordBackward() {
 
 func (e *Editor) deleteWordForward() {
 	e.mu.Lock()
+	e.clearMouseSelectionLocked()
 	e.pushSnapshotLocked()
 	if e.allSelected {
 		e.clearSelectionContentLocked()
@@ -725,6 +993,7 @@ func (e *Editor) deleteWordForward() {
 
 func (e *Editor) deleteToLineStart() {
 	e.mu.Lock()
+	e.clearMouseSelectionLocked()
 	e.pushSnapshotLocked()
 	if e.allSelected {
 		e.clearSelectionContentLocked()
@@ -755,6 +1024,7 @@ func (e *Editor) deleteToLineStart() {
 
 func (e *Editor) deleteToLineEnd() {
 	e.mu.Lock()
+	e.clearMouseSelectionLocked()
 	e.pushSnapshotLocked()
 	if e.allSelected {
 		e.clearSelectionContentLocked()
@@ -803,6 +1073,7 @@ func (e *Editor) pushKillRingLocked(s string) {
 
 func (e *Editor) yank() {
 	e.mu.Lock()
+	e.clearMouseSelectionLocked()
 	if len(e.killRing) == 0 {
 		e.mu.Unlock()
 		return
@@ -821,6 +1092,7 @@ func (e *Editor) yank() {
 
 func (e *Editor) yankPop() {
 	e.mu.Lock()
+	e.clearMouseSelectionLocked()
 	if !e.lastKill || len(e.killRing) == 0 {
 		e.mu.Unlock()
 		return
@@ -924,6 +1196,7 @@ func (e *Editor) pushSnapshotLocked() {
 
 func (e *Editor) undo() {
 	e.mu.Lock()
+	e.clearMouseSelectionLocked()
 	if len(e.history) == 0 {
 		e.mu.Unlock()
 		return
@@ -950,6 +1223,7 @@ func (e *Editor) undo() {
 
 func (e *Editor) redo() {
 	e.mu.Lock()
+	e.clearMouseSelectionLocked()
 	if len(e.future) == 0 {
 		e.mu.Unlock()
 		return

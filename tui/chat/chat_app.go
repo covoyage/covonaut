@@ -840,6 +840,10 @@ type chatLayout struct {
 	ac           *component.Autocomplete
 	lastRows     int64
 	headerHeight int
+	// editorTop is the absolute screen row of the editor's top border, as
+	// computed by the most recent Render call. Used to translate MouseMsg
+	// screen coordinates into the editor's own row space (see Update).
+	editorTop int64
 }
 
 type textSelectionComponent interface {
@@ -887,6 +891,12 @@ func (l *chatLayout) Render(width int64) []string {
 	if remaining < 1 {
 		remaining = 1
 	}
+
+	// Row order below is: header, history(remaining), ac, loader, editor(with
+	// top/bottom border), footer, statusBar. editorTop marks where the
+	// editor's top border row lands; the editor's own content starts one row
+	// after that.
+	l.editorTop = int64(len(headerLines)) + remaining + int64(len(acLines)) + int64(len(loaderLines))
 
 	var historyLines []string
 	if l.history != nil {
@@ -939,6 +949,16 @@ func doCopy(l *chatLayout) {
 	// clipboard with content the user never asked to copy.
 }
 
+// hasSelection reports whether the editor or chat history currently has a
+// non-empty text selection, without clearing it. Used to decide whether
+// Ctrl/Cmd+C should copy instead of interrupting the running agent.
+func hasSelection(l *chatLayout) bool {
+	if sel, ok := l.editor.(textSelectionComponent); ok && sel.GetSelectedText() != "" {
+		return true
+	}
+	return l.history.GetSelectedText() != ""
+}
+
 func isPrimaryShortcutMod(mods terminal.Modifier) bool {
 	return mods&terminal.ModCtrl != 0 || mods&terminal.ModSuper != 0 || mods&terminal.ModMeta != 0
 }
@@ -977,6 +997,27 @@ func (l *chatLayout) Update(msg core.Msg) core.Cmd {
 			if adjusted.Row >= 0 {
 				l.history.Update(adjusted)
 			}
+			// Also forward to the editor (row-adjusted for its own screen
+			// position, skipping its top border row) so click-drag text
+			// selection works inside the input box. Mouse mode itself stays
+			// globally enabled — the editor bounds-checks and ignores events
+			// outside its own rendered rows.
+			//
+			// Forwarded unconditionally (not gated on the adjusted row being
+			// in range): once a drag starts, the mouse can easily drift onto
+			// the editor's border row or outside it entirely before the
+			// button is released. If MouseRelease were dropped here because
+			// the row briefly fell out of range, the editor would be stuck
+			// with selDragging=true forever, and every later mouse move
+			// (terminals report motion regardless of button state) would
+			// keep extending a phantom selection. The editor's own
+			// hitTestLocked/selDragging checks already validate press/motion
+			// positions, so forwarding everything is safe.
+			if upd, ok := l.editor.(core.Updatable); ok {
+				editorAdjusted := m
+				editorAdjusted.Row -= l.editorTop + 1
+				upd.Update(editorAdjusted)
+			}
 		case core.KeyMsg:
 			for _, k := range terminal.ParseKeys(m.Data) {
 				name := strings.ToLower(k.Name)
@@ -1010,6 +1051,17 @@ func (l *chatLayout) Update(msg core.Msg) core.Cmd {
 					l.history.ScrollBy(5)
 				case "c", "insert":
 					if isCopyShortcut(k) {
+						// Prefer copying an active selection over interrupting.
+						// This matters because many terminals don't report a
+						// distinguishable Cmd modifier (no Kitty keyboard protocol
+						// support) and send Cmd+C as the same byte sequence as
+						// Ctrl+C. Without this check, Cmd+C while the agent is
+						// running would interrupt it instead of copying the text
+						// the user just selected.
+						if hasSelection(l) {
+							doCopy(l)
+							return nil
+						}
 						// Ctrl+C while agent is running: interrupt
 						if k.Mods&terminal.ModCtrl != 0 && l.app.cfg.OnInterrupt != nil && l.app.isRunning() {
 							l.app.cfg.OnInterrupt()

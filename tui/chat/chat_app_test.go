@@ -27,19 +27,19 @@ func newTestChatApp(t *testing.T, cfg ChatAppConfig) (*ChatApp, *terminal.Virtua
 }
 
 type testAppHost struct {
-	vt        *terminal.VirtualTerminal
-	children  []core.Component
-	started   bool
-	overlays  []OverlayRef
+	vt       *terminal.VirtualTerminal
+	children []core.Component
+	started  bool
+	overlays []OverlayRef
 }
 
-func (h *testAppHost) Start() error                    { h.started = true; return nil }
-func (h *testAppHost) Stop() error                     { h.started = false; return nil }
-func (h *testAppHost) Done() <-chan struct{}            { ch := make(chan struct{}); close(ch); return ch }
-func (h *testAppHost) AddChild(c core.Component)       { h.children = append(h.children, c) }
-func (h *testAppHost) Focus(c core.Component)           {}
-func (h *testAppHost) RequestRender()                   {}
-func (h *testAppHost) PushOverlay(ov OverlayRef)        { h.overlays = append(h.overlays, ov) }
+func (h *testAppHost) Start() error              { h.started = true; return nil }
+func (h *testAppHost) Stop() error               { h.started = false; return nil }
+func (h *testAppHost) Done() <-chan struct{}     { ch := make(chan struct{}); close(ch); return ch }
+func (h *testAppHost) AddChild(c core.Component) { h.children = append(h.children, c) }
+func (h *testAppHost) Focus(c core.Component)    {}
+func (h *testAppHost) RequestRender()            {}
+func (h *testAppHost) PushOverlay(ov OverlayRef) { h.overlays = append(h.overlays, ov) }
 func (h *testAppHost) RemoveOverlay(ov OverlayRef) bool {
 	for i, o := range h.overlays {
 		if o == ov {
@@ -176,7 +176,6 @@ func TestChatAppEditorDiffExpanded(t *testing.T) {
 	}
 }
 
-
 func TestChatAppEditorSubmit(t *testing.T) {
 	var captured string
 	app, _ := newTestChatApp(t, ChatAppConfig{
@@ -208,6 +207,41 @@ func TestChatAppBusyIdle(t *testing.T) {
 	app.Idle()
 	if app.loader.IsRunning() {
 		t.Fatalf("loader should be stopped")
+	}
+}
+
+func TestCtrlCPrefersCopyOverInterrupt(t *testing.T) {
+	var interrupted bool
+	app, _ := newTestChatApp(t, ChatAppConfig{
+		OnInterrupt: func() { interrupted = true },
+	})
+	app.Busy("working") // agent "running"
+
+	app.editor.Update(core.KeyMsg{Data: "hello"})
+	app.editor.Render(40)                                                      // populate lastVisuals; default prompt "> " is 2 cols wide
+	app.editor.Update(core.MouseMsg{Action: core.MousePress, Row: 0, Col: 2})  // buffer col 0
+	app.editor.Update(core.MouseMsg{Action: core.MouseMotion, Row: 0, Col: 7}) // buffer col 5
+	app.editor.Update(core.MouseMsg{Action: core.MouseRelease, Row: 0, Col: 7})
+	if app.editor.GetSelectedText() != "hello" {
+		t.Fatalf("setup: expected editor selection %q, got %q", "hello", app.editor.GetSelectedText())
+	}
+
+	// Mirrors the real TUI dispatch order (tui.go processMsg): the focused
+	// component (the editor) receives every KeyMsg first, and non-focused
+	// children (chatLayout, which owns the Ctrl/Cmd+C handling) receive it
+	// afterward. A prior bug cleared the editor's mouse-drag selection
+	// unconditionally on every keystroke it saw — including Ctrl+C itself —
+	// so by the time chatLayout's handler ran, the selection was already
+	// gone and nothing got copied.
+	keyMsg := core.KeyMsg{Data: "\x03"} // Ctrl+C
+	app.editor.Update(keyMsg)
+	app.layout.Update(keyMsg)
+
+	if interrupted {
+		t.Fatalf("expected Ctrl+C to copy the active selection instead of interrupting")
+	}
+	if app.editor.GetSelectedText() != "" {
+		t.Fatalf("expected selection to be cleared after copy")
 	}
 }
 
