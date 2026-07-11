@@ -140,6 +140,17 @@ type BashToolConfig struct {
 	Operations BashOperations
 	MaxBytes   int64
 	MaxLines   int64
+
+	// AllowList restricts commands to those matching one of the given
+	// prefixes (word-boundary match, e.g. "git" allows "git status" but
+	// not "github"). Empty means all commands are allowed (subject to
+	// BlockList). The check is applied to each sub-command split on
+	// &&, ||, ;, |. See commandAllowed for limitations.
+	AllowList []string
+
+	// BlockList denies commands matching one of the given prefixes.
+	// BlockList is evaluated before AllowList and wins on conflict.
+	BlockList []string
 }
 
 func (c *BashToolConfig) defaults() {
@@ -194,6 +205,10 @@ func NewBashTool(cwd string, cfg *BashToolConfig) *agentcore.Tool {
 
 			if input.Command == "" {
 				return resultErrf("command is required")
+			}
+
+			if err := commandAllowed(input.Command, cfg.AllowList, cfg.BlockList); err != nil {
+				return resultErrf("command not allowed: %s", err)
 			}
 
 			var chunks [][]byte

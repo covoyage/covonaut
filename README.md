@@ -97,6 +97,8 @@ agent := agentcore.New(agentcore.Config{
 
 Each tool supports pluggable operations for delegating to remote systems (e.g. SSH).
 
+The `bash` tool supports optional `AllowList` and `BlockList` for command filtering — word-boundary prefix match, sub-command aware via `&&`/`||`/`;`/`|` splitting. For strong isolation, delegate `BashOperations` to a sandbox rather than relying on the list alone.
+
 ### MCP Tools
 
 `covonaut` can bridge external MCP servers into first-class `agentcore.Tool`s.
@@ -643,6 +645,55 @@ app := tui.NewChatApp(tui.ChatAppConfig{
 })
 app.Run(ctx)
 ```
+
+## Model Profiles
+
+Register model-specific defaults (system-prompt suffix, excluded tools, temperature, max turns) that apply automatically when `Config.Model` matches.
+
+```go
+agentcore.RegisterProfile(agentcore.ModelProfile{
+    Name:               "claude-sonnet-4-6",
+    SystemPromptSuffix: "Use parallel tool calls when possible.",
+    ExcludedTools:      []string{"computer_use"},
+})
+
+agent := agentcore.New(agentcore.Config{
+    Model:    "claude-sonnet-4-6", // profile applied automatically
+    Provider: provider,
+})
+```
+
+User-set fields always win; `SystemPromptSuffix` is additive. Profiles apply once during `New()` — runtime model changes (e.g. via `ApplyCallConfig`) do not re-apply.
+
+## Prompt Caching
+
+Automatically annotate messages with `cache_control` breakpoints so Anthropic-compatible providers cache stable prefixes (~75% token savings).
+
+```go
+agent := agentcore.New(agentcore.Config{
+    Provider: provider,
+    Extensions: []agentcore.Extension{
+        agentcore.NewPromptCachingExtension(),
+    },
+})
+```
+
+Defaults: 4 breakpoints max, one on the system prompt, one near the conversation tail. Tunable via `WithMaxBreakpoints`, `WithCacheSystemPrompt`, `WithCacheLastN`. A zero-value `PromptCachingExtension{}` is a safe no-op.
+
+## Project Rules
+
+Load project rule files (AGENTS.md, .cursorrules, or any caller-specified file) into the system prompt so the agent picks up project-specific guidance without hard-coding it.
+
+```go
+ext := agentcore.NewRulesExtension() // defaults to AGENTS.md
+// or: agentcore.NewRulesExtension(agentcore.WithRulesPaths("AGENTS.md", ".cursorrules"))
+agent := agentcore.New(agentcore.Config{
+    Provider:   provider,
+    Extensions: []agentcore.Extension{ext},
+})
+```
+
+Missing files are silently skipped. Inject a custom `FileReader` via `WithRulesReader` for sandboxed or embedded rule sources.
 
 ## Extensions
 

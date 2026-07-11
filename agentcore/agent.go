@@ -100,6 +100,7 @@ type Agent struct {
 }
 
 func New(cfg Config) *Agent {
+	cfg = ApplyModelProfile(cfg)
 	if cfg.MaxTurns <= 0 {
 		cfg.MaxTurns = defaultMaxTurns
 	}
