@@ -45,6 +45,11 @@ type ExecutionConfig struct {
 	UnknownToolHandler UnknownToolHandler
 	SteeringMode       SteeringMode // default: SteeringAll
 	FollowUpMode       SteeringMode // default: SteeringAll
+
+	// ArgumentRepairFunc is called when tool arguments contain invalid JSON.
+	// It receives the raw arguments string and tool name, and should return
+	// repaired JSON or the original string if no repair is possible.
+	ArgumentRepairFunc func(rawArgs string, toolName string) string
 }
 
 // CompactionConfig groups context window management and compaction behavior.

@@ -121,6 +121,7 @@ func New(cfg Config) *Agent {
 		After:              cfg.GlobalAfter,
 		ValidateArguments:  cfg.ValidateArguments,
 		UnknownToolHandler: unknownHandler,
+		ArgumentRepairFunc: cfg.ArgumentRepairFunc,
 	}
 
 	engineReg := NewEngineRegistry()

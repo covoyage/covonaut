@@ -299,3 +299,73 @@ func TestExecutorDefaultModeSerial(t *testing.T) {
 		t.Fatalf("expected default mode serial, got %s", exe.config.Mode)
 	}
 }
+
+func TestExecutorArgumentRepair(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(echoTool())
+
+	repairCalled := false
+	repairFunc := func(rawArgs string, toolName string) string {
+		repairCalled = true
+		if toolName == "echo" {
+			return `{"msg":"repaired"}`
+		}
+		return rawArgs
+	}
+
+	exe := NewExecutor(reg, ExecutorConfig{
+		ArgumentRepairFunc: repairFunc,
+	})
+
+	// Invalid JSON should be repaired
+	result := exe.Execute(context.Background(), ToolCall{
+		Name:      "echo",
+		Arguments: `{"msg": "broken"`,
+	}, &AgentState{})
+
+	if result.Err != nil {
+		t.Fatalf("expected no error after repair, got: %v", result.Err)
+	}
+	if !repairCalled {
+		t.Error("repair function was not called")
+	}
+}
+
+func TestExecutorArgumentRepairFails(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(echoTool())
+
+	repairFunc := func(rawArgs string, toolName string) string {
+		return rawArgs // return unchanged (still invalid)
+	}
+
+	exe := NewExecutor(reg, ExecutorConfig{
+		ArgumentRepairFunc: repairFunc,
+	})
+
+	result := exe.Execute(context.Background(), ToolCall{
+		Name:      "echo",
+		Arguments: `{"msg": broken`,
+	}, &AgentState{})
+
+	if result.Err == nil {
+		t.Fatal("expected error when repair fails")
+	}
+}
+
+func TestExecutorNoRepairFunc(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(echoTool())
+
+	// No repair func configured — should reject invalid JSON
+	exe := NewExecutor(reg)
+
+	result := exe.Execute(context.Background(), ToolCall{
+		Name:      "echo",
+		Arguments: `{"msg": broken`,
+	}, &AgentState{})
+
+	if result.Err == nil {
+		t.Fatal("expected error for invalid JSON without repair func")
+	}
+}

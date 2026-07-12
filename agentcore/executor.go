@@ -48,6 +48,12 @@ type ExecutorConfig struct {
 	After              []AfterHook        // global after hooks applied to every tool
 	ValidateArguments  bool               // enable JSON Schema validation of tool arguments
 	UnknownToolHandler UnknownToolHandler // called when the model hallucinates a tool name
+
+	// ArgumentRepairFunc is called when tool arguments contain invalid JSON.
+	// It receives the raw arguments string and tool name, and should return
+	// repaired JSON or the original string if no repair is possible.
+	// When set, repair is attempted before rejecting invalid JSON.
+	ArgumentRepairFunc func(rawArgs string, toolName string) string
 }
 
 // ToolResult holds the outcome of a single tool call execution.
@@ -131,14 +137,27 @@ func (e *Executor) coreExecute(ctx context.Context, tc ToolCall) (string, error)
 	// Unconditional JSON validity check. When the model output is truncated by
 	// max_tokens the tool-call arguments are cut mid-string, producing invalid
 	// JSON. Running the tool with partial arguments risks semantic corruption
-	// (e.g. a half-written file path). Reject early with a clear message so the
-	// model regenerates the call. This runs regardless of ValidateArguments
-	// because it is a correctness guard, not a schema conformance check.
+	// (e.g. a half-written file path). When an ArgumentRepairFunc is configured,
+	// attempt repair before rejecting so the model doesn't need to regenerate.
+	// This runs regardless of ValidateArguments because it is a correctness
+	// guard, not a schema conformance check.
 	if tc.Arguments != "" && !json.Valid([]byte(tc.Arguments)) {
-		return "", fmt.Errorf(
-			"tool %s arguments are not valid JSON — the previous response may have been truncated by max_tokens; please regenerate the tool call with complete arguments",
-			tc.Name,
-		)
+		if e.config.ArgumentRepairFunc != nil {
+			repaired := e.config.ArgumentRepairFunc(tc.Arguments, tc.Name)
+			if repaired != tc.Arguments && json.Valid([]byte(repaired)) {
+				tc.Arguments = repaired
+			} else {
+				return "", fmt.Errorf(
+					"tool %s arguments are not valid JSON and could not be repaired — the previous response may have been truncated by max_tokens; please regenerate the tool call with complete arguments",
+					tc.Name,
+				)
+			}
+		} else {
+			return "", fmt.Errorf(
+				"tool %s arguments are not valid JSON — the previous response may have been truncated by max_tokens; please regenerate the tool call with complete arguments",
+				tc.Name,
+			)
+		}
 	}
 
 	if e.config.ValidateArguments {
