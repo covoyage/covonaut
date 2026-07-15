@@ -78,6 +78,91 @@ func TestChatAppMessageDeltaStream(t *testing.T) {
 	}
 }
 
+// TestChatAppAutoRetryDiscardsStalePartialStream reproduces a bug where a
+// transient provider error mid-stream (followed by an automatic retry)
+// caused the retried attempt's freshly streamed text to be appended after
+// the first, failed attempt's partial text — rendering as visibly
+// duplicated/concatenated text in the same message bubble (e.g. "Let me
+// look at X... Let me look at X...").
+func TestChatAppAutoRetryDiscardsStalePartialStream(t *testing.T) {
+	app, _ := newTestChatApp(t, ChatAppConfig{})
+
+	app.onAgentStart(AgentStartChatEvent{})
+	app.onMessageDelta(MessageDeltaChatEvent{Delta: "Let me look at the docs."})
+
+	msgs := app.History().Messages()
+	if len(msgs) != 1 || msgs[0].Text != "Let me look at the docs." {
+		t.Fatalf("expected 1 partial streaming msg, got %+v", msgs)
+	}
+
+	// The provider call failed and is being retried; the retry event should
+	// discard the stale partial message rather than let the retried
+	// attempt's deltas append onto it.
+	app.onAutoRetry(AutoRetryChatEvent{Attempt: 1, MaxRetries: 3, Delay: time.Millisecond})
+
+	msgs = app.History().Messages()
+	if len(msgs) != 1 {
+		t.Fatalf("expected only the retry system message after discarding stale stream, got %+v", msgs)
+	}
+	if msgs[0].Role != RoleSystem {
+		t.Fatalf("expected remaining message to be the retry system notice, got %+v", msgs[0])
+	}
+
+	// The retried attempt re-streams the assistant reply from scratch.
+	app.onMessageDelta(MessageDeltaChatEvent{Delta: "Let me look at the docs."})
+
+	msgs = app.History().Messages()
+	if len(msgs) != 2 {
+		t.Fatalf("expected retry system msg + fresh assistant msg, got %+v", msgs)
+	}
+	if msgs[1].Text != "Let me look at the docs." {
+		t.Fatalf("retried stream text should not be duplicated, got %q", msgs[1].Text)
+	}
+
+	app.onAgentEnd(AgentEndChatEvent{})
+}
+
+// TestChatAppRepetitionRecoveryDiscardsStalePartialStream mirrors
+// TestChatAppAutoRetryDiscardsStalePartialStream but for the
+// repetition-recovery ladder (runLoop injecting a corrective steering nudge
+// after detecting a degeneration loop): the stale in-flight streamed message
+// must be discarded so the next attempt's deltas start a fresh bubble
+// instead of concatenating onto the abandoned, degenerate partial text.
+func TestChatAppRepetitionRecoveryDiscardsStalePartialStream(t *testing.T) {
+	app, _ := newTestChatApp(t, ChatAppConfig{})
+
+	app.onAgentStart(AgentStartChatEvent{})
+	app.onMessageDelta(MessageDeltaChatEvent{Delta: "Let me look at the docs."})
+
+	msgs := app.History().Messages()
+	if len(msgs) != 1 || msgs[0].Text != "Let me look at the docs." {
+		t.Fatalf("expected 1 partial streaming msg, got %+v", msgs)
+	}
+
+	app.onRepetitionRecovery(RepetitionRecoveryChatEvent{Kind: "stream", Attempt: 0, MaxAttempts: 2})
+
+	msgs = app.History().Messages()
+	if len(msgs) != 1 {
+		t.Fatalf("expected only the recovery system message after discarding stale stream, got %+v", msgs)
+	}
+	if msgs[0].Role != RoleSystem {
+		t.Fatalf("expected remaining message to be the recovery system notice, got %+v", msgs[0])
+	}
+
+	// The retried attempt re-streams the assistant reply from scratch.
+	app.onMessageDelta(MessageDeltaChatEvent{Delta: "Let me look at the docs."})
+
+	msgs = app.History().Messages()
+	if len(msgs) != 2 {
+		t.Fatalf("expected recovery system msg + fresh assistant msg, got %+v", msgs)
+	}
+	if msgs[1].Text != "Let me look at the docs." {
+		t.Fatalf("retried stream text should not be duplicated, got %q", msgs[1].Text)
+	}
+
+	app.onAgentEnd(AgentEndChatEvent{})
+}
+
 func TestChatAppToolLifecycle(t *testing.T) {
 	app, _ := newTestChatApp(t, ChatAppConfig{ShowTimings: true})
 
@@ -267,8 +352,8 @@ func TestChatAppSubscribe(t *testing.T) {
 	adapter := &testSubscriber{handlers: make(map[ChatEventType]func(ChatEvent))}
 	app.Subscribe(adapter)
 
-	if len(adapter.handlers) != 13 {
-		t.Fatalf("expected 13 handlers registered, got %d", len(adapter.handlers))
+	if len(adapter.handlers) != 14 {
+		t.Fatalf("expected 14 handlers registered, got %d", len(adapter.handlers))
 	}
 	for _, et := range []ChatEventType{
 		ChatEventAgentStart, ChatEventAgentEnd, ChatEventAgentError,
@@ -276,7 +361,7 @@ func TestChatAppSubscribe(t *testing.T) {
 		ChatEventToolCallStart, ChatEventToolCallEnd,
 		ChatEventHandoffStart, ChatEventHandoffEnd,
 		ChatEventCompactionStart, ChatEventCompactionEnd,
-		ChatEventAutoRetry,
+		ChatEventAutoRetry, ChatEventRepetitionRecovery,
 	} {
 		if adapter.handlers[et] == nil {
 			t.Errorf("handler for %s not registered", et)

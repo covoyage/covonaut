@@ -366,3 +366,32 @@ func TestAgentRun_Streaming_ContextCancellation(t *testing.T) {
 	// Clean up the hanging provider channel
 	close(provider.ch)
 }
+
+func TestContentSimilar(t *testing.T) {
+	tests := []struct {
+		name  string
+		a, b string
+		ratio float64
+		want  bool
+	}{
+		{"identical", "hello world", "hello world", 0.6, true},
+		{"empty", "", "hello", 0.6, false},
+		{"both empty", "", "", 0.6, true},
+		{"prefix heavy", "Let me read the file and check its contents carefully", "Let me read the file and check its contents carefully now", 0.6, true},
+		{"suffix heavy", "The file contains the following important information about the system", "Important information about the system that we need to review", 0.6, false},
+		{"completely different", "abc", "xyz", 0.6, false},
+		{"subset", "hello", "hello world", 0.6, true},
+		{"minor variation", "I will read file A to check the implementation", "I will read file B to check the implementation", 0.6, true},
+		{"low ratio", "completely different text here", "also totally unrelated content", 0.6, false},
+		{"high threshold", "abc def ghi", "abc def ghi j", 0.9, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := contentSimilar(tt.a, tt.b, tt.ratio)
+			if got != tt.want {
+				t.Errorf("contentSimilar(%q, %q, %v) = %v, want %v", tt.a, tt.b, tt.ratio, got, tt.want)
+			}
+		})
+	}
+}

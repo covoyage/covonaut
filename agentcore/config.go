@@ -8,14 +8,25 @@ import (
 
 // ModelConfig groups LLM model selection and generation parameters.
 type ModelConfig struct {
-	Name           string         // optional: identifies this agent in events and handoff logs
-	Model          string         // model identifier (e.g. "gpt-4o-mini")
-	Provider       Provider       // LLM provider implementation
-	Temperature    float64        // sampling temperature; 0 = deterministic
-	MaxTokens      int64          // max tokens in response; 0 = provider default
-	ResponseFormat *ResponseFormat // optional: force JSON mode etc.
-	Thinking       *ThinkingConfig // optional: extended thinking / reasoning
-	Streaming      bool           // enable streaming responses
+	Name        string   // optional: identifies this agent in events and handoff logs
+	Model       string   // model identifier (e.g. "gpt-4o-mini")
+	Provider    Provider // LLM provider implementation
+	Temperature float64  // sampling temperature; 0 = deterministic
+	MaxTokens   int64    // max tokens in response; 0 = provider default
+
+	// FrequencyPenalty / PresencePenalty reduce the model's tendency to
+	// degenerate into repeating the same text verbatim (see EventAutoRetry /
+	// stream_health repetition-loop detection for the after-the-fact
+	// mitigation). 0 = provider default (unset). Only forwarded by providers
+	// that support the OpenAI-style penalty params (e.g. chatcompat); other
+	// providers (Anthropic, Gemini, Bedrock) silently ignore these fields.
+	// Not all models accept non-zero penalties (some reasoning models reject
+	// them), so this is opt-in and never defaulted automatically.
+	FrequencyPenalty float64
+	PresencePenalty  float64
+	ResponseFormat   *ResponseFormat // optional: force JSON mode etc.
+	Thinking         *ThinkingConfig // optional: extended thinking / reasoning
+	Streaming        bool            // enable streaming responses
 
 	// FastMode requests priority/low-latency processing where supported
 	// (e.g. OpenAI Priority Processing, Anthropic Fast Mode).
@@ -46,6 +57,12 @@ type ExecutionConfig struct {
 	SteeringMode       SteeringMode // default: SteeringAll
 	FollowUpMode       SteeringMode // default: SteeringAll
 
+	// RepetitionRecovery controls the soft repetition-loop recovery ladder
+	// (nudge, then escalate, then give up) used by runLoop when a
+	// degeneration/repetition loop is detected. nil uses built-in defaults
+	// (MaxAttempts=2, English prompts).
+	RepetitionRecovery *RepetitionRecoveryConfig
+
 	// ArgumentRepairFunc is called when tool arguments contain invalid JSON.
 	// It receives the raw arguments string and tool name, and should return
 	// repaired JSON or the original string if no repair is possible.
@@ -54,19 +71,19 @@ type ExecutionConfig struct {
 
 // CompactionConfig groups context window management and compaction behavior.
 type CompactionConfig struct {
-	ContextWindow         int64    // model context window size in tokens (e.g. 128000); 0 = no compaction
-	ReserveTokens         int64    // tokens reserved for response generation; default = ContextWindow/4
-	KeepRecentTokens      int64    // min recent tokens preserved during compaction; default = 2000
-	StructuredCompaction  bool     // emit JSON summaries instead of free-form paragraphs
-	ProtectFirstN         int      // number of non-system head messages to preserve verbatim; default = 3
-	CompressionThreshold  float64  // compress when usage exceeds this fraction of contextWindow; default = 0.75
-	AutoCompactTokenLimit int64    // absolute token threshold (overrides CompressionThreshold when > 0); default = 0
-	AntiThrashEnabled     bool     // skip compaction if recent savings < 10%; default = true
-	CompressionModel      string   // optional: separate model for summarization (cheaper/faster)
-	CompressionProvider   Provider // optional: provider for compression model
-	CompressionBaseURL    string   // optional: base URL for compression model
-	CompressionAPIKey     string   // optional: API key for compression model
-	Engine                string   // context engine name; default = "compressor"
+	ContextWindow         int64         // model context window size in tokens (e.g. 128000); 0 = no compaction
+	ReserveTokens         int64         // tokens reserved for response generation; default = ContextWindow/4
+	KeepRecentTokens      int64         // min recent tokens preserved during compaction; default = 2000
+	StructuredCompaction  bool          // emit JSON summaries instead of free-form paragraphs
+	ProtectFirstN         int           // number of non-system head messages to preserve verbatim; default = 3
+	CompressionThreshold  float64       // compress when usage exceeds this fraction of contextWindow; default = 0.75
+	AutoCompactTokenLimit int64         // absolute token threshold (overrides CompressionThreshold when > 0); default = 0
+	AntiThrashEnabled     bool          // skip compaction if recent savings < 10%; default = true
+	CompressionModel      string        // optional: separate model for summarization (cheaper/faster)
+	CompressionProvider   Provider      // optional: provider for compression model
+	CompressionBaseURL    string        // optional: base URL for compression model
+	CompressionAPIKey     string        // optional: API key for compression model
+	Engine                string        // context engine name; default = "compressor"
 	CustomEngine          ContextEngine // pre-built custom engine (overrides Engine name)
 }
 
@@ -124,6 +141,19 @@ func WithTemperature(temp float64) ConfigOption {
 // WithMaxTokens sets the maximum response tokens.
 func WithMaxTokens(n int64) ConfigOption {
 	return func(c *Config) { c.MaxTokens = n }
+}
+
+// WithFrequencyPenalty sets the frequency penalty (reduces likelihood of
+// repeating tokens that already appeared; helps mitigate degenerate
+// repetition loops on providers that support it, e.g. OpenAI-compatible).
+func WithFrequencyPenalty(p float64) ConfigOption {
+	return func(c *Config) { c.FrequencyPenalty = p }
+}
+
+// WithPresencePenalty sets the presence penalty (discourages reusing any
+// token that has appeared at all, regardless of frequency).
+func WithPresencePenalty(p float64) ConfigOption {
+	return func(c *Config) { c.PresencePenalty = p }
 }
 
 // WithStreaming enables or disables streaming.

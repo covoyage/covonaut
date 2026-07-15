@@ -1,10 +1,108 @@
 package agentcore
 
 import (
+	"errors"
 	"math/rand"
 	"regexp"
+	"strings"
 	"time"
 )
+
+// ErrRepetitionLoop is returned (wrapped) when a provider middleware detects
+// the model has degenerated into repeating the same text/tokens verbatim
+// mid-stream. Unlike transport errors, this is never retried with the same
+// request via callProviderWithRetry — the caller (runLoop) is expected to
+// catch it with IsRepetitionLoopError and drive its own recovery ladder
+// (inject a corrective steering message and try again, up to a limit) rather
+// than blindly resending the identical request.
+var ErrRepetitionLoop = errors.New("stream repetition loop detected")
+
+// IsRepetitionLoopError returns true if err is (or wraps) ErrRepetitionLoop.
+func IsRepetitionLoopError(err error) bool {
+	return errors.Is(err, ErrRepetitionLoop)
+}
+
+// RepetitionKind identifies which detector triggered a repetition-recovery
+// nudge, so a custom Prompt function (or the built-in default) can tailor
+// the corrective message to what actually went wrong.
+type RepetitionKind string
+
+const (
+	// RepetitionKindStream: mid-stream degeneration reported by a provider
+	// middleware (e.g. covo-agent's stream_health n-gram/periodicity detector).
+	RepetitionKindStream RepetitionKind = "stream"
+	// RepetitionKindText: the model produced (near-)identical assistant text
+	// across consecutive turns.
+	RepetitionKindText RepetitionKind = "text"
+	// RepetitionKindTool: the model made the same tool call (name+arguments)
+	// across consecutive turns without progress.
+	RepetitionKindTool RepetitionKind = "tool"
+)
+
+// RepetitionRecoveryConfig controls the soft repetition-loop recovery ladder
+// used by runLoop: when a degeneration/repetition loop is detected (mid-
+// stream via a provider middleware, or across turns via repeated content or
+// repeated tool calls), a corrective steering message is injected and the
+// model gets another chance — escalating in severity — before the turn is
+// finally given up on with a terminal error.
+type RepetitionRecoveryConfig struct {
+	// MaxAttempts is how many corrective nudges to send (per detector) before
+	// giving up and ending the turn with a terminal error. <= 0 uses the
+	// built-in default (2), matching a "mild nudge, then a stronger replan
+	// nudge, then give up" ladder.
+	MaxAttempts int64
+
+	// Prompt returns the corrective steering message for the given detector
+	// and 0-based attempt number (0 = first/mildest nudge, increasing
+	// severity thereafter). If nil, a built-in English default ladder is
+	// used. Callers wanting localized text should supply this.
+	Prompt func(kind RepetitionKind, attempt int64) string
+}
+
+var whitespaceCollapsePattern = regexp.MustCompile(`\s+`)
+var repetitionLeadInPattern = regexp.MustCompile(`(?i)^(let me |i'll |i will |let's )`)
+
+// normalizeForLoopDetection reduces assistant text to a comparable core for
+// cross-turn repetition detection: case-folded, whitespace-collapsed, common
+// narration lead-ins stripped (so "Let me check X" and "I'll check X"
+// compare equal when the model is stuck repeating the same underlying
+// action with slightly different wording), and capped in length (a long
+// shared prefix is already strong signal; comparing full multi-paragraph
+// text needlessly misses turns that only diverge near the end).
+func normalizeForLoopDetection(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = whitespaceCollapsePattern.ReplaceAllString(s, " ")
+	s = repetitionLeadInPattern.ReplaceAllString(s, "")
+	if len(s) > 200 {
+		s = s[:200]
+	}
+	return s
+}
+
+// defaultRepetitionPrompt is the built-in English recovery ladder used when
+// Config.RepetitionRecovery (or its Prompt field) is not set. attempt == 0 is
+// the mild first nudge; attempt >= 1 escalates to a stronger "replan"
+// message.
+func defaultRepetitionPrompt(kind RepetitionKind, attempt int64) string {
+	strong := attempt > 0
+	switch kind {
+	case RepetitionKindTool:
+		if strong {
+			return "CRITICAL: you are STILL calling the same tools with the same arguments after a previous warning. You MUST abandon this approach entirely, explain to the user what you attempted and why it failed, and ask for guidance. Do not call any more tools."
+		}
+		return "You have been calling the same tools repeatedly without progress. Stop this loop immediately. Do not call any more tools. Report to the user what you attempted and why it failed, and ask for guidance."
+	case RepetitionKindStream:
+		if strong {
+			return "CRITICAL: your output is still degenerating into repeated text after a previous warning. You MUST completely change your approach: state what you were trying to do, why it failed, and propose a different plan. Do not repeat the same wording again."
+		}
+		return "Your recent output contained repeated phrases. Stop repeating yourself: vary your wording and reasoning, try a different tool or approach, or explain what is blocking you instead of looping."
+	default: // RepetitionKindText
+		if strong {
+			return "CRITICAL: you are STILL repeating the same response after a previous warning. You MUST abandon your current approach, explain what you were trying to do and why it failed, and ask the user for guidance."
+		}
+		return "You have been repeating the same response. Stop this loop immediately. Do not call any more tools. Give a final answer based on what you have so far, or clearly state that you cannot complete the request and ask the user for guidance."
+	}
+}
 
 // RetryConfig controls LLM-level automatic retry behavior.
 type RetryConfig struct {

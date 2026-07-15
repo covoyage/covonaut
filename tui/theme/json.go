@@ -7,14 +7,14 @@ import (
 	"strings"
 )
 
-// themeJSONFile matches the subset of pi-mono coding-agent theme JSON we support.
+// themeJSONFile matches the subset of the common theme JSON schema we support.
 type themeJSONFile struct {
 	Name   string         `json:"name"`
 	Vars   map[string]any `json:"vars"`
 	Colors map[string]any `json:"colors"`
 }
 
-// ParseSemanticThemeJSON parses a pi-compatible theme JSON document into SemanticTheme.
+// ParseSemanticThemeJSON parses a compatible theme JSON document into SemanticTheme.
 // Unknown keys are ignored; missing colors inherit from base (typically DefaultSemanticDark).
 func ParseSemanticThemeJSON(data []byte, base *SemanticTheme) (*SemanticTheme, error) {
 	var raw themeJSONFile

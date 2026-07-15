@@ -100,7 +100,6 @@ type Agent struct {
 }
 
 func New(cfg Config) *Agent {
-	cfg = ApplyModelProfile(cfg)
 	if cfg.MaxTurns <= 0 {
 		cfg.MaxTurns = defaultMaxTurns
 	}
@@ -121,7 +120,6 @@ func New(cfg Config) *Agent {
 		After:              cfg.GlobalAfter,
 		ValidateArguments:  cfg.ValidateArguments,
 		UnknownToolHandler: unknownHandler,
-		ArgumentRepairFunc: cfg.ArgumentRepairFunc,
 	}
 
 	engineReg := NewEngineRegistry()
@@ -135,21 +133,21 @@ func New(cfg Config) *Agent {
 			engineName = engineReg.Default()
 		}
 		engineCfg := ContextEngineConfig{
-			Model:               cfg.Model,
-			BaseURL:             "",
-			APIKey:              "",
-			Provider:            cfg.Provider,
-			ContextWindow:       cfg.ContextWindow,
-			ReserveTokens:       cfg.ReserveTokens,
-			KeepRecentTokens:    cfg.KeepRecentTokens,
-			ProtectFirstN:       cfg.ProtectFirstN,
+			Model:                cfg.Model,
+			BaseURL:              "",
+			APIKey:               "",
+			Provider:             cfg.Provider,
+			ContextWindow:        cfg.ContextWindow,
+			ReserveTokens:        cfg.ReserveTokens,
+			KeepRecentTokens:     cfg.KeepRecentTokens,
+			ProtectFirstN:        cfg.ProtectFirstN,
 			CompressionThreshold: cfg.CompressionThreshold,
-			AutoCompactLimit:    cfg.AutoCompactTokenLimit,
+			AutoCompactLimit:     cfg.AutoCompactTokenLimit,
 			StructuredCompaction: cfg.StructuredCompaction,
-			CompressionModel:    cfg.CompressionModel,
-			CompressionProvider: cfg.CompressionProvider,
-			CompressionBaseURL:  cfg.CompressionBaseURL,
-			CompressionAPIKey:   cfg.CompressionAPIKey,
+			CompressionModel:     cfg.CompressionModel,
+			CompressionProvider:  cfg.CompressionProvider,
+			CompressionBaseURL:   cfg.CompressionBaseURL,
+			CompressionAPIKey:    cfg.CompressionAPIKey,
 		}
 		var err error
 		ctxEngine, err = engineReg.Create(engineName, engineCfg)
@@ -190,7 +188,7 @@ func New(cfg Config) *Agent {
 
 func (a *Agent) On(t EventType, h EventHandler) func() { return a.eventBus.On(t, h) }
 func (a *Agent) OnAll(h EventHandler) func()           { return a.eventBus.OnAll(h) }
-func (a *Agent) EmitEvent(e Event)              { a.eventBus.Emit(e) }
+func (a *Agent) EmitEvent(e Event)                     { a.eventBus.Emit(e) }
 func (a *Agent) EmitExtensionSnapshots() {
 	for _, e := range a.extensions.SnapshotEvents() {
 		a.eventBus.Emit(e)
@@ -279,9 +277,9 @@ func (a *Agent) systemPrompt() string {
 
 // --- tool hot-reload ---
 
-func (a *Agent) RegisterTools(tools ...*Tool)    { a.registry.Register(tools...) }
-func (a *Agent) UnregisterTools(names ...string) { a.registry.Unregister(names...) }
-func (a *Agent) ToolNames() []string             { return a.registry.Names() }
+func (a *Agent) RegisterTools(tools ...*Tool)      { a.registry.Register(tools...) }
+func (a *Agent) UnregisterTools(names ...string)   { a.registry.Unregister(names...) }
+func (a *Agent) ToolNames() []string               { return a.registry.Names() }
 func (a *Agent) GetTool(name string) (*Tool, bool) { return a.registry.Get(name) }
 
 // InvokeTool runs a single named tool through the exact same hook pipeline
@@ -346,11 +344,11 @@ func (a *Agent) ContextEngineStats() map[string]any {
 		return nil
 	}
 	stats := map[string]any{
-		"name":             a.contextEngine.Name(),
-		"context_length":   a.contextEngine.ContextLength(),
-		"threshold_tokens": a.contextEngine.ThresholdTokens(),
+		"name":              a.contextEngine.Name(),
+		"context_length":    a.contextEngine.ContextLength(),
+		"threshold_tokens":  a.contextEngine.ThresholdTokens(),
 		"compression_count": a.contextEngine.CompressionCount(),
-		"last_savings_pct": a.contextEngine.LastSavingsPct(),
+		"last_savings_pct":  a.contextEngine.LastSavingsPct(),
 	}
 	if ce, ok := a.contextEngine.(*CompressorEngine); ok {
 		stats["details"] = ce.SummaryStats()
@@ -560,6 +558,16 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 	var lastToolSignature string
 	var toolRepeatCount int
 
+	// Recovery-attempt counters for the repetition-recovery ladder — one per
+	// detector, scoped to this runLoop invocation (reset on every new
+	// user message / Run call, not cumulative across the whole session).
+	// Separate from repeatCount/toolRepeatCount above, which count
+	// consecutive *detections* (the fire threshold); these count how many
+	// corrective nudges have actually been sent before giving up.
+	var streamRepeatAttempts int64
+	var textRecoveryAttempts int64
+	var toolRecoveryAttempts int64
+
 	for {
 		// Inner loop: process turns until the model stops calling tools
 		for a.state.Status() == StatusRunning {
@@ -622,14 +630,16 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 			msgs = converter(msgs)
 
 			req := &ProviderRequest{
-				Model:          a.config.Model,
-				Messages:       msgs,
-				Tools:          a.registry.Definitions(),
-				Temperature:    a.config.Temperature,
-				MaxTokens:      a.config.MaxTokens,
-				ResponseFormat: a.config.ResponseFormat,
-				Thinking:       a.config.Thinking,
-				FastMode:       a.config.FastMode,
+				Model:            a.config.Model,
+				Messages:         msgs,
+				Tools:            a.registry.Definitions(),
+				Temperature:      a.config.Temperature,
+				FrequencyPenalty: a.config.FrequencyPenalty,
+				PresencePenalty:  a.config.PresencePenalty,
+				MaxTokens:        a.config.MaxTokens,
+				ResponseFormat:   a.config.ResponseFormat,
+				Thinking:         a.config.Thinking,
+				FastMode:         a.config.FastMode,
 			}
 
 			// Lifecycle: BeforeModelCall
@@ -658,6 +668,35 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 						resp, err = a.callProviderWithRetry(ctx, req)
 					}
 				}
+
+				// Repetition loop detected mid-stream (e.g. by covo-agent's
+				// stream_health n-gram/periodicity middleware). Rather than
+				// failing the turn outright, inject an escalating corrective
+				// steering message and give the model another chance — up to
+				// MaxAttempts — before giving up. Mirrors the
+				// compaction-then-retry pattern above, but for degeneration
+				// rather than context overflow.
+				if err != nil && IsRepetitionLoopError(err) {
+					if streamRepeatAttempts < a.repetitionMaxAttempts() {
+						a.steering.Push(Message{
+							Role:    RoleSystem,
+							Content: a.repetitionPrompt(RepetitionKindStream, streamRepeatAttempts),
+						})
+						a.emit(&RepetitionRecoveryEvent{
+							baseEvent:   newBase(EventRepetitionRecovery),
+							Kind:        RepetitionKindStream,
+							Attempt:     streamRepeatAttempts,
+							MaxAttempts: a.repetitionMaxAttempts(),
+						})
+						streamRepeatAttempts++
+						continue
+					}
+					ne := NewNodeError("repetition loop", ErrRepetitionLoop, a.config.Name, fmt.Sprintf("turn:%d", turn))
+					a.state.SetStatus(StatusError)
+					a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
+					return "", ne
+				}
+
 				if err != nil {
 					if errors.Is(err, context.Canceled) {
 						// User interrupted — emit clean end event instead of cryptic error
@@ -833,37 +872,75 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 				return a.handleTransfer(ctx, handoff)
 			}
 
-			// Repetition detection: if the model emits the same text 3+ turns in a
-			// row it is stuck in a loop. Inject a steering message to break out.
-			if turn-loopStartTurn >= 2 && resp.Content != "" && resp.Content == lastContent {
+			// Repetition detection: if the model emits (near-)identical text
+			// 3+ turns in a row it is stuck in a loop. Normalize before
+			// comparing so minor wording variations ("Let me check X" vs
+			// "I'll check X") on an otherwise-identical repeated action still
+			// count as the same loop. Injects an escalating corrective
+			// steering message (mild, then strong) and gives up with a
+			// terminal error once MaxAttempts nudges fail to break it.
+			normalizedContent := normalizeForLoopDetection(resp.Content)
+			if turn-loopStartTurn >= 2 && normalizedContent != "" && normalizedContent == lastContent {
 				repeatCount++
 				if repeatCount >= 2 {
-					a.steering.Push(Message{
-						Role:    RoleSystem,
-						Content: "You have been repeating the same response. Stop this loop immediately. Do not call any more tools. Give a final answer based on what you have so far, or clearly state that you cannot complete the request and ask the user for guidance.",
-					})
-					lastContent = ""
-					repeatCount = 0
+					if textRecoveryAttempts < a.repetitionMaxAttempts() {
+						a.steering.Push(Message{
+							Role:    RoleSystem,
+							Content: a.repetitionPrompt(RepetitionKindText, textRecoveryAttempts),
+						})
+						a.emit(&RepetitionRecoveryEvent{
+							baseEvent:   newBase(EventRepetitionRecovery),
+							Kind:        RepetitionKindText,
+							Attempt:     textRecoveryAttempts,
+							MaxAttempts: a.repetitionMaxAttempts(),
+						})
+						textRecoveryAttempts++
+						lastContent = ""
+						repeatCount = 0
+					} else {
+						ne := NewNodeError("repetition loop", ErrRepetitionLoop, a.config.Name, fmt.Sprintf("turn:%d", turn))
+						a.state.SetStatus(StatusError)
+						a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
+						return "", ne
+					}
 				}
-			} else if resp.Content != "" {
-				lastContent = resp.Content
+			} else if normalizedContent != "" {
+				lastContent = normalizedContent
 				repeatCount = 0
 			}
 
-			// Tool-call repetition detection: if the model makes the same set of
-			// tool calls (by name) 3+ turns in a row, it is stuck in a retry loop
-			// even though the text content differs each turn.
+			// Tool-call repetition detection: if the model makes the same
+			// tool call (name AND arguments) 3+ turns in a row, it is stuck
+			// in a retry loop even though the text content differs each
+			// turn. Arguments are part of the signature so legitimate
+			// repeated-tool-different-arguments sequences (e.g. reading
+			// three different files in a row) are never mistaken for a
+			// stuck loop.
 			if len(resp.ToolCalls) > 0 {
 				sig := toolCallSignature(resp.ToolCalls)
 				if sig == lastToolSignature {
 					toolRepeatCount++
 					if toolRepeatCount >= 2 {
-						a.steering.Push(Message{
-							Role:    RoleSystem,
-							Content: "You have been calling the same tools repeatedly without progress. Stop this loop immediately. Do not call any more tools. Report to the user what you attempted and why it failed, and ask for guidance.",
-						})
-						lastToolSignature = ""
-						toolRepeatCount = 0
+						if toolRecoveryAttempts < a.repetitionMaxAttempts() {
+							a.steering.Push(Message{
+								Role:    RoleSystem,
+								Content: a.repetitionPrompt(RepetitionKindTool, toolRecoveryAttempts),
+							})
+							a.emit(&RepetitionRecoveryEvent{
+								baseEvent:   newBase(EventRepetitionRecovery),
+								Kind:        RepetitionKindTool,
+								Attempt:     toolRecoveryAttempts,
+								MaxAttempts: a.repetitionMaxAttempts(),
+							})
+							toolRecoveryAttempts++
+							lastToolSignature = ""
+							toolRepeatCount = 0
+						} else {
+							ne := NewNodeError("repetition loop", ErrRepetitionLoop, a.config.Name, fmt.Sprintf("turn:%d", turn))
+							a.state.SetStatus(StatusError)
+							a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
+							return "", ne
+						}
 					}
 				} else {
 					lastToolSignature = sig
@@ -900,14 +977,37 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 
 // toolCallSignature returns a stable string key for a set of tool calls,
 // used by the repetition detector to catch retry loops where the model
-// calls the same tools each turn but with varying text content.
+// calls the same tools with the same arguments each turn. Arguments are
+// included (not just names) so legitimate repeated-tool-different-arguments
+// sequences (e.g. reading three different files in a row) are never
+// mistaken for a stuck loop.
 func toolCallSignature(calls []ToolCall) string {
-	names := make([]string, len(calls))
+	sigs := make([]string, len(calls))
 	for i, c := range calls {
-		names[i] = c.Name
+		sigs[i] = c.Name + ":" + c.Arguments
 	}
-	sort.Strings(names)
-	return strings.Join(names, ",")
+	sort.Strings(sigs)
+	return strings.Join(sigs, "|")
+}
+
+// repetitionMaxAttempts returns how many corrective steering nudges the
+// repetition-recovery ladder should try (per detector) before giving up.
+func (a *Agent) repetitionMaxAttempts() int64 {
+	if a.config.RepetitionRecovery != nil && a.config.RepetitionRecovery.MaxAttempts > 0 {
+		return a.config.RepetitionRecovery.MaxAttempts
+	}
+	return 2
+}
+
+// repetitionPrompt returns the corrective steering message for the given
+// detector and 0-based attempt number, using Config.RepetitionRecovery.Prompt
+// if supplied (e.g. so covo-agent can localize the text) or the built-in
+// English default ladder otherwise.
+func (a *Agent) repetitionPrompt(kind RepetitionKind, attempt int64) string {
+	if a.config.RepetitionRecovery != nil && a.config.RepetitionRecovery.Prompt != nil {
+		return a.config.RepetitionRecovery.Prompt(kind, attempt)
+	}
+	return defaultRepetitionPrompt(kind, attempt)
 }
 
 // persistMessage appends a message after lifecycle BeforeMessagePersist /
@@ -1095,6 +1195,14 @@ func (a *Agent) runStreaming(ctx context.Context, req *ProviderRequest) (*Provid
 		case delta, ok := <-ch:
 			if !ok {
 				goto buildResponse
+			}
+			if delta.Err != nil {
+				// Terminal mid-stream condition (e.g. repetition loop) signaled by a
+				// provider middleware. Discard whatever content/blocks were
+				// accumulated so far -- it's degenerate output that must never be
+				// persisted as a real assistant turn -- and surface the error so the
+				// caller's recovery ladder (runLoop) can react.
+				return nil, delta.Err
 			}
 			if delta.Content != "" {
 				content.WriteString(delta.Content)

@@ -9,13 +9,15 @@ import (
 
 // ProviderRequest is the input for a model completion call.
 type ProviderRequest struct {
-	Model          string
-	Messages       []Message
-	Tools          []ToolDefinition
-	Temperature    float64
-	MaxTokens      int64
-	ResponseFormat *ResponseFormat
-	Thinking       *ThinkingConfig
+	Model            string
+	Messages         []Message
+	Tools            []ToolDefinition
+	Temperature      float64
+	FrequencyPenalty float64
+	PresencePenalty  float64
+	MaxTokens        int64
+	ResponseFormat   *ResponseFormat
+	Thinking         *ThinkingConfig
 
 	// FastMode requests priority/low-latency processing where supported
 	// (e.g. OpenAI Priority Processing, Anthropic Fast Mode).
@@ -318,6 +320,13 @@ type StreamDelta struct {
 	// FinishReason is populated on the final chunk by providers that expose it.
 	// Common values: "stop", "length", "tool_calls", "content_filter".
 	FinishReason string
+	// Err, when non-nil, signals a terminal mid-stream condition detected by a
+	// provider middleware (e.g. a degenerate repetition loop) rather than a
+	// genuine model-generated finish. When set, this should be the last delta
+	// sent before the channel is closed; runStreaming discards any content
+	// accumulated so far and returns this error instead of a normal response,
+	// so the bad/partial output never gets persisted as a real assistant turn.
+	Err error
 }
 
 // ToolCallDelta is an incremental fragment of a tool call during streaming.

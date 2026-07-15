@@ -6,7 +6,7 @@ import (
 )
 
 // Runnable[I, O] is a generic interface for any executable component.
-// Inspired by eino's four-mode Runnable, it supports all data flow patterns:
+// A four-mode design that supports all data flow patterns:
 //   - Invoke:    single input  → single output
 //   - Stream:    single input  → stream output
 //   - Collect:   stream input  → single output

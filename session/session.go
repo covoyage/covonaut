@@ -19,7 +19,7 @@ import (
 const CurrentVersion int64 = 4
 
 // ---------------------------------------------------------------------------
-// Entry types — mirrors the session-manager.ts entry taxonomy
+// Entry types
 // ---------------------------------------------------------------------------
 
 type EntryType string

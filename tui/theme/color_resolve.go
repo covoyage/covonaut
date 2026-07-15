@@ -18,7 +18,7 @@ const (
 	ColorMode256
 )
 
-// DetectColorMode mirrors common heuristics (similar to pi-mono coding-agent).
+// DetectColorMode uses common terminal-capability heuristics.
 func DetectColorMode() ColorMode {
 	if os.Getenv("COLORTERM") == "truecolor" || os.Getenv("COLORTERM") == "24bit" {
 		return ColorModeTruecolor

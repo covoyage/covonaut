@@ -95,7 +95,7 @@ func shouldCompact(msgs []Message, toolDefs []ToolDefinition, contextWindow int6
 	}
 	estimated := EstimateMessagesTokens(msgs) + EstimateToolDefinitionsTokens(toolDefs)
 
-	// Codex-style: absolute token limit takes priority over percentage threshold.
+	// Absolute token limit takes priority over percentage threshold.
 	if autoCompactLimit > 0 {
 		return estimated >= autoCompactLimit
 	}

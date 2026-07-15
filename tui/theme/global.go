@@ -55,7 +55,7 @@ func DefaultSemanticForTerminal() *SemanticTheme {
 	return DefaultSemanticDark()
 }
 
-// InitThemeFromEnv loads TUI_THEME or AGENT_TUI_THEME JSON (pi-compatible subset),
+// InitThemeFromEnv loads TUI_THEME or AGENT_TUI_THEME JSON (compatible subset),
 // otherwise picks DefaultSemanticForTerminal. Color mode follows TUI_COLORMODE
 // or DetectColorMode.
 func InitThemeFromEnv() error {

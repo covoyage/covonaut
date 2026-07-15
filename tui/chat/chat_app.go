@@ -114,7 +114,7 @@ type ChatApp struct {
 	// SuppressAutoRetry suppresses auto-retry messages from being printed to
 	// the chat history. When true, retry events are silently dropped instead of
 	// showing "⚠ retry N/M in D". Used by covo-agent to buffer retry messages
-	// and only flush them on final failure (Hermes-style buffered retry).
+	// and only flush them on final failure.
 	SuppressAutoRetry bool
 
 	skipRefresh bool // suppress autocomplete re-activation after applying a suggestion
@@ -338,6 +338,7 @@ func (a *ChatApp) Subscribe(sub EventSubscriber) {
 	sub.On(ChatEventCompactionStart, a.onCompactionStart)
 	sub.On(ChatEventCompactionEnd, a.onCompactionEnd)
 	sub.On(ChatEventAutoRetry, a.onAutoRetry)
+	sub.On(ChatEventRepetitionRecovery, a.onRepetitionRecovery)
 	sub.On(ChatEventAgentError, a.onAgentError)
 	sub.On(ChatEventAgentEnd, a.onAgentEnd)
 }
@@ -777,6 +778,18 @@ func (a *ChatApp) onAutoRetry(e ChatEvent) {
 	if !ok {
 		return
 	}
+	// The in-flight streamed message (if any) belongs to the failed attempt.
+	// The retried provider call re-streams the assistant reply from scratch,
+	// so without discarding this stale partial text, the retry's deltas get
+	// appended after it (same StreamID), producing a visibly duplicated
+	// message (partial text + full text concatenated in one bubble).
+	a.mu.Lock()
+	staleID := a.model.StreamID
+	a.model.StreamID = ""
+	a.mu.Unlock()
+	if staleID != "" {
+		a.history.RemoveMessage(staleID)
+	}
 	if a.SuppressAutoRetry {
 		return
 	}
@@ -784,6 +797,32 @@ func (a *ChatApp) onAutoRetry(e ChatEvent) {
 		Role: RoleSystem,
 		Text: fmt.Sprintf("%s retry %d/%d in %s",
 			theme.SymbolWarning, r.Attempt, r.MaxRetries, r.Delay.Round(time.Millisecond)),
+	})
+}
+
+// onRepetitionRecovery handles a corrective steering nudge injected by
+// runLoop's repetition-recovery ladder (see agentcore.RepetitionRecoveryEvent).
+// Like onAutoRetry, this discards any in-flight streamed message first: for
+// the "stream" kind in particular, the partial/degenerate text belongs to an
+// attempt that is being abandoned (the model will re-generate from scratch
+// on the next attempt), so leaving it wired to the live StreamID would let
+// the next attempt's deltas append after it in the same bubble.
+func (a *ChatApp) onRepetitionRecovery(e ChatEvent) {
+	r, ok := e.(RepetitionRecoveryChatEvent)
+	if !ok {
+		return
+	}
+	a.mu.Lock()
+	staleID := a.model.StreamID
+	a.model.StreamID = ""
+	a.mu.Unlock()
+	if staleID != "" {
+		a.history.RemoveMessage(staleID)
+	}
+	a.history.Append(ChatMessage{
+		Role: RoleSystem,
+		Text: fmt.Sprintf("%s repetition detected (%s), nudging model to recover (%d/%d)",
+			theme.SymbolWarning, r.Kind, r.Attempt+1, r.MaxAttempts),
 	})
 }
 

@@ -139,6 +139,16 @@ func (s *subscriberAdapter) On(eventType chat.ChatEventType, handler func(chat.C
 				Delay: ev.Delay, Err: ev.Err,
 			})
 		})
+	case chat.ChatEventRepetitionRecovery:
+		s.agent.On(agentcore.EventRepetitionRecovery, func(e agentcore.Event) {
+			ev, ok := e.(*agentcore.RepetitionRecoveryEvent)
+			if !ok {
+				return
+			}
+			handler(chat.RepetitionRecoveryChatEvent{
+				Kind: string(ev.Kind), Attempt: ev.Attempt, MaxAttempts: ev.MaxAttempts,
+			})
+		})
 	}
 }
 

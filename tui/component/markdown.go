@@ -45,7 +45,10 @@ type MarkdownTheme struct {
 	QuoteFn       func(string) string
 	LinkLabelFn   func(string) string
 	LinkURLFn     func(string) string
-	HRFn          func(string) string
+	// LinkRendererFn, when set, replaces the default label+URL rendering.
+	// It receives the raw label and URL and returns the fully rendered link string.
+	LinkRendererFn func(label, url string) string
+	HRFn           func(string) string
 	ListBulletFn  func(string) string
 	TableBorderFn func(string) string
 	TableHeaderFn func(string) string
@@ -356,6 +359,9 @@ func renderInline(s string, t MarkdownTheme) string {
 		if len(sub) < 3 {
 			return m
 		}
+		if t.LinkRendererFn != nil {
+			return t.LinkRendererFn(sub[1], sub[2])
+		}
 		return t.LinkLabelFn(sub[1]) + " " + t.LinkURLFn("("+sub[2]+")")
 	})
 	return s
@@ -471,6 +477,18 @@ func renderTable(rows []string, width int64, t MarkdownTheme) []string {
 // custom theme is set.
 func DefaultMarkdownTheme() MarkdownTheme { return defaultMarkdownTheme() }
 
+// OSC8LinkRenderer returns a LinkRendererFn that wraps links with OSC8
+// escape sequences, making them clickable in supported terminals
+// (iTerm2, Hyper, Windows Terminal, kitty, etc.). The label and URL
+// remain visible even on terminals that don't support OSC8.
+func OSC8LinkRenderer(labelFn, urlFn func(string) string) func(label, url string) string {
+	return func(label, url string) string {
+		styledLabel := labelFn(label)
+		styledURL := urlFn("(" + url + ")")
+		return "\x1b]8;;" + url + "\x1b\\" + styledLabel + " " + styledURL + "\x1b]8;;\x1b\\"
+	}
+}
+
 func defaultMarkdownTheme() MarkdownTheme {
 	p := apitheme.CurrentPalette()
 	sem := p.Semantic
@@ -478,21 +496,24 @@ func defaultMarkdownTheme() MarkdownTheme {
 	h := func(s string) string {
 		return apitheme.SemStyle(sem.MdHeading, mode).Bold().Render(s)
 	}
+	linkLabelFn := apitheme.SemStyle(sem.MdLink, mode).Underline().Render
+	linkURLFn := apitheme.SemStyle(sem.MdLinkUrl, mode).Render
 	return MarkdownTheme{
-		HeadingFn:     [6]func(string) string{h, h, h, h, h, h},
-		EmphasisFn:    apitheme.NewStyle().Italic().Render,
-		StrongFn:      apitheme.NewStyle().Bold().Render,
-		StrikeFn:      apitheme.NewStyle().Strike().Render,
-		CodeInlineFn:  apitheme.SemStyle(sem.MdCode, mode).Render,
-		CodeBlockFn:   apitheme.SemStyle(sem.MdCodeBlock, mode).Render,
-		CodeFenceFn:   apitheme.SemStyle(sem.MdCodeBlockBorder, mode).Render,
-		QuoteFn:       apitheme.SemStyle(sem.MdQuote, mode).Render,
-		LinkLabelFn:   apitheme.SemStyle(sem.MdLink, mode).Underline().Render,
-		LinkURLFn:     apitheme.SemStyle(sem.MdLinkUrl, mode).Render,
-		HRFn:          apitheme.SemStyle(sem.MdHr, mode).Render,
-		ListBulletFn:  apitheme.SemStyle(sem.MdListBullet, mode).Render,
-		TableBorderFn: apitheme.SemStyle(sem.MdCodeBlockBorder, mode).Render,
-		TableHeaderFn: apitheme.NewStyle().Bold().Render,
+		HeadingFn:      [6]func(string) string{h, h, h, h, h, h},
+		EmphasisFn:     apitheme.NewStyle().Italic().Render,
+		StrongFn:       apitheme.NewStyle().Bold().Render,
+		StrikeFn:       apitheme.NewStyle().Strike().Render,
+		CodeInlineFn:   apitheme.SemStyle(sem.MdCode, mode).Render,
+		CodeBlockFn:    apitheme.SemStyle(sem.MdCodeBlock, mode).Render,
+		CodeFenceFn:    apitheme.SemStyle(sem.MdCodeBlockBorder, mode).Render,
+		QuoteFn:        apitheme.SemStyle(sem.MdQuote, mode).Render,
+		LinkLabelFn:    linkLabelFn,
+		LinkURLFn:      linkURLFn,
+		LinkRendererFn: OSC8LinkRenderer(linkLabelFn, linkURLFn),
+		HRFn:           apitheme.SemStyle(sem.MdHr, mode).Render,
+		ListBulletFn:   apitheme.SemStyle(sem.MdListBullet, mode).Render,
+		TableBorderFn:  apitheme.SemStyle(sem.MdCodeBlockBorder, mode).Render,
+		TableHeaderFn:  apitheme.NewStyle().Bold().Render,
 	}
 }
 
@@ -524,6 +545,9 @@ func mergeMarkdownTheme(t MarkdownTheme) MarkdownTheme {
 	}
 	if t.LinkURLFn != nil {
 		d.LinkURLFn = t.LinkURLFn
+	}
+	if t.LinkRendererFn != nil {
+		d.LinkRendererFn = t.LinkRendererFn
 	}
 	if t.HRFn != nil {
 		d.HRFn = t.HRFn

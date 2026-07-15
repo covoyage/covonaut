@@ -199,7 +199,7 @@ func applyEdits(content string, edits []Edit, path string) (string, string, bool
 			continue
 		}
 
-		// 9-strategy progressive fuzzy matching (from MiMo-Code)
+		// 9-strategy progressive fuzzy matching
 		m := editMatcher{content: content, old: e.OldText, new: e.NewText}
 		if !m.find() {
 			return "", "", false, fmt.Errorf("could not find edits[%d] in %s", i, path)
@@ -290,7 +290,7 @@ func lineInOld(oldLines []string, line string) bool {
 	return false
 }
 
-// --- 9-strategy fuzzy edit matching (from MiMo-Code) ---
+// --- 9-strategy fuzzy edit matching ---
 
 type editMatcher struct {
 	content, old, new string

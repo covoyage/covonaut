@@ -18,22 +18,23 @@ import (
 type EventType string
 
 const (
-	EventAgentStart      EventType = "agent_start"
-	EventAgentEnd        EventType = "agent_end"
-	EventAgentError      EventType = "agent_error"
-	EventSkillLoaded     EventType = "skill_loaded"
-	EventSkillsReloaded  EventType = "skills_reloaded"
-	EventTurnStart       EventType = "turn_start"
-	EventTurnEnd         EventType = "turn_end"
-	EventMessageDelta    EventType = "message_delta"
-	EventToolCallStart   EventType = "tool_call_start"
-	EventToolCallEnd     EventType = "tool_call_end"
-	EventHandoffStart    EventType = "handoff_start"
-	EventHandoffEnd      EventType = "handoff_end"
-	EventCompactionStart EventType = "compaction_start"
-	EventCompactionEnd   EventType = "compaction_end"
-	EventAutoRetry       EventType = "auto_retry"
-	EventAgentInterrupt  EventType = "agent_interrupt"
+	EventAgentStart         EventType = "agent_start"
+	EventAgentEnd           EventType = "agent_end"
+	EventAgentError         EventType = "agent_error"
+	EventSkillLoaded        EventType = "skill_loaded"
+	EventSkillsReloaded     EventType = "skills_reloaded"
+	EventTurnStart          EventType = "turn_start"
+	EventTurnEnd            EventType = "turn_end"
+	EventMessageDelta       EventType = "message_delta"
+	EventToolCallStart      EventType = "tool_call_start"
+	EventToolCallEnd        EventType = "tool_call_end"
+	EventHandoffStart       EventType = "handoff_start"
+	EventHandoffEnd         EventType = "handoff_end"
+	EventCompactionStart    EventType = "compaction_start"
+	EventCompactionEnd      EventType = "compaction_end"
+	EventAutoRetry          EventType = "auto_retry"
+	EventAgentInterrupt     EventType = "agent_interrupt"
+	EventRepetitionRecovery EventType = "repetition_recovery"
 )
 
 // Event is the common interface for all agent lifecycle events.
@@ -73,7 +74,7 @@ type AgentErrorEvent struct {
 
 type AgentInterruptEvent struct {
 	baseEvent
-	AgentName string          `json:"agent_name,omitempty"`
+	AgentName string           `json:"agent_name,omitempty"`
 	Reason    *InterruptReason `json:"reason,omitempty"`
 }
 
@@ -187,6 +188,18 @@ type AutoRetryEvent struct {
 	MaxRetries int64         `json:"max_retries"`
 	Delay      time.Duration `json:"delay"`
 	Err        error         `json:"error"`
+}
+
+// RepetitionRecoveryEvent is emitted each time runLoop's repetition-recovery
+// ladder injects a corrective steering nudge (see RepetitionKind /
+// RepetitionRecoveryConfig in retry.go). It fires on the soft-recovery path
+// only; if the ladder is ultimately exhausted, the turn ends with a normal
+// AgentErrorEvent (wrapping ErrRepetitionLoop) instead.
+type RepetitionRecoveryEvent struct {
+	baseEvent
+	Kind        RepetitionKind `json:"kind"`
+	Attempt     int64          `json:"attempt"`
+	MaxAttempts int64          `json:"max_attempts"`
 }
 
 // --- JSON serialization for events with error fields ---

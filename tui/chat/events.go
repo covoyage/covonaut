@@ -13,19 +13,20 @@ type Subscriber interface {
 type ChatEventType string
 
 const (
-	ChatEventAgentStart      ChatEventType = "agent_start"
-	ChatEventAgentEnd        ChatEventType = "agent_end"
-	ChatEventAgentError      ChatEventType = "agent_error"
-	ChatEventTurnStart       ChatEventType = "turn_start"
-	ChatEventTurnEnd         ChatEventType = "turn_end"
-	ChatEventMessageDelta    ChatEventType = "message_delta"
-	ChatEventToolCallStart   ChatEventType = "tool_call_start"
-	ChatEventToolCallEnd     ChatEventType = "tool_call_end"
-	ChatEventHandoffStart    ChatEventType = "handoff_start"
-	ChatEventHandoffEnd      ChatEventType = "handoff_end"
-	ChatEventCompactionStart ChatEventType = "compaction_start"
-	ChatEventCompactionEnd   ChatEventType = "compaction_end"
-	ChatEventAutoRetry       ChatEventType = "auto_retry"
+	ChatEventAgentStart         ChatEventType = "agent_start"
+	ChatEventAgentEnd           ChatEventType = "agent_end"
+	ChatEventAgentError         ChatEventType = "agent_error"
+	ChatEventTurnStart          ChatEventType = "turn_start"
+	ChatEventTurnEnd            ChatEventType = "turn_end"
+	ChatEventMessageDelta       ChatEventType = "message_delta"
+	ChatEventToolCallStart      ChatEventType = "tool_call_start"
+	ChatEventToolCallEnd        ChatEventType = "tool_call_end"
+	ChatEventHandoffStart       ChatEventType = "handoff_start"
+	ChatEventHandoffEnd         ChatEventType = "handoff_end"
+	ChatEventCompactionStart    ChatEventType = "compaction_start"
+	ChatEventCompactionEnd      ChatEventType = "compaction_end"
+	ChatEventAutoRetry          ChatEventType = "auto_retry"
+	ChatEventRepetitionRecovery ChatEventType = "repetition_recovery"
 )
 
 type ChatEvent interface {
@@ -136,6 +137,19 @@ type AutoRetryChatEvent struct {
 }
 
 func (AutoRetryChatEvent) ChatEventKind() ChatEventType { return ChatEventAutoRetry }
+
+// RepetitionRecoveryChatEvent mirrors agentcore.RepetitionRecoveryEvent: a
+// corrective steering nudge was injected because the model appeared to be
+// stuck in a repetition loop (mid-stream, or repeating the same text/tool
+// call across turns). Kind is one of "stream", "text", "tool" (see
+// agentcore.RepetitionKind).
+type RepetitionRecoveryChatEvent struct {
+	Kind        string
+	Attempt     int64
+	MaxAttempts int64
+}
+
+func (RepetitionRecoveryChatEvent) ChatEventKind() ChatEventType { return ChatEventRepetitionRecovery }
 
 type TokenUsage struct {
 	PromptTokens     int64

@@ -384,6 +384,31 @@ func (h *ChatHistory) Finalize(id string) {
 	h.PatchMessage(id, func(m *ChatMessage) { m.Pending = false })
 }
 
+// RemoveMessage deletes the message identified by id, if present. Used to
+// discard a stale in-flight streamed message (e.g. one whose provider call
+// failed and is being retried from scratch) so its partial text doesn't
+// linger and get concatenated with the retried attempt's output. Returns
+// true if a message was removed.
+func (h *ChatHistory) RemoveMessage(id string) bool {
+	if id == "" {
+		return false
+	}
+	h.mu.Lock()
+	for i := range h.messages {
+		if h.messages[i].ID == id {
+			h.messages = append(h.messages[:i], h.messages[i+1:]...)
+			h.dirty = true
+			h.selActive = false
+			h.selDragging = false
+			h.mu.Unlock()
+			h.invalidate()
+			return true
+		}
+	}
+	h.mu.Unlock()
+	return false
+}
+
 // Clear empties the transcript.
 func (h *ChatHistory) Clear() {
 	h.mu.Lock()

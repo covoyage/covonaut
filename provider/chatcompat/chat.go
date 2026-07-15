@@ -85,14 +85,16 @@ func New(cfg Config) *Provider {
 // --- Chat Completions wire types ---
 
 type chatRequest struct {
-	Model          string              `json:"model"`
-	Messages       []chatMessage       `json:"messages"`
-	Tools          []chatTool          `json:"tools,omitempty"`
-	Stream         bool                `json:"stream,omitempty"`
-	Temperature    *float64            `json:"temperature,omitempty"`
-	MaxTokens      *int64              `json:"max_tokens,omitempty"`
-	ResponseFormat *chatResponseFormat `json:"response_format,omitempty"`
-	StreamOptions  *streamOptions      `json:"stream_options,omitempty"`
+	Model            string              `json:"model"`
+	Messages         []chatMessage       `json:"messages"`
+	Tools            []chatTool          `json:"tools,omitempty"`
+	Stream           bool                `json:"stream,omitempty"`
+	Temperature      *float64            `json:"temperature,omitempty"`
+	FrequencyPenalty *float64            `json:"frequency_penalty,omitempty"`
+	PresencePenalty  *float64            `json:"presence_penalty,omitempty"`
+	MaxTokens        *int64              `json:"max_tokens,omitempty"`
+	ResponseFormat   *chatResponseFormat `json:"response_format,omitempty"`
+	StreamOptions    *streamOptions      `json:"stream_options,omitempty"`
 }
 
 type streamOptions struct {
@@ -485,6 +487,17 @@ func (p *Provider) buildRequest(req *agentcore.ProviderRequest, stream bool) (ch
 	if req.Temperature > 0 {
 		t := req.Temperature
 		cr.Temperature = &t
+	}
+	// Penalties are opt-in (0 = unset/provider default) since not all models
+	// accept them (some reasoning models reject non-zero penalties), unlike
+	// Temperature they support negative values too, so we gate on != 0.
+	if req.FrequencyPenalty != 0 {
+		fp := req.FrequencyPenalty
+		cr.FrequencyPenalty = &fp
+	}
+	if req.PresencePenalty != 0 {
+		pp := req.PresencePenalty
+		cr.PresencePenalty = &pp
 	}
 	if req.MaxTokens > 0 {
 		m := req.MaxTokens

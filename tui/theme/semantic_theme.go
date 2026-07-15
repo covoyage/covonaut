@@ -2,7 +2,7 @@ package theme
 
 // SemanticTheme holds named colors for the TUI (hex "#rrggbb", decimal "0"–"255"
 // for 256 palette, or "" for terminal default foreground/background).
-// JSON themes use the same keys as pi-mono coding-agent dark.json / light.json.
+// JSON themes use the same keys as common dark.json / light.json theme files.
 type SemanticTheme struct {
 	Name string `json:"name"`
 
