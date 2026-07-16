@@ -5,10 +5,88 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/covoyage/covonaut/agentcore"
 )
+
+func TestProviderStream_NormalizesCumulativeSnapshots(t *testing.T) {
+	const first = "Let me inspect the runtime resolve flow carefully."
+	const second = first + " Next I will check the sentinel mechanism."
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ordinary \"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"stream\",\"reasoning_content\":\"" + first + "\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"" + second + "\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	provider := New(Config{APIKey: "test-key", BaseURL: srv.URL, Client: srv.Client()})
+	ch, err := provider.Stream(context.Background(), &agentcore.ProviderRequest{
+		Model:    "test-model",
+		Messages: []agentcore.Message{{Role: agentcore.RoleUser, Content: "inspect"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var content strings.Builder
+	var reasoning strings.Builder
+	for delta := range ch {
+		content.WriteString(delta.Content)
+		for _, block := range delta.Blocks {
+			if block.Kind == agentcore.BlockKindThinking {
+				reasoning.WriteString(block.Text)
+			}
+		}
+	}
+
+	if got := content.String(); got != "ordinary stream" {
+		t.Fatalf("content = %q", got)
+	}
+	if got := reasoning.String(); got != second {
+		t.Fatalf("reasoning = %q, want one cumulative snapshot %q", got, second)
+	}
+}
+
+func TestProviderStream_DropsMirroredReasoningContent(t *testing.T) {
+	const narration = "Let me inspect the two relevant files."
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"" + narration + "\",\"reasoning_content\":\"" + narration + "\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	provider := New(Config{APIKey: "test-key", BaseURL: srv.URL, Client: srv.Client()})
+	ch, err := provider.Stream(context.Background(), &agentcore.ProviderRequest{
+		Model:    "test-model",
+		Messages: []agentcore.Message{{Role: agentcore.RoleUser, Content: "inspect"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var content strings.Builder
+	var thinkingBlocks int
+	for delta := range ch {
+		content.WriteString(delta.Content)
+		for _, block := range delta.Blocks {
+			if block.Kind == agentcore.BlockKindThinking && block.Text != "" {
+				thinkingBlocks++
+			}
+		}
+	}
+	if got := content.String(); got != narration {
+		t.Fatalf("content = %q", got)
+	}
+	if thinkingBlocks != 0 {
+		t.Fatalf("mirrored reasoning blocks = %d", thinkingBlocks)
+	}
+}
 
 func TestProviderComplete_SendsStructuredOutputRequest(t *testing.T) {
 	var gotBody map[string]any

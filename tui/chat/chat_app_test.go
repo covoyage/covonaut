@@ -78,6 +78,25 @@ func TestChatAppMessageDeltaStream(t *testing.T) {
 	}
 }
 
+func TestChatAppMessageDeltaRoutesThinking(t *testing.T) {
+	app, _ := newTestChatApp(t, ChatAppConfig{})
+
+	app.onAgentStart(AgentStartChatEvent{})
+	app.onMessageDelta(MessageDeltaChatEvent{Delta: "inspect first", Kind: "thinking"})
+	app.onMessageDelta(MessageDeltaChatEvent{Delta: "final answer", Kind: "text"})
+
+	msgs := app.History().Messages()
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 streaming msg, got %d", len(msgs))
+	}
+	if msgs[0].Text != "final answer" {
+		t.Fatalf("text = %q", msgs[0].Text)
+	}
+	if len(msgs[0].ThinkingSegments) != 1 || msgs[0].ThinkingSegments[0].Text != "inspect first" {
+		t.Fatalf("thinking segments = %+v", msgs[0].ThinkingSegments)
+	}
+}
+
 // TestChatAppAutoRetryDiscardsStalePartialStream reproduces a bug where a
 // transient provider error mid-stream (followed by an automatic retry)
 // caused the retried attempt's freshly streamed text to be appended after

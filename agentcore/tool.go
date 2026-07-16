@@ -18,33 +18,14 @@ type Tool struct {
 	Func        ToolFunc
 	Before      []BeforeHook
 	After       []AfterHook
-
-	// DynamicParameters is an optional callback invoked during Definition()
-	// to merge runtime values (e.g. live config) into the schema.
-	// Shallow-merged on top of Parameters; useful for descriptions that depend on runtime state.
-	DynamicParameters func() map[string]any
 }
 
 // Definition converts a Tool to its schema representation for the model.
 func (t *Tool) Definition() ToolDefinition {
-	params := t.Parameters
-	if t.DynamicParameters != nil {
-		dyn := t.DynamicParameters()
-		if len(dyn) > 0 {
-			merged := make(map[string]any, len(params)+len(dyn))
-			for k, v := range params {
-				merged[k] = v
-			}
-			for k, v := range dyn {
-				merged[k] = v
-			}
-			params = merged
-		}
-	}
 	return ToolDefinition{
 		Name:        t.Name,
 		Description: t.Description,
-		Parameters:  params,
+		Parameters:  t.Parameters,
 	}
 }
 

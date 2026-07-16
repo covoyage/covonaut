@@ -580,6 +580,15 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 				return "", err
 			}
 
+			// Grace call: on the final allowed turn, inject a wrap-up instruction
+			// so the model can produce a meaningful summary instead of being hard-killed.
+			if a.config.MaxTurns > 0 && a.config.MaxTurns < 1<<30 && turn-loopStartTurn == a.config.MaxTurns {
+				a.steering.Push(Message{
+					Role:    RoleSystem,
+					Content: "[FINAL TURN] You have reached the maximum number of tool-calling turns. You MUST produce your final response now without making any more tool calls.",
+				})
+			}
+
 			// Context compaction
 			if err := a.maybeCompact(ctx); err != nil {
 				ne := NewNodeError("compaction failed", err, a.config.Name, fmt.Sprintf("turn:%d", turn), "compaction")
@@ -1206,18 +1215,20 @@ func (a *Agent) runStreaming(ctx context.Context, req *ProviderRequest) (*Provid
 			}
 			if delta.Content != "" {
 				content.WriteString(delta.Content)
-				kind := BlockKindText
-				for _, bl := range delta.Blocks {
-					if bl.Kind == BlockKindThinking {
-						kind = BlockKindThinking
-						break
-					}
-				}
 				a.emit(&MessageDeltaEvent{
 					baseEvent: newBase(EventMessageDelta),
 					Delta:     delta.Content,
-					Kind:      kind,
+					Kind:      BlockKindText,
 				})
+			}
+			for _, bl := range delta.Blocks {
+				if bl.Kind == BlockKindThinking && bl.Text != "" && bl.Text != delta.Content {
+					a.emit(&MessageDeltaEvent{
+						baseEvent: newBase(EventMessageDelta),
+						Delta:     bl.Text,
+						Kind:      BlockKindThinking,
+					})
+				}
 			}
 			if len(delta.Blocks) > 0 {
 				blocks = MergeContentBlocks(blocks, delta.Blocks...)

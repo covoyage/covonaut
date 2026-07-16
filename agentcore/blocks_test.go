@@ -50,11 +50,36 @@ func TestMessageCollapseForLLM_preservesImageBlocks(t *testing.T) {
 	}
 }
 
+func TestMessageCollapseForLLM_DeduplicatesMirroredTextBlocks(t *testing.T) {
+	m := Message{
+		Role:    RoleAssistant,
+		Content: "Let me inspect the two relevant files.",
+		Blocks: []ContentBlock{
+			{Kind: BlockKindText, Text: "Let me inspect the two relevant files."},
+		},
+	}
+
+	c := MessageCollapseForLLM(m, false)
+	if got := c.Content; got != m.Content {
+		t.Fatalf("content = %q, want %q", got, m.Content)
+	}
+}
+
 func TestMessageTextBody_wrapsThinking(t *testing.T) {
 	m := Message{}.AppendThinkingBlock("why").AppendTextBlock("hi")
 	body := MessageTextBody(m)
 	if !strings.Contains(body, "<thinking>") || !strings.Contains(body, "why") {
 		t.Fatalf("body %q", body)
+	}
+}
+
+func TestMessageTextBody_DeduplicatesMirroredTextBlocks(t *testing.T) {
+	m := Message{
+		Content: "final answer",
+		Blocks:  []ContentBlock{{Kind: BlockKindText, Text: "final answer"}},
+	}
+	if got := MessageTextBody(m); got != "final answer" {
+		t.Fatalf("body = %q", got)
 	}
 }
 

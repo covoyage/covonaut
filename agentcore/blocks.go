@@ -43,10 +43,11 @@ func MessageTextBody(m Message) string {
 	if m.Content != "" {
 		b.WriteString(m.Content)
 	}
+	textBlocksMirrorContent := textBlockContent(m.Blocks) == m.Content
 	for _, bl := range m.Blocks {
 		switch bl.Kind {
 		case BlockKindText:
-			if bl.Text == "" {
+			if bl.Text == "" || textBlocksMirrorContent {
 				continue
 			}
 			if b.Len() > 0 {
@@ -107,10 +108,11 @@ func MessageCollapseForLLM(m Message, includeThinking bool) Message {
 	if m.Content != "" {
 		b.WriteString(m.Content)
 	}
+	textBlocksMirrorContent := textBlockContent(m.Blocks) == m.Content
 	for _, bl := range m.Blocks {
 		switch bl.Kind {
 		case BlockKindText:
-			if bl.Text == "" {
+			if bl.Text == "" || textBlocksMirrorContent {
 				continue
 			}
 			if b.Len() > 0 {
@@ -148,6 +150,16 @@ func MessageCollapseForLLM(m Message, includeThinking bool) Message {
 	out.Content = b.String()
 	out.Blocks = kept
 	return out
+}
+
+func textBlockContent(blocks []ContentBlock) string {
+	var b strings.Builder
+	for _, bl := range blocks {
+		if bl.Kind == BlockKindText {
+			b.WriteString(bl.Text)
+		}
+	}
+	return b.String()
 }
 
 // MessageStringForSummary formats a message for compaction / logging (includes
@@ -236,19 +248,19 @@ func MergeContentBlocks(dst []ContentBlock, src ...ContentBlock) []ContentBlock 
 // StructuredCompactionSummary is the JSON shape requested when
 // Config.StructuredCompaction is enabled.
 type StructuredCompactionSummary struct {
-	ActiveTask         string `json:"active_task"`
-	Goal               string `json:"goal"`
-	ConstraintsPrefs   string `json:"constraints_preferences"`
-	CompletedActions   string `json:"completed_actions"`
-	ActiveState        string `json:"active_state"`
-	InProgress         string `json:"in_progress"`
-	Blocked            string `json:"blocked"`
-	KeyDecisions       string `json:"key_decisions"`
-	ResolvedQuestions  string `json:"resolved_questions"`
-	PendingUserAsks    string `json:"pending_user_asks"`
-	RelevantFiles      string `json:"relevant_files"`
-	RemainingWork      string `json:"remaining_work"`
-	CriticalContext    string `json:"critical_context"`
+	ActiveTask        string `json:"active_task"`
+	Goal              string `json:"goal"`
+	ConstraintsPrefs  string `json:"constraints_preferences"`
+	CompletedActions  string `json:"completed_actions"`
+	ActiveState       string `json:"active_state"`
+	InProgress        string `json:"in_progress"`
+	Blocked           string `json:"blocked"`
+	KeyDecisions      string `json:"key_decisions"`
+	ResolvedQuestions string `json:"resolved_questions"`
+	PendingUserAsks   string `json:"pending_user_asks"`
+	RelevantFiles     string `json:"relevant_files"`
+	RemainingWork     string `json:"remaining_work"`
+	CriticalContext   string `json:"critical_context"`
 }
 
 // ToReadableSummary renders the structured fields as a markdown block for the

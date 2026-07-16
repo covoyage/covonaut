@@ -513,7 +513,7 @@ func (a *ChatApp) onMessageDelta(e ChatEvent) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	id := a.model.StreamID
-	newID := a.history.AppendDelta(id, d.Delta)
+	newID := a.history.AppendDeltaWithKind(id, d.Delta, d.Kind)
 	if newID != id {
 		a.model.StreamID = newID
 	}

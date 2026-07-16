@@ -199,6 +199,36 @@ type chunkDelta struct {
 	ToolCalls        []chunkToolCall `json:"tool_calls,omitempty"`
 }
 
+const cumulativeSnapshotMinPrefix = 32
+
+type streamTextNormalizer struct {
+	previous   string
+	cumulative bool
+}
+
+func (n *streamTextNormalizer) delta(text string) string {
+	if text == "" {
+		return ""
+	}
+
+	previous := n.previous
+	n.previous = text
+	if previous == "" {
+		return text
+	}
+	if strings.HasPrefix(text, previous) &&
+		(n.cumulative || len(previous) >= cumulativeSnapshotMinPrefix) {
+		n.cumulative = true
+		return strings.TrimPrefix(text, previous)
+	}
+	if n.cumulative && strings.HasPrefix(previous, text) {
+		return ""
+	}
+
+	n.cumulative = false
+	return text
+}
+
 type chunkToolCall struct {
 	Index    int64             `json:"index"`
 	ID       string            `json:"id,omitempty"`
@@ -384,6 +414,8 @@ func (p *Provider) Stream(ctx context.Context, req *agentcore.ProviderRequest) (
 		defer httpResp.Body.Close()
 		defer close(ch)
 
+		var contentNormalizer streamTextNormalizer
+		var reasoningNormalizer streamTextNormalizer
 		scanner := bufio.NewScanner(httpResp.Body)
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -420,17 +452,22 @@ func (p *Provider) Stream(ctx context.Context, req *agentcore.ProviderRequest) (
 			}
 
 			delta := chunk.Choices[0].Delta
-			sd := agentcore.StreamDelta{Content: delta.Content}
+			contentDelta := contentNormalizer.delta(delta.Content)
+			reasoningDelta := reasoningNormalizer.delta(delta.ReasoningContent)
+			if reasoningDelta == contentDelta {
+				reasoningDelta = ""
+			}
+			sd := agentcore.StreamDelta{Content: contentDelta}
 			if fr := chunk.Choices[0].FinishReason; fr != nil && *fr != "" {
 				sd.FinishReason = *fr
 			}
-			if delta.Content != "" {
-				sd.Blocks = TextBlocks(delta.Content)
+			if contentDelta != "" {
+				sd.Blocks = TextBlocks(contentDelta)
 			}
-			if rc := delta.ReasoningContent; rc != "" {
+			if reasoningDelta != "" {
 				sd.Blocks = agentcore.MergeContentBlocks(sd.Blocks, agentcore.ContentBlock{
 					Kind: agentcore.BlockKindThinking,
-					Text: rc,
+					Text: reasoningDelta,
 				})
 			}
 
