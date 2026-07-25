@@ -3,6 +3,7 @@ package agentcore
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -19,6 +20,135 @@ func ValidateToolArguments(tool *Tool, arguments string) error {
 	}
 
 	return validateObject(tool.Parameters, args, "")
+}
+
+// CoerceToolArguments coerces argument values to match the tool's parameter
+// schema types. This handles the common LLM mistake of emitting numbers and
+// booleans as JSON strings (e.g. {"count": "5"} instead of {"count": 5}).
+// It returns the coerced arguments string, or the original if no coercion
+// was needed or if the arguments are not valid JSON / the tool has no schema.
+func CoerceToolArguments(tool *Tool, arguments string) string {
+	if tool.Parameters == nil || arguments == "" {
+		return arguments
+	}
+
+	var args map[string]any
+	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
+		return arguments // not valid JSON; let validation report the error
+	}
+
+	if coerceObjectArgs(tool.Parameters, args) {
+		if coerced, err := json.Marshal(args); err == nil {
+			return string(coerced)
+		}
+	}
+	return arguments
+}
+
+// coerceObjectArgs walks the schema's properties and coerces each value
+// in-place. Returns true if any value was changed.
+func coerceObjectArgs(schema map[string]any, args map[string]any) bool {
+	props := getProperties(schema)
+	if props == nil {
+		return false
+	}
+	changed := false
+	for name, propSchemaRaw := range props {
+		val, exists := args[name]
+		if !exists {
+			continue
+		}
+		propSchema, ok := propSchemaRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if coerced, ok := coerceValue(propSchema, val); ok {
+			args[name] = coerced
+			changed = true
+		}
+	}
+	return changed
+}
+
+// coerceValue attempts to coerce a value to the type declared in the schema.
+// Returns (coerced, true) if coercion was applied, (original, false) otherwise.
+func coerceValue(schema map[string]any, value any) (any, bool) {
+	expectedType, ok := schema["type"].(string)
+	if !ok {
+		return value, false
+	}
+
+	switch expectedType {
+	case "integer":
+		// string → int
+		if s, ok := value.(string); ok {
+			if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+				return float64(n), true // JSON numbers decode as float64
+			}
+		}
+	case "number":
+		// string → float
+		if s, ok := value.(string); ok {
+			if f, err := strconv.ParseFloat(s, 64); err == nil {
+				return f, true
+			}
+		}
+	case "boolean":
+		// string → bool
+		if s, ok := value.(string); ok {
+			switch strings.ToLower(s) {
+			case "true":
+				return true, true
+			case "false":
+				return false, true
+			}
+		}
+	case "array":
+		// string → array (try parsing as JSON array)
+		if s, ok := value.(string); ok {
+			var arr []any
+			if err := json.Unmarshal([]byte(s), &arr); err == nil {
+				// Recursively coerce array element types if items schema exists
+				if itemsSchema, ok := schema["items"].(map[string]any); ok {
+					for i, item := range arr {
+						if coerced, ok := coerceValue(itemsSchema, item); ok {
+							arr[i] = coerced
+						}
+					}
+				}
+				return arr, true
+			}
+		}
+		// Also coerce elements within an existing array
+		if arr, ok := value.([]any); ok {
+			if itemsSchema, ok := schema["items"].(map[string]any); ok {
+				changed := false
+				for i, item := range arr {
+					if coerced, ok := coerceValue(itemsSchema, item); ok {
+						arr[i] = coerced
+						changed = true
+					}
+				}
+				return arr, changed
+			}
+		}
+	case "object":
+		// string → object (try parsing as JSON object)
+		if s, ok := value.(string); ok {
+			var obj map[string]any
+			if err := json.Unmarshal([]byte(s), &obj); err == nil {
+				coerceObjectArgs(schema, obj)
+				return obj, true
+			}
+		}
+		// Also coerce properties within an existing object
+		if obj, ok := value.(map[string]any); ok {
+			if coerceObjectArgs(schema, obj) {
+				return obj, true
+			}
+		}
+	}
+	return value, false
 }
 
 func validateObject(schema map[string]any, value map[string]any, path string) error {

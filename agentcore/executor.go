@@ -160,6 +160,14 @@ func (e *Executor) coreExecute(ctx context.Context, tc ToolCall) (string, error)
 		}
 	}
 
+	// Coerce argument types before validation. LLMs frequently emit numbers
+	// and booleans as JSON strings (e.g. {"count": "5"} instead of {"count": 5}).
+	// This step silently fixes those mismatches so the tool receives the
+	// correct types without requiring the model to regenerate the call.
+	if tool.Parameters != nil && tc.Arguments != "" {
+		tc.Arguments = CoerceToolArguments(tool, tc.Arguments)
+	}
+
 	if e.config.ValidateArguments {
 		if err := ValidateToolArguments(tool, tc.Arguments); err != nil {
 			return "", fmt.Errorf("argument validation failed for %s: %w", tc.Name, err)

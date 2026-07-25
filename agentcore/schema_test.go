@@ -366,3 +366,166 @@ func TestValidateToolArgumentsTypeObjectNestedMissingRequired(t *testing.T) {
 		t.Fatal("expected missing required in nested object")
 	}
 }
+
+// --- CoerceToolArguments tests ---
+
+func TestCoerceToolArgumentsStringToInt(t *testing.T) {
+	tool := &Tool{
+		Name: "web_search",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"query": map[string]any{"type": "string"},
+				"count": map[string]any{"type": "integer"},
+			},
+		},
+	}
+
+	coerced := CoerceToolArguments(tool, `{"query":"hello","count":"5"}`)
+	if err := ValidateToolArguments(tool, coerced); err != nil {
+		t.Fatalf("after coercion, validation should pass: %v (coerced=%s)", err, coerced)
+	}
+}
+
+func TestCoerceToolArgumentsStringToNumber(t *testing.T) {
+	tool := &Tool{
+		Name: "test",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"price": map[string]any{"type": "number"},
+			},
+		},
+	}
+
+	coerced := CoerceToolArguments(tool, `{"price":"3.14"}`)
+	if err := ValidateToolArguments(tool, coerced); err != nil {
+		t.Fatalf("after coercion, validation should pass: %v (coerced=%s)", err, coerced)
+	}
+}
+
+func TestCoerceToolArgumentsStringToBoolean(t *testing.T) {
+	tool := &Tool{
+		Name: "test",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"enabled": map[string]any{"type": "boolean"},
+			},
+		},
+	}
+
+	for _, s := range []string{"true", "false", "True", "False"} {
+		coerced := CoerceToolArguments(tool, `{"enabled":"`+s+`"}`)
+		if err := ValidateToolArguments(tool, coerced); err != nil {
+			t.Fatalf("after coercion, validation should pass for %q: %v (coerced=%s)", s, err, coerced)
+		}
+	}
+}
+
+func TestCoerceToolArgumentsNoChangeForCorrectTypes(t *testing.T) {
+	tool := &Tool{
+		Name: "test",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"count":   map[string]any{"type": "integer"},
+				"name":    map[string]any{"type": "string"},
+				"enabled": map[string]any{"type": "boolean"},
+			},
+		},
+	}
+
+	original := `{"count":5,"name":"hello","enabled":true}`
+	coerced := CoerceToolArguments(tool, original)
+	if coerced != original {
+		t.Fatalf("expected no change, got: %s", coerced)
+	}
+}
+
+func TestCoerceToolArgumentsNonNumericStringUnchanged(t *testing.T) {
+	tool := &Tool{
+		Name: "test",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"count": map[string]any{"type": "integer"},
+			},
+		},
+	}
+
+	// "abc" is not a valid integer — coercion should leave it unchanged,
+	// and validation should still fail.
+	coerced := CoerceToolArguments(tool, `{"count":"abc"}`)
+	if err := ValidateToolArguments(tool, coerced); err == nil {
+		t.Fatal("expected validation error for non-numeric string")
+	}
+}
+
+func TestCoerceToolArgumentsNilSchema(t *testing.T) {
+	tool := &Tool{Name: "test", Parameters: nil}
+	original := `{"key":"val"}`
+	coerced := CoerceToolArguments(tool, original)
+	if coerced != original {
+		t.Fatalf("expected no change with nil schema, got: %s", coerced)
+	}
+}
+
+func TestCoerceToolArgumentsInvalidJSON(t *testing.T) {
+	tool := &Tool{
+		Name: "test",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"count": map[string]any{"type": "integer"},
+			},
+		},
+	}
+	original := `{bad json}`
+	coerced := CoerceToolArguments(tool, original)
+	if coerced != original {
+		t.Fatalf("expected no change for invalid JSON, got: %s", coerced)
+	}
+}
+
+func TestCoerceToolArgumentsStringToArray(t *testing.T) {
+	tool := &Tool{
+		Name: "test",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"tags": map[string]any{
+					"type":  "array",
+					"items": map[string]any{"type": "string"},
+				},
+			},
+		},
+	}
+
+	coerced := CoerceToolArguments(tool, `{"tags":"[\"a\",\"b\"]"}`)
+	if err := ValidateToolArguments(tool, coerced); err != nil {
+		t.Fatalf("after coercion, validation should pass: %v (coerced=%s)", err, coerced)
+	}
+}
+
+func TestCoerceToolArgumentsNestedObject(t *testing.T) {
+	tool := &Tool{
+		Name: "test",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"config": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"limit": map[string]any{"type": "integer"},
+					},
+				},
+			},
+		},
+	}
+
+	coerced := CoerceToolArguments(tool, `{"config":{"limit":"10"}}`)
+	if err := ValidateToolArguments(tool, coerced); err != nil {
+		t.Fatalf("after coercion, nested object validation should pass: %v (coerced=%s)", err, coerced)
+	}
+}
