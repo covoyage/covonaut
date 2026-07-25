@@ -81,14 +81,14 @@ docker run -d --name itk-service \
   -e GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn \
   -e ITK_LOG_LEVEL="$ITK_LOG_LEVEL" \
   -v "$COVONAUT_ROOT:/app/agents/repo" \
-  -v "$ITK_DIR:/app/agents/repo/example/itk" \
+  -v "$ITK_DIR:/app/agents/repo/itk" \
   $DOCKER_MOUNT_LOGS \
   -p 8000:8000 \
   itk_service
 
 # 6.1. Fix dubious ownership for git
 docker exec itk-service git config --system --add safe.directory /app/agents/repo
-docker exec itk-service git config --system --add safe.directory /app/agents/repo/example/itk
+docker exec itk-service git config --system --add safe.directory /app/agents/repo/itk
 docker exec itk-service git config --system core.multiPackIndex false
 
 # 7. Verify service is up and send post request
