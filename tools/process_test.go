@@ -35,6 +35,14 @@ func TestProcessToolSpawn(t *testing.T) {
 	}
 }
 
+func TestProcessToolDefaultsToLocalOperations(t *testing.T) {
+	tool := NewProcessTool(t.TempDir(), nil)
+	args, _ := json.Marshal(map[string]string{"action": "spawn", "command": "echo default_ops"})
+	if _, err := tool.Func(context.Background(), args); err != nil {
+		t.Fatalf("default process operations: %v", err)
+	}
+}
+
 func TestProcessToolSpawnMissingCommand(t *testing.T) {
 	tmpDir := t.TempDir()
 	registry := NewProcessRegistry()
@@ -79,9 +87,6 @@ func TestProcessToolWait(t *testing.T) {
 		t.Fatal("expected non-empty content")
 	}
 
-	// Wait a bit for process to complete.
-	time.Sleep(500 * time.Millisecond)
-
 	// Parse process ID - it's between "process " and " (PID"
 	start := strings.Index(content, "proc-")
 	if start == -1 {
@@ -93,15 +98,40 @@ func TestProcessToolWait(t *testing.T) {
 	}
 	procID := content[start : start+end]
 
-	// Check status.
-	statusArgs, _ := json.Marshal(map[string]string{
-		"action":     "status",
+	waitArgs, _ := json.Marshal(map[string]string{
+		"action":     "wait",
 		"process_id": procID,
 	})
-	_, err = tool.Func(context.Background(), statusArgs)
+	waitResult, err := tool.Func(context.Background(), waitArgs)
 	if err != nil {
-		// Status might fail due to registry lookup - that's ok for now.
-		t.Logf("status check (expected partial implementation): %v", err)
+		t.Fatalf("wait: %v", err)
+	}
+	if !strings.Contains(waitResult.(ToolResult).Content, "test_output") {
+		t.Fatalf("wait output = %q", waitResult.(ToolResult).Content)
+	}
+}
+
+func TestProcessToolListAndKill(t *testing.T) {
+	tool := NewProcessTool(t.TempDir(), nil)
+	spawnArgs, _ := json.Marshal(map[string]string{"action": "spawn", "command": "sleep 30"})
+	spawnResult, err := tool.Func(context.Background(), spawnArgs)
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	content := spawnResult.(ToolResult).Content
+	start := strings.Index(content, "proc-")
+	end := strings.Index(content[start:], " ")
+	processID := content[start : start+end]
+
+	listArgs, _ := json.Marshal(map[string]string{"action": "list"})
+	listResult, err := tool.Func(context.Background(), listArgs)
+	if err != nil || !strings.Contains(listResult.(ToolResult).Content, processID) {
+		t.Fatalf("list = (%v, %v), want process %s", listResult, err, processID)
+	}
+
+	killArgs, _ := json.Marshal(map[string]string{"action": "kill", "process_id": processID})
+	if _, err := tool.Func(context.Background(), killArgs); err != nil {
+		t.Fatalf("kill: %v", err)
 	}
 }
 

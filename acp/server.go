@@ -85,53 +85,68 @@ func isTimeoutError(err error) bool {
 
 func (s *Server) Run(ctx context.Context) error {
 	s.logger.Info("ACP server starting on stdio")
+	if s.sessionMgr != nil {
+		defer s.sessionMgr.Cleanup()
+	}
+
+	type readResult struct {
+		line []byte
+		err  error
+	}
+	reads := make(chan readResult, 1)
+	go func() {
+		for {
+			line, err := s.reader.ReadBytes('\n')
+			select {
+			case reads <- readResult{line: line, err: err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil && !isTimeoutError(err) {
+				return
+			}
+		}
+	}()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
-		default:
-		}
-
-		// Set a read deadline on the raw reader (e.g. stdin) so that
-		// ReadBytes doesn't block forever on a partial line. If the
-		// underlying reader doesn't support deadlines, this is a no-op.
-		if f, ok := s.rawReader.(interface{ SetReadDeadline(t time.Time) error }); ok {
-			f.SetReadDeadline(time.Now().Add(5 * time.Minute))
-		}
-
-		line, err := s.reader.ReadBytes('\n')
-		if err != nil {
-			if err == io.EOF {
-				return nil
+			if closer, ok := s.rawReader.(io.Closer); ok {
+				_ = closer.Close()
 			}
-			// Timeout is not fatal — loop back to check ctx.Done().
-			if isTimeoutError(err) {
+			return nil
+		case result := <-reads:
+			if result.err != nil {
+				if result.err == io.EOF {
+					return nil
+				}
+				if isTimeoutError(result.err) {
+					continue
+				}
+				return fmt.Errorf("read stdin: %w", result.err)
+			}
+
+			var req JSONRPCRequest
+			if err := json.Unmarshal(result.line, &req); err != nil {
+				s.writeError(nil, -32700, "Parse error", err.Error())
 				continue
 			}
-			return fmt.Errorf("read stdin: %w", err)
-		}
 
-		var req JSONRPCRequest
-		if err := json.Unmarshal(line, &req); err != nil {
-			s.writeError(nil, -32700, "Parse error", err.Error())
-			continue
-		}
+			if req.JSONRPC != "2.0" {
+				s.writeError(req.ID, -32600, "Invalid Request", "jsonrpc must be 2.0")
+				continue
+			}
 
-		if req.JSONRPC != "2.0" {
-			s.writeError(req.ID, -32600, "Invalid Request", "jsonrpc must be 2.0")
-			continue
-		}
+			// A message with an id but no method is a response to one of our
+			// outbound client requests (e.g. session/request_permission). Route it
+			// to the waiting caller instead of treating it as a request.
+			if req.Method == "" && req.ID != nil {
+				s.deliverClientResponse(req.ID, result.line)
+				continue
+			}
 
-		// A message with an id but no method is a response to one of our
-		// outbound client requests (e.g. session/request_permission). Route it
-		// to the waiting caller instead of treating it as a request.
-		if req.Method == "" && req.ID != nil {
-			s.deliverClientResponse(req.ID, line)
-			continue
+			s.handleRequest(ctx, &req)
 		}
-
-		s.handleRequest(ctx, &req)
 	}
 }
 
@@ -367,7 +382,6 @@ func (s *Server) handleInitialize(req *JSONRPCRequest) {
 			return
 		}
 	}
-
 	clientName := "unknown"
 	if params.ClientInfo != nil {
 		clientName = params.ClientInfo.Name
@@ -591,9 +605,8 @@ func (s *Server) handlePrompt(ctx context.Context, req *JSONRPCRequest) {
 	}
 
 	if state.IsRunning() {
-		s.logger.Warn("session already running, cancelling previous", "session_id", params.SessionID)
-		state.Cancel()
-		s.sessionMgr.SetIdle(params.SessionID)
+		s.writeError(req.ID, -32000, "Session already running", "cancel the active prompt before starting another")
+		return
 	}
 
 	userText := extractPromptContent(params.Prompt)
@@ -616,7 +629,11 @@ func (s *Server) handlePrompt(ctx context.Context, req *JSONRPCRequest) {
 	s.sessionMgr.SetRunning(params.SessionID, cancel)
 
 	core := state.Agent.Core()
+	var streamedOutput atomic.Bool
 	unregisterEvents := RegisterEventListeners(params.SessionID, core, func(method string, p any) {
+		if notification, ok := p.(SessionNotification); ok && notification.Update.SessionUpdate == "agent_message_chunk" {
+			streamedOutput.Store(true)
+		}
 		s.sendNotification(params.SessionID, method, p)
 	})
 
@@ -631,13 +648,13 @@ func (s *Server) handlePrompt(ctx context.Context, req *JSONRPCRequest) {
 			s.logger.Error("agent run failed", "err", err)
 		}
 
-		if result != "" {
+		if result != "" && !streamedOutput.Load() {
 			s.sendNotification(params.SessionID, "session/update", SessionNotification{
-					SessionID: params.SessionID,
-					Update: SessionUpdate{
-						SessionUpdate: "agent_message_chunk",
-						Content:       TextContentBlock{Type: "text", Text: result},
-					},
+				SessionID: params.SessionID,
+				Update: SessionUpdate{
+					SessionUpdate: "agent_message_chunk",
+					Content:       TextContentBlock{Type: "text", Text: result},
+				},
 			})
 		}
 
@@ -651,7 +668,7 @@ func (s *Server) handleCancel(req *JSONRPCRequest) {
 	var params CancelParams
 	if req.Params != nil {
 		if err := json.Unmarshal(req.Params, &params); err != nil {
-			s.writeError(req.ID, -32602, "Invalid params", err.Error())
+			s.logger.Warn("invalid session/cancel notification", "error", err)
 			return
 		}
 	}
@@ -662,7 +679,6 @@ func (s *Server) handleCancel(req *JSONRPCRequest) {
 		s.logger.Info("ACP session cancelled", "session_id", params.SessionID)
 	}
 
-	s.writeResponse(req.ID, nil)
 }
 
 func (s *Server) handleSetMode(req *JSONRPCRequest) {

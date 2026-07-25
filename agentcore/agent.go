@@ -86,6 +86,7 @@ type Config struct {
 type Agent struct {
 	config        Config
 	configMu      sync.RWMutex
+	initErr       error
 	state         *AgentState
 	registry      *Registry
 	executor      *Executor
@@ -100,6 +101,7 @@ type Agent struct {
 }
 
 func New(cfg Config) *Agent {
+	cfg = ApplyModelProfile(cfg)
 	if cfg.MaxTurns <= 0 {
 		cfg.MaxTurns = defaultMaxTurns
 	}
@@ -120,6 +122,7 @@ func New(cfg Config) *Agent {
 		After:              cfg.GlobalAfter,
 		ValidateArguments:  cfg.ValidateArguments,
 		UnknownToolHandler: unknownHandler,
+		ArgumentRepairFunc: cfg.ArgumentRepairFunc,
 	}
 
 	engineReg := NewEngineRegistry()
@@ -178,10 +181,43 @@ func New(cfg Config) *Agent {
 	}
 
 	if len(cfg.Extensions) > 0 {
-		_ = a.extensions.Register(context.Background(), a, cfg.Extensions...)
+		if err := a.extensions.Register(context.Background(), a, cfg.Extensions...); err != nil {
+			a.initErr = fmt.Errorf("initialize extensions: %w", err)
+		}
 	}
 
 	return a
+}
+
+// NewWithError constructs an Agent and reports extension initialization errors.
+// New remains available for compatibility; agents returned by New surface the
+// same error from Run, Continue, Resume, and InvokeTool.
+func NewWithError(cfg Config) (*Agent, error) {
+	a := New(cfg)
+	if a.initErr != nil {
+		err := a.initErr
+		a.Close()
+		return nil, err
+	}
+	return a, nil
+}
+
+func (a *Agent) rebuildExecutor() {
+	cfg := a.Config()
+	unknownHandler := cfg.UnknownToolHandler
+	if unknownHandler == nil {
+		unknownHandler = DynamicUnknownToolHandler(a.registry)
+	}
+	a.executor = NewExecutor(a.registry, ExecutorConfig{
+		Mode:               cfg.ExecutionMode,
+		Concurrency:        cfg.Concurrency,
+		Middleware:         cfg.Middleware,
+		Before:             cfg.GlobalBefore,
+		After:              cfg.GlobalAfter,
+		ValidateArguments:  cfg.ValidateArguments,
+		UnknownToolHandler: unknownHandler,
+		ArgumentRepairFunc: cfg.ArgumentRepairFunc,
+	})
 }
 
 // --- event subscriptions ---
@@ -291,6 +327,9 @@ func (a *Agent) GetTool(name string) (*Tool, bool) { return a.registry.Get(name)
 // guardrails, and any other configured hooks applied exactly as they would
 // be for the model's own tool calls.
 func (a *Agent) InvokeTool(ctx context.Context, name string, args json.RawMessage) (string, error) {
+	if a.initErr != nil {
+		return "", a.initErr
+	}
 	tc := ToolCall{Name: name, Arguments: string(args)}
 	result := a.executor.Execute(ctx, tc, a.state)
 	if result.Err != nil {
@@ -442,6 +481,9 @@ func (a *Agent) appendCheckpoint(ctx context.Context) error {
 // The Agent can be reused across multiple Run calls — conversation state is
 // preserved between calls and system prompt is only persisted once.
 func (a *Agent) Run(ctx context.Context, input string) (string, error) {
+	if a.initErr != nil {
+		return "", a.initErr
+	}
 	ctx, span := a.tracer().Start(ctx, "agent.run",
 		Attr("agent.name", a.config.Name),
 		Attr("agent.model", a.config.Model),
@@ -497,6 +539,9 @@ func (a *Agent) Run(ctx context.Context, input string) (string, error) {
 
 // Continue resumes the agent loop from the current state without adding new input.
 func (a *Agent) Continue(ctx context.Context) (string, error) {
+	if a.initErr != nil {
+		return "", a.initErr
+	}
 	ctx, span := a.tracer().Start(ctx, "agent.continue",
 		Attr("agent.name", a.config.Name),
 	)
@@ -527,6 +572,9 @@ func (a *Agent) Interrupted() *InterruptReason {
 // conversation from the tool result that triggered the interrupt,
 // allowing the LLM to continue naturally.
 func (a *Agent) Resume(ctx context.Context) (string, error) {
+	if a.initErr != nil {
+		return "", a.initErr
+	}
 	ir := a.Interrupted()
 	if ir == nil {
 		return "", fmt.Errorf("agent is not interrupted (status: %s)", a.state.Status())

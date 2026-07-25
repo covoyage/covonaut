@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -43,8 +44,12 @@ func lastEventIDFromCtx(ctx context.Context) int {
 }
 
 const (
-	defaultMaxRequestBody = 10 << 20 // 10 MB
-	defaultTaskTimeout    = 5 * time.Minute
+	defaultMaxRequestBody        = 10 << 20 // 10 MB
+	defaultTaskTimeout           = 5 * time.Minute
+	defaultHTTPReadHeaderTimeout = 10 * time.Second
+	defaultHTTPReadTimeout       = 30 * time.Second
+	defaultHTTPIdleTimeout       = 2 * time.Minute
+	defaultHTTPMaxHeaderBytes    = 1 << 20
 )
 
 // ---------------------------------------------------------------------------
@@ -70,12 +75,94 @@ type StreamingHandler interface {
 	SetUpdatePublisher(TaskUpdatePublisher)
 }
 
+// V1MessageHandler optionally implements native A2A 1.0 SendMessage semantics,
+// including direct Message responses that do not create a Task.
+type V1MessageHandler interface {
+	SendMessage(ctx context.Context, req V1SendMessageRequest) (*V1SendMessageResponse, error)
+}
+
+// V1StreamingMessageHandler optionally emits native A2A 1.0 stream responses.
+// A message-only stream contains one Message. A task stream starts with a Task.
+type V1StreamingMessageHandler interface {
+	SendStreamingMessage(ctx context.Context, req V1SendMessageRequest) (<-chan V1StreamResponse, error)
+}
+
+// PushNotificationDeleter lets handlers remove the active runtime webhook.
+type PushNotificationDeleter interface {
+	DeletePushNotification(ctx context.Context, taskID string) error
+}
+
 // ---------------------------------------------------------------------------
 type taskSubState struct {
-	mu        sync.RWMutex
-	subs      []chan *TaskUpdateEvent
-	history   []historyEntry
-	nextSeq   int
+	mu      sync.RWMutex
+	subs    []*taskSubscriber
+	history []historyEntry
+	nextSeq int
+}
+
+type taskSubscriber struct {
+	events chan *TaskUpdateEvent
+	done   chan struct{}
+	once   sync.Once
+	mu     sync.Mutex
+	queue  []*TaskUpdateEvent
+	wake   chan struct{}
+}
+
+func newTaskSubscriber() *taskSubscriber {
+	subscriber := &taskSubscriber{
+		events: make(chan *TaskUpdateEvent, 16),
+		done:   make(chan struct{}),
+		wake:   make(chan struct{}, 1),
+	}
+	go subscriber.dispatch()
+	return subscriber
+}
+
+func (s *taskSubscriber) close() {
+	s.once.Do(func() { close(s.done) })
+}
+
+func (s *taskSubscriber) send(event *TaskUpdateEvent) bool {
+	select {
+	case <-s.done:
+		return false
+	default:
+	}
+	s.mu.Lock()
+	s.queue = append(s.queue, event)
+	s.mu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+func (s *taskSubscriber) dispatch() {
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-s.wake:
+		}
+		for {
+			s.mu.Lock()
+			if len(s.queue) == 0 {
+				s.mu.Unlock()
+				break
+			}
+			event := s.queue[0]
+			s.queue[0] = nil
+			s.queue = s.queue[1:]
+			s.mu.Unlock()
+			select {
+			case s.events <- event:
+			case <-s.done:
+				return
+			}
+		}
+	}
 }
 
 type historyEntry struct {
@@ -94,6 +181,7 @@ type Server struct {
 	taskTTL       time.Duration
 	cleanupTicker *time.Ticker
 	cleanupStop   chan struct{}
+	cleanupOnce   sync.Once
 
 	rateLimiter *RateLimiter
 
@@ -106,9 +194,20 @@ type Server struct {
 	maxHistoryLen int
 	maxTotalHist  int
 
-	maxRequestBody  int64
-	taskTimeout     time.Duration
-	requestTimeout  time.Duration
+	maxRequestBody int64
+	taskTimeout    time.Duration
+	requestTimeout time.Duration
+	bgCtx          context.Context
+	bgCancel       context.CancelFunc
+	bgCancelOnce   sync.Once
+	bgWG           sync.WaitGroup
+
+	v1PushMu           sync.RWMutex
+	v1PushConfigs      map[string]map[string]V1TaskPushNotificationConfig
+	v1Notifier         *PushNotifier
+	allowPrivateV1Push bool
+	extendedCard       *V1AgentCard
+	v1Extensions       []V1AgentExtension
 }
 
 // CORSConfig configures cross-origin resource sharing.
@@ -174,17 +273,40 @@ func WithMaxEventHistory(perTask, total int) ServerOption {
 	}
 }
 
+// WithExtendedAgentCard configures the authenticated A2A 1.0 extended card.
+func WithExtendedAgentCard(card V1AgentCard) ServerOption {
+	return func(s *Server) { s.extendedCard = &card }
+}
+
+// WithA2AExtensions declares extensions supported by the A2A 1.0 interface.
+func WithA2AExtensions(extensions ...V1AgentExtension) ServerOption {
+	return func(s *Server) { s.v1Extensions = append([]V1AgentExtension(nil), extensions...) }
+}
+
+// WithAllowPrivateV1PushTargets permits private webhook targets for trusted deployments.
+func WithAllowPrivateV1PushTargets(allow bool) ServerOption {
+	return func(s *Server) {
+		s.allowPrivateV1Push = allow
+		s.v1Notifier.WithAllowPrivate(allow)
+	}
+}
+
 // NewServer creates an A2A server wrapping the given handler.
 func NewServer(handler AgentHandler, opts ...ServerOption) *Server {
+	bgCtx, bgCancel := context.WithCancel(context.Background())
 	s := &Server{
 		handler:        handler,
 		taskStates:     make(map[string]*taskSubState),
+		v1PushConfigs:  make(map[string]map[string]V1TaskPushNotificationConfig),
+		v1Notifier:     NewPushNotifier(),
 		maxHistoryLen:  64,
 		maxTotalHist:   10000,
 		logger:         slog.Default(),
-		maxRequestBody:  defaultMaxRequestBody,
-		taskTimeout:     defaultTaskTimeout,
-		requestTimeout:  30 * time.Second,
+		maxRequestBody: defaultMaxRequestBody,
+		taskTimeout:    defaultTaskTimeout,
+		requestTimeout: 30 * time.Second,
+		bgCtx:          bgCtx,
+		bgCancel:       bgCancel,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -264,8 +386,8 @@ func (s *Server) purgeOldTasks() {
 	for _, id := range toDelete {
 		ts := s.taskStates[id]
 		ts.mu.Lock()
-		for _, ch := range ts.subs {
-			close(ch)
+		for _, subscriber := range ts.subs {
+			subscriber.close()
 		}
 		ts.subs = nil
 		removed := len(ts.history)
@@ -288,7 +410,7 @@ func (s *Server) purgeOldTasks() {
 
 func isTerminalState(state TaskState) bool {
 	switch state {
-	case TaskStateCompleted, TaskStateFailed, TaskStateCanceled:
+	case TaskStateCompleted, TaskStateFailed, TaskStateCanceled, TaskStateRejected:
 		return true
 	default:
 		return false
@@ -354,46 +476,105 @@ func validateSkillParameters(params map[string]any, skillIndex int) error {
 // Handler returns an http.Handler with all A2A routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/agent-card.json", s.handleAgentCardV1)
 	mux.HandleFunc("/.well-known/agent.json", s.handleAgentCard)
 	mux.HandleFunc("/", s.handleJSONRPC)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/ws", s.handleWebSocket)
 
-	h := withAuth(withCORS(mux, s.cors), s.auth)
+	// REST transport (HTTP+JSON binding).
+	mux.HandleFunc("POST /rest/message:send", s.handleRESTSendMessage)
+	mux.HandleFunc("POST /rest/message:stream", s.handleRESTStreamMessage)
+	mux.HandleFunc("GET /rest/tasks", s.handleRESTListTasks)
+	mux.HandleFunc("GET /rest/tasks/{id}", s.handleRESTGetTask)
+	mux.HandleFunc("POST /rest/tasks/{idAndAction}", s.handleRESTTaskAction)
+	mux.HandleFunc("POST /rest/tasks/{id}/pushNotificationConfigs", s.handleRESTCreatePushConfig)
+
+	h := withAuth(withCORS(s.withA2AVersion(mux), s.cors), s.auth)
 	if s.rateLimiter != nil {
 		h = s.rateLimiter.Middleware(h)
 	}
 	return h
 }
 
+func (s *Server) withA2AVersion(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		version := r.Header.Get("A2A-Version")
+		if version == "" || version == "0.3" || version == a2aProtocolVersion {
+			if version == a2aProtocolVersion && r.URL.Path == "/" {
+				requested := make(map[string]struct{})
+				for _, uri := range strings.Split(r.Header.Get("A2A-Extensions"), ",") {
+					if uri = strings.TrimSpace(uri); uri != "" {
+						requested[uri] = struct{}{}
+					}
+				}
+				for _, extension := range s.v1Extensions {
+					if _, ok := requested[extension.URI]; extension.Required && !ok {
+						writeJSONRPCError(w, nil, A2AErrorExtensionSupportRequired, fmt.Sprintf("required extension %q was not requested", extension.URI))
+						return
+					}
+				}
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+		writeJSONRPCError(w, nil, A2AErrorVersionNotSupported, fmt.Sprintf("unsupported A2A version %q; supported versions are 0.3 and %s", version, a2aProtocolVersion))
+	})
+}
+
 // ListenAndServe starts the HTTP server.
 func (s *Server) ListenAndServe(addr string) error {
-	s.srv = &http.Server{Addr: addr, Handler: s.Handler()}
+	s.srv = s.newHTTPServer(addr)
 	return s.srv.ListenAndServe()
+}
+
+func (s *Server) newHTTPServer(addr string) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: defaultHTTPReadHeaderTimeout,
+		ReadTimeout:       defaultHTTPReadTimeout,
+		IdleTimeout:       defaultHTTPIdleTimeout,
+		MaxHeaderBytes:    defaultHTTPMaxHeaderBytes,
+	}
 }
 
 // Shutdown gracefully shuts down the server and closes all subscriptions.
 func (s *Server) Shutdown(ctx context.Context) error {
-	if s.cleanupTicker != nil {
-		s.cleanupTicker.Stop()
-		close(s.cleanupStop)
+	s.bgCancelOnce.Do(s.bgCancel)
+	backgroundDone := make(chan struct{})
+	go func() {
+		s.bgWG.Wait()
+		close(backgroundDone)
+	}()
+	select {
+	case <-backgroundDone:
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 
-	if s.rateLimiter != nil {
-		s.rateLimiter.Stop()
-	}
-
-	s.taskStatesMu.Lock()
-	for id, ts := range s.taskStates {
-		ts.mu.Lock()
-		for _, ch := range ts.subs {
-			close(ch)
+	s.cleanupOnce.Do(func() {
+		if s.cleanupTicker != nil {
+			s.cleanupTicker.Stop()
+			close(s.cleanupStop)
 		}
-		ts.subs = nil
-		ts.mu.Unlock()
-		delete(s.taskStates, id)
-	}
-	s.taskStatesMu.Unlock()
+
+		if s.rateLimiter != nil {
+			s.rateLimiter.Stop()
+		}
+
+		s.taskStatesMu.Lock()
+		for id, ts := range s.taskStates {
+			ts.mu.Lock()
+			for _, subscriber := range ts.subs {
+				subscriber.close()
+			}
+			ts.subs = nil
+			ts.mu.Unlock()
+			delete(s.taskStates, id)
+		}
+		s.taskStatesMu.Unlock()
+	})
 
 	if s.srv == nil {
 		return nil
@@ -464,7 +645,13 @@ func (s *Server) handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.dispatchJSONRPC(withLastEventID(r.Context(), r.Header.Get("Last-Event-ID")), w, req)
+	ctx := withLastEventID(r.Context(), r.Header.Get("Last-Event-ID"))
+	if req.isNotification() {
+		s.dispatchJSONRPC(ctx, discardResponseWriter{}, req)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	s.dispatchJSONRPC(ctx, w, req)
 }
 
 func (s *Server) handleBatchJSONRPC(w http.ResponseWriter, r *http.Request, reqs []JSONRPCRequest) {
@@ -485,8 +672,12 @@ func (s *Server) handleBatchJSONRPC(w http.ResponseWriter, r *http.Request, reqs
 			})
 			continue
 		}
+		if req.isNotification() {
+			s.dispatchJSONRPC(withLastEventID(r.Context(), r.Header.Get("Last-Event-ID")), discardResponseWriter{}, req)
+			continue
+		}
 
-		if req.Method == "tasks/sendSubscribe" || req.Method == "tasks/resubscribe" {
+		if req.Method == "tasks/sendSubscribe" || req.Method == "tasks/resubscribe" || req.Method == "SendStreamingMessage" || req.Method == "SubscribeToTask" {
 			results = append(results, JSONRPCResponse{
 				JSONRPC: "2.0",
 				ID:      req.ID,
@@ -494,7 +685,6 @@ func (s *Server) handleBatchJSONRPC(w http.ResponseWriter, r *http.Request, reqs
 			})
 			continue
 		}
-
 		rec := httptestNewRecorder()
 		s.dispatchJSONRPC(withLastEventID(r.Context(), r.Header.Get("Last-Event-ID")), rec, req)
 
@@ -504,6 +694,10 @@ func (s *Server) handleBatchJSONRPC(w http.ResponseWriter, r *http.Request, reqs
 		}
 	}
 
+	if len(results) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	_ = json.NewEncoder(w).Encode(results)
 }
 
@@ -518,7 +712,7 @@ func (s *Server) dispatchJSONRPC(ctx context.Context, w http.ResponseWriter, req
 
 	card := s.handler.Card()
 
-	isStreaming := req.Method == "tasks/sendSubscribe" || req.Method == "tasks/resubscribe"
+	isStreaming := req.Method == "tasks/sendSubscribe" || req.Method == "tasks/resubscribe" || req.Method == "SendStreamingMessage" || req.Method == "SubscribeToTask"
 
 	if !isStreaming && s.requestTimeout > 0 {
 		var cancel context.CancelFunc
@@ -527,6 +721,60 @@ func (s *Server) dispatchJSONRPC(ctx context.Context, w http.ResponseWriter, req
 	}
 
 	switch req.Method {
+	case "SendMessage":
+		s.handleV1SendMessage(ctx, w, req)
+	case "SendStreamingMessage":
+		if !card.Capabilities.Streaming {
+			writeJSONRPCError(w, req.ID, A2AErrorUnsupportedOperation, "streaming not supported")
+			return
+		}
+		s.handleV1SendStreamingMessage(ctx, w, req)
+	case "GetTask":
+		s.handleV1GetTask(ctx, w, req)
+	case "ListTasks":
+		s.handleV1ListTasks(ctx, w, req)
+	case "CancelTask":
+		s.handleV1CancelTask(ctx, w, req)
+	case "SubscribeToTask":
+		if !card.Capabilities.Streaming {
+			writeJSONRPCError(w, req.ID, A2AErrorUnsupportedOperation, "streaming not supported")
+			return
+		}
+		s.handleV1SubscribeToTask(ctx, w, req)
+	case "CreateTaskPushNotificationConfig":
+		if !card.Capabilities.PushNotifications {
+			writeJSONRPCError(w, req.ID, A2AErrorPushNotSupported, "push notifications not supported")
+			return
+		}
+		s.handleV1CreatePushConfig(ctx, w, req)
+	case "GetTaskPushNotificationConfig":
+		if !card.Capabilities.PushNotifications {
+			writeJSONRPCError(w, req.ID, A2AErrorPushNotSupported, "push notifications not supported")
+			return
+		}
+		s.handleV1GetPushConfig(ctx, w, req)
+	case "ListTaskPushNotificationConfigs":
+		if !card.Capabilities.PushNotifications {
+			writeJSONRPCError(w, req.ID, A2AErrorPushNotSupported, "push notifications not supported")
+			return
+		}
+		s.handleV1ListPushConfigs(ctx, w, req)
+	case "DeleteTaskPushNotificationConfig":
+		if !card.Capabilities.PushNotifications {
+			writeJSONRPCError(w, req.ID, A2AErrorPushNotSupported, "push notifications not supported")
+			return
+		}
+		s.handleV1DeletePushConfig(ctx, w, req)
+	case "GetExtendedAgentCard":
+		if !card.Capabilities.ExtendedAgentCard && s.extendedCard == nil {
+			writeJSONRPCError(w, req.ID, A2AErrorUnsupportedOperation, "extended Agent Card not supported")
+			return
+		}
+		if s.auth.APIKey == "" && s.auth.BearerToken == "" {
+			writeJSONRPCError(w, req.ID, JSONRPCInvalidRequest, "extended Agent Card requires an authentication mechanism")
+			return
+		}
+		s.handleV1GetExtendedAgentCard(w, req)
 	case "tasks/send":
 		s.handleSendTask(ctx, w, req)
 	case "tasks/sendSubscribe":
@@ -628,23 +876,8 @@ func (s *Server) handleSendTaskSubscribe(ctx context.Context, w http.ResponseWri
 		params.ID = taskID
 	}
 
-	ch := make(chan *TaskUpdateEvent, 16)
-	ts := s.getTaskState(taskID)
-	ts.mu.Lock()
-	ts.subs = append(ts.subs, ch)
-	ts.mu.Unlock()
-
-	defer func() {
-		ts.mu.Lock()
-		for i, c := range ts.subs {
-			if c == ch {
-				ts.subs = append(ts.subs[:i], ts.subs[i+1:]...)
-				break
-			}
-		}
-		close(ch)
-		ts.mu.Unlock()
-	}()
+	subscriber := s.subscribeToTask(taskID)
+	defer s.unsubscribeFromTask(taskID, subscriber)
 
 	type taskResult struct {
 		task *Task
@@ -687,10 +920,9 @@ func (s *Server) handleSendTaskSubscribe(ctx context.Context, w http.ResponseWri
 			if !s.writeSSEComment(w, flusher, "heartbeat") {
 				return
 			}
-		case ev, ok := <-ch:
-			if !ok {
-				return
-			}
+		case <-subscriber.done:
+			return
+		case ev := <-subscriber.events:
 			ev.ID = req.ID
 			seq++
 			if !s.writeSSEEvent(w, flusher, ev, seq) {
@@ -838,22 +1070,8 @@ func (s *Server) handleResubscribe(ctx context.Context, w http.ResponseWriter, r
 		}
 	}
 
-	ch := make(chan *TaskUpdateEvent, 16)
-	ts.mu.Lock()
-	ts.subs = append(ts.subs, ch)
-	ts.mu.Unlock()
-
-	defer func() {
-		ts.mu.Lock()
-		for i, c := range ts.subs {
-			if c == ch {
-				ts.subs = append(ts.subs[:i], ts.subs[i+1:]...)
-				break
-			}
-		}
-		close(ch)
-		ts.mu.Unlock()
-	}()
+	subscriber := s.subscribeToTask(params.ID)
+	defer s.unsubscribeFromTask(params.ID, subscriber)
 
 	heartbeat := time.NewTicker(30 * time.Second)
 	defer heartbeat.Stop()
@@ -866,27 +1084,11 @@ func (s *Server) handleResubscribe(ctx context.Context, w http.ResponseWriter, r
 			if !s.writeSSEComment(w, flusher, "heartbeat") {
 				return
 			}
-		case ev, ok := <-ch:
-			if !ok {
-				return
-			}
+		case <-subscriber.done:
+			return
+		case ev := <-subscriber.events:
 			ev.ID = req.ID
-			ts.mu.Lock()
-			ts.nextSeq++
-			seq := ts.nextSeq
-			trimmed := 0
-			if len(ts.history) >= s.maxHistoryLen {
-				trimmed = len(ts.history) - s.maxHistoryLen + 1
-				ts.history = ts.history[trimmed:]
-			}
-			ts.history = append(ts.history, historyEntry{event: ev, seq: seq})
-			chans := make([]chan *TaskUpdateEvent, len(ts.subs))
-			copy(chans, ts.subs)
-			ts.mu.Unlock()
-
-			s.totalHistSize.Add(1 - int64(trimmed))
-
-			if !s.writeSSEEvent(w, flusher, ev, seq) {
+			if !s.writeSSEEvent(w, flusher, ev, ev.sequence) {
 				return
 			}
 			if ev.Final {
@@ -928,6 +1130,10 @@ func (s *Server) writeSSEComment(w http.ResponseWriter, flusher http.Flusher, co
 
 // recordTask stores a task snapshot in event history for resubscription.
 func (s *Server) recordTask(task *Task) {
+	task = cloneTask(task)
+	if task == nil {
+		return
+	}
 	ts := s.getTaskState(task.ID)
 	ts.mu.Lock()
 	ev := &TaskUpdateEvent{Result: task, Final: isTerminalState(task.State)}
@@ -972,26 +1178,84 @@ func (s *Server) recordTask(task *Task) {
 	}
 }
 
+func cloneTask(task *Task) *Task {
+	if task == nil {
+		return nil
+	}
+	data, err := json.Marshal(task)
+	if err != nil {
+		copy := *task
+		return &copy
+	}
+	var copy Task
+	if err := json.Unmarshal(data, &copy); err != nil {
+		fallback := *task
+		return &fallback
+	}
+	return &copy
+}
+
+func (s *Server) recordedTask(taskID string) *Task {
+	s.taskStatesMu.RLock()
+	ts := s.taskStates[taskID]
+	s.taskStatesMu.RUnlock()
+	if ts == nil {
+		return nil
+	}
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	for i := len(ts.history) - 1; i >= 0; i-- {
+		if task := ts.history[i].event.Result; task != nil {
+			copy := *task
+			return &copy
+		}
+	}
+	return nil
+}
+
 func (s *Server) PublishTaskUpdate(taskID string, ev *TaskUpdateEvent) {
 	ts := s.getTaskState(taskID)
 	ts.mu.Lock()
 	ts.nextSeq++
+	ev.sequence = ts.nextSeq
 	trimmed := 0
 	if len(ts.history) >= s.maxHistoryLen {
 		trimmed = len(ts.history) - s.maxHistoryLen + 1
 		ts.history = ts.history[trimmed:]
 	}
 	ts.history = append(ts.history, historyEntry{event: ev, seq: ts.nextSeq})
-	chans := make([]chan *TaskUpdateEvent, len(ts.subs))
-	copy(chans, ts.subs)
+	subscribers := append([]*taskSubscriber(nil), ts.subs...)
 	ts.mu.Unlock()
 
 	s.totalHistSize.Add(1 - int64(trimmed))
 
-	for _, ch := range chans {
-		select {
-		case ch <- ev:
-		default:
+	for _, subscriber := range subscribers {
+		evCopy := *ev
+		subscriber.send(&evCopy)
+	}
+	s.notifyV1PushConfigs(taskID, streamResponseFromLegacy(taskID, taskContextID(ev), ev))
+}
+
+func taskContextID(ev *TaskUpdateEvent) string {
+	if ev != nil && ev.Result != nil {
+		return ev.Result.SessionID
+	}
+	return ""
+}
+
+func (s *Server) notifyV1PushConfigs(taskID string, payload V1StreamResponse) {
+	s.v1PushMu.RLock()
+	configs := make([]V1TaskPushNotificationConfig, 0, len(s.v1PushConfigs[taskID]))
+	for _, config := range s.v1PushConfigs[taskID] {
+		configs = append(configs, config)
+	}
+	s.v1PushMu.RUnlock()
+	for i := range configs {
+		ctx, cancel := context.WithTimeout(s.bgCtx, 30*time.Second)
+		err := s.v1Notifier.NotifyV1(ctx, &configs[i], payload)
+		cancel()
+		if err != nil && !errors.Is(err, context.Canceled) {
+			s.logger.Warn("A2A v1 push notification failed", "task_id", taskID, "config_id", configs[i].ID, "error", err)
 		}
 	}
 }
@@ -1016,17 +1280,24 @@ func writeJSONRPCError(w http.ResponseWriter, id any, code int, message string) 
 }
 
 type recordingResponseWriter struct {
-	code int
-	Body *bytes.Buffer
+	code   int
+	Body   *bytes.Buffer
+	header http.Header
 }
 
 func httptestNewRecorder() *recordingResponseWriter {
-	return &recordingResponseWriter{Body: new(bytes.Buffer)}
+	return &recordingResponseWriter{Body: new(bytes.Buffer), header: make(http.Header)}
 }
 
-func (r *recordingResponseWriter) Header() http.Header        { return http.Header{} }
+func (r *recordingResponseWriter) Header() http.Header         { return r.header }
 func (r *recordingResponseWriter) Write(b []byte) (int, error) { return r.Body.Write(b) }
 func (r *recordingResponseWriter) WriteHeader(code int)        { r.code = code }
+
+type discardResponseWriter struct{}
+
+func (discardResponseWriter) Header() http.Header         { return make(http.Header) }
+func (discardResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
+func (discardResponseWriter) WriteHeader(int)             {}
 
 // ---------------------------------------------------------------------------
 // Auth middleware
@@ -1037,6 +1308,10 @@ func withAuth(next http.Handler, cfg AuthConfig) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.well-known/agent-card.json" || r.URL.Path == "/.well-known/agent.json" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		authenticated := false
 
 		if cfg.APIKey != "" {
@@ -1129,8 +1404,8 @@ type DefaultAgentHandler struct {
 	publisher     TaskUpdatePublisher
 	inputRequired func(output string) bool
 
-	execSem    chan struct{}
-	cancelMu   sync.Mutex
+	execSem     chan struct{}
+	cancelMu    sync.Mutex
 	cancelFuncs map[string]context.CancelFunc
 }
 
@@ -1560,6 +1835,13 @@ func (h *DefaultAgentHandler) GetPushNotification(ctx context.Context, taskID st
 	return cfg, nil
 }
 
+func (h *DefaultAgentHandler) DeletePushNotification(_ context.Context, taskID string) error {
+	h.pushMu.Lock()
+	defer h.pushMu.Unlock()
+	delete(h.pushCfg, taskID)
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // PushNotifier
 // ---------------------------------------------------------------------------
@@ -1570,25 +1852,77 @@ type PushNotifier struct {
 	maxRetries   int
 	backoff      time.Duration
 	allowPrivate bool
+	mu           sync.RWMutex
 }
 
 // NewPushNotifier creates a new push notifier.
 func NewPushNotifier() *PushNotifier {
-	return &PushNotifier{
-		client:     &http.Client{Timeout: 30 * time.Second},
+	notifier := &PushNotifier{
 		maxRetries: 3,
 		backoff:    500 * time.Millisecond,
 	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = notifier.dialContext
+	notifier.client = &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+			if notifier.privateAllowed() {
+				return nil
+			}
+			return validateWebhookURL(req.URL.String())
+		},
+	}
+	return notifier
 }
 
 func (n *PushNotifier) WithAllowPrivate(allow bool) *PushNotifier {
+	n.mu.Lock()
 	n.allowPrivate = allow
+	n.mu.Unlock()
 	return n
+}
+
+func (n *PushNotifier) privateAllowed() bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.allowPrivate
+}
+
+func (n *PushNotifier) dialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if n.privateAllowed() {
+		return (&net.Dialer{}).DialContext(ctx, network, address)
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("invalid webhook address %q: %w", address, err)
+	}
+	addresses, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve webhook host %q: %w", host, err)
+	}
+	if len(addresses) == 0 {
+		return nil, fmt.Errorf("webhook host %q has no addresses", host)
+	}
+	for _, address := range addresses {
+		if isPrivateIP(address.IP) {
+			return nil, fmt.Errorf("webhook host %q resolves to private IP %s", host, address.IP)
+		}
+	}
+	var lastErr error
+	for _, address := range addresses {
+		conn, err := (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(address.IP.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("connect to webhook host %q: %w", host, lastErr)
 }
 
 // Notify sends a task update to the configured webhook with exponential backoff retry.
 func (n *PushNotifier) Notify(ctx context.Context, cfg *PushNotificationConfig, task *Task) error {
-	if !n.allowPrivate {
+	if !n.privateAllowed() {
 		if err := validateWebhookURL(cfg.URL); err != nil {
 			return fmt.Errorf("invalid webhook URL: %w", err)
 		}
@@ -1649,6 +1983,62 @@ func (n *PushNotifier) Notify(ctx context.Context, cfg *PushNotificationConfig, 
 		return nil
 	}
 
+	return fmt.Errorf("push notification failed after %d retries: %w", n.maxRetries, lastErr)
+}
+
+// NotifyV1 sends a standards-based A2A 1.0 StreamResponse webhook payload.
+func (n *PushNotifier) NotifyV1(ctx context.Context, cfg *V1TaskPushNotificationConfig, payload V1StreamResponse) error {
+	headers := make(http.Header)
+	if cfg.Authentication != nil && cfg.Authentication.Scheme != "" && cfg.Authentication.Credentials != "" {
+		headers.Set("Authorization", cfg.Authentication.Scheme+" "+cfg.Authentication.Credentials)
+	} else if cfg.Token != "" {
+		headers.Set("Authorization", "Bearer "+cfg.Token)
+	}
+	return n.notifyJSON(ctx, cfg.URL, "application/a2a+json", headers, payload)
+}
+
+func (n *PushNotifier) notifyJSON(ctx context.Context, targetURL, contentType string, headers http.Header, payload any) error {
+	if !n.privateAllowed() {
+		if err := validateWebhookURL(targetURL); err != nil {
+			return fmt.Errorf("invalid webhook URL: %w", err)
+		}
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal push payload: %w", err)
+	}
+	var lastErr error
+	for attempt := 0; attempt <= n.maxRetries; attempt++ {
+		if attempt > 0 {
+			backoff := n.backoff * time.Duration(1<<uint(attempt-1))
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("create push request: %w", err)
+		}
+		req.Header = headers.Clone()
+		req.Header.Set("Content-Type", contentType)
+		resp, err := n.client.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("send push notification: %w", err)
+			continue
+		}
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			lastErr = fmt.Errorf("push webhook returned %d: %s", resp.StatusCode, string(respBody))
+			if resp.StatusCode >= 500 {
+				continue
+			}
+			return lastErr
+		}
+		return nil
+	}
 	return fmt.Errorf("push notification failed after %d retries: %w", n.maxRetries, lastErr)
 }
 

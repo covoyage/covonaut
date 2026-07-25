@@ -67,6 +67,7 @@ func NewExtensionRegistry() *ExtensionRegistry {
 
 // Register adds extensions and immediately initializes them.
 func (r *ExtensionRegistry) Register(ctx context.Context, agent *Agent, exts ...Extension) error {
+	defer agent.rebuildExecutor()
 	for _, ext := range exts {
 		if err := ext.Init(ctx, agent); err != nil {
 			return err

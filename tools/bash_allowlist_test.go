@@ -103,6 +103,32 @@ func TestCommandAllowed_SemicolonSeparator(t *testing.T) {
 	}
 }
 
+func TestCommandAllowed_RejectsNewlineBypass(t *testing.T) {
+	if err := commandAllowed("git status\nrm -rf /tmp/x", []string{"git"}, nil); err == nil {
+		t.Fatal("expected rejection for disallowed command after newline")
+	}
+}
+
+func TestCommandAllowed_RejectsCommandSubstitution(t *testing.T) {
+	for _, cmd := range []string{"git status $(rm -rf /tmp/x)", "git status `rm -rf /tmp/x`"} {
+		if err := commandAllowed(cmd, []string{"git"}, nil); err == nil {
+			t.Fatalf("expected nested command rejection for %q", cmd)
+		}
+	}
+}
+
+func TestCommandAllowed_RejectsDynamicCommandName(t *testing.T) {
+	if err := commandAllowed("$COMMAND status", []string{"git"}, nil); err == nil {
+		t.Fatal("expected dynamic command name rejection")
+	}
+}
+
+func TestCommandAllowed_RespectsQuotedSeparators(t *testing.T) {
+	if err := commandAllowed(`echo "a; b | c"`, []string{"echo"}, nil); err != nil {
+		t.Fatalf("quoted separators should not create commands: %v", err)
+	}
+}
+
 // --- bash tool integration ---
 // (reuses mockBashOps from tools_ops_test.go, which takes an execFunc)
 

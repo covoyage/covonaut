@@ -71,7 +71,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	wc := &wsConn{conn: conn}
 	go s.wsPingLoop(wc)
-	go s.wsReadLoop(wc, r)
+	go s.wsReadLoop(wc)
 }
 
 func (s *Server) wsPingLoop(wc *wsConn) {
@@ -105,10 +105,10 @@ func (s *Server) checkWSAuth(key, token string) bool {
 	return false
 }
 
-func (s *Server) wsReadLoop(wc *wsConn, r *http.Request) {
+func (s *Server) wsReadLoop(wc *wsConn) {
 	defer wc.close()
 
-	ctx, cancel := context.WithCancel(r.Context())
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	for {
@@ -145,13 +145,13 @@ func (s *Server) wsReadLoop(wc *wsConn, r *http.Request) {
 				wc.writeJSON(JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &JSONRPCError{Code: A2AErrorUnsupportedOperation, Message: "streaming not supported"}})
 				continue
 			}
-			s.handleWSSubscribe(ctx, wc, req, cancel)
+			go s.handleWSSubscribe(ctx, wc, req)
 		case "tasks/resubscribe":
 			if !s.handler.Card().Capabilities.Streaming {
 				wc.writeJSON(JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &JSONRPCError{Code: A2AErrorUnsupportedOperation, Message: "streaming not supported"}})
 				continue
 			}
-			s.handleWSResubscribe(ctx, wc, req, cancel)
+			s.handleWSResubscribe(ctx, wc, req)
 		case "tasks/pushNotification/set":
 			if !s.handler.Card().Capabilities.PushNotifications {
 				wc.writeJSON(JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &JSONRPCError{Code: A2AErrorPushNotSupported, Message: "push notifications not supported"}})
@@ -283,7 +283,7 @@ func (s *Server) handleWSGetPushNotification(ctx context.Context, wc *wsConn, re
 	wc.writeJSON(JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: cfg})
 }
 
-func (s *Server) handleWSSubscribe(ctx context.Context, wc *wsConn, req JSONRPCRequest, cancel context.CancelFunc) {
+func (s *Server) handleWSSubscribe(ctx context.Context, wc *wsConn, req JSONRPCRequest) {
 	var params SendTaskRequest
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		wc.writeJSON(JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &JSONRPCError{Code: JSONRPCInvalidParams, Message: err.Error()}})
@@ -305,8 +305,8 @@ func (s *Server) handleWSSubscribe(ctx context.Context, wc *wsConn, req JSONRPCR
 		params.ID = taskID
 	}
 
-	ch := s.subscribeToTask(taskID)
-	defer s.unsubscribeFromTask(taskID, ch)
+	subscriber := s.subscribeToTask(taskID)
+	defer s.unsubscribeFromTask(taskID, subscriber)
 
 	type taskResult struct {
 		task *Task
@@ -350,10 +350,9 @@ func (s *Server) handleWSSubscribe(ctx context.Context, wc *wsConn, req JSONRPCR
 			if err != nil {
 				return
 			}
-		case ev, ok := <-ch:
-			if !ok {
-				return
-			}
+		case <-subscriber.done:
+			return
+		case ev := <-subscriber.events:
 			if err := wc.writeJSON(ev); err != nil {
 				return
 			}
@@ -364,7 +363,7 @@ func (s *Server) handleWSSubscribe(ctx context.Context, wc *wsConn, req JSONRPCR
 	}
 }
 
-func (s *Server) handleWSResubscribe(ctx context.Context, wc *wsConn, req JSONRPCRequest, cancel context.CancelFunc) {
+func (s *Server) handleWSResubscribe(ctx context.Context, wc *wsConn, req JSONRPCRequest) {
 	var params struct {
 		ID string `json:"id"`
 	}
@@ -378,35 +377,34 @@ func (s *Server) handleWSResubscribe(ctx context.Context, wc *wsConn, req JSONRP
 		return
 	}
 
-	ch := s.subscribeToTask(params.ID)
-	go s.wsForwardEvents(ctx, wc, ch, params.ID, cancel)
+	subscriber := s.subscribeToTask(params.ID)
+	go s.wsForwardEvents(ctx, wc, subscriber, params.ID)
 }
 
-func (s *Server) subscribeToTask(taskID string) chan *TaskUpdateEvent {
+func (s *Server) subscribeToTask(taskID string) *taskSubscriber {
 	ts := s.getTaskState(taskID)
 	ts.mu.Lock()
-	ch := make(chan *TaskUpdateEvent, 16)
-	ts.subs = append(ts.subs, ch)
+	subscriber := newTaskSubscriber()
+	ts.subs = append(ts.subs, subscriber)
 	ts.mu.Unlock()
-	return ch
+	return subscriber
 }
 
-func (s *Server) unsubscribeFromTask(taskID string, ch chan *TaskUpdateEvent) {
+func (s *Server) unsubscribeFromTask(taskID string, subscriber *taskSubscriber) {
 	ts := s.getTaskState(taskID)
 	ts.mu.Lock()
 	for i, c := range ts.subs {
-		if c == ch {
+		if c == subscriber {
 			ts.subs = append(ts.subs[:i], ts.subs[i+1:]...)
 			break
 		}
 	}
-	close(ch)
 	ts.mu.Unlock()
+	subscriber.close()
 }
 
-func (s *Server) wsForwardEvents(ctx context.Context, wc *wsConn, ch chan *TaskUpdateEvent, taskID string, cancel context.CancelFunc) {
-	defer cancel()
-	defer s.unsubscribeFromTask(taskID, ch)
+func (s *Server) wsForwardEvents(ctx context.Context, wc *wsConn, subscriber *taskSubscriber, taskID string) {
+	defer s.unsubscribeFromTask(taskID, subscriber)
 
 	heartbeat := time.NewTicker(30 * time.Second)
 	defer heartbeat.Stop()
@@ -426,10 +424,9 @@ func (s *Server) wsForwardEvents(ctx context.Context, wc *wsConn, ch chan *TaskU
 			if err != nil {
 				return
 			}
-		case ev, ok := <-ch:
-			if !ok {
-				return
-			}
+		case <-subscriber.done:
+			return
+		case ev := <-subscriber.events:
 			if err := wc.writeJSON(ev); err != nil {
 				return
 			}
@@ -478,17 +475,17 @@ func (c *WSClient) WithMaxRetries(n int) *WSClient {
 }
 
 type WSConnection struct {
-	conn      *websocket.Conn
-	mu        sync.Mutex
-	closed    bool
-	ch        chan *TaskUpdateEvent
-	err       error
-	ctx       context.Context
-	cancel    context.CancelFunc
+	conn   *websocket.Conn
+	mu     sync.Mutex
+	closed bool
+	ch     chan *TaskUpdateEvent
+	err    error
+	ctx    context.Context
+	cancel context.CancelFunc
 
-	client    *WSClient
-	maxRetry  int
-	retryNum  int
+	client   *WSClient
+	maxRetry int
+	retryNum int
 }
 
 func (c *WSClient) Connect(ctx context.Context) (*WSConnection, error) {
@@ -515,12 +512,12 @@ func (c *WSClient) Connect(ctx context.Context) (*WSConnection, error) {
 
 	ctx2, cancel := context.WithCancel(ctx)
 	wsc := &WSConnection{
-		conn:      conn,
-		ch:        make(chan *TaskUpdateEvent, 16),
-		ctx:       ctx2,
-		cancel:    cancel,
-		client:    c,
-		maxRetry:  c.maxRetries,
+		conn:     conn,
+		ch:       make(chan *TaskUpdateEvent, 16),
+		ctx:      ctx2,
+		cancel:   cancel,
+		client:   c,
+		maxRetry: c.maxRetries,
 	}
 
 	go wsc.readLoop()

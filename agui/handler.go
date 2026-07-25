@@ -125,12 +125,16 @@ func (h *Handler) handleRun(w http.ResponseWriter, r *http.Request) {
 	// leak onto the agent and keep writing to this dead ResponseWriter on
 	// subsequent requests.
 	var mu sync.Mutex
+	terminalSent := false
 	unregister := agent.OnAll(func(e agentcore.Event) {
-		agEvents := converter.Convert(e)
 		mu.Lock()
 		defer mu.Unlock()
+		agEvents := converter.Convert(e)
 		for _, agEv := range agEvents {
 			evtType := extractEventType(agEv)
+			if evtType == string(EventRunError) || evtType == string(EventRunFinished) {
+				terminalSent = true
+			}
 			writeSSE(w, flusher, evtType, agEv)
 		}
 	})
@@ -169,11 +173,15 @@ func (h *Handler) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if runErr != nil {
+		mu.Lock()
+		defer mu.Unlock()
 		for _, agEv := range converter.closeAll(time.Now()) {
 			evtType := extractEventType(agEv)
 			writeSSE(w, flusher, evtType, agEv)
 		}
-		writeSSE(w, flusher, string(EventRunFinished), converter.RunFinished(time.Now()))
+		if !terminalSent {
+			writeSSE(w, flusher, string(EventRunError), converter.RunError(time.Now(), runErr))
+		}
 	}
 }
 

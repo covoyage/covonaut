@@ -40,9 +40,9 @@ func newMockHandler() *mockHandler {
 			URL:         "http://localhost:8080",
 			Version:     "1.0.0",
 			Capabilities: AgentCapabilities{
-			Streaming:         true,
-			PushNotifications: true,
-		},
+				Streaming:         true,
+				PushNotifications: true,
+			},
 			Skills: []AgentSkill{
 				{ID: "greet", Name: "Greeting", Description: "Say hello"},
 			},
@@ -104,7 +104,7 @@ func (m *mockHandler) GetTask(ctx context.Context, req GetTaskRequest) (*Task, e
 		return &t, nil
 	}
 
-	return task, nil
+	return cloneTask(task), nil
 }
 
 func (m *mockHandler) CancelTask(ctx context.Context, req CancelTaskRequest) (*Task, error) {
@@ -146,6 +146,13 @@ func (m *mockHandler) GetPushNotification(ctx context.Context, taskID string) (*
 	return cfg, nil
 }
 
+func (m *mockHandler) DeletePushNotification(_ context.Context, taskID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.pushCfg, taskID)
+	return nil
+}
+
 func (m *mockHandler) QueryTasks(ctx context.Context, req QueryTasksRequest) (*QueryTasksResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -180,29 +187,33 @@ func TestServer_AgentCard(t *testing.T) {
 	ts := httptest.NewServer(server.Handler())
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "/.well-known/agent.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
+	for _, path := range []string{"/.well-known/agent-card.json", "/.well-known/agent.json"} {
+		t.Run(path, func(t *testing.T) {
+			resp, err := http.Get(ts.URL + path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200, got %d", resp.StatusCode)
-	}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("expected 200, got %d", resp.StatusCode)
+			}
 
-	var card AgentCard
-	if err := json.NewDecoder(resp.Body).Decode(&card); err != nil {
-		t.Fatal(err)
-	}
+			var card AgentCard
+			if err := json.NewDecoder(resp.Body).Decode(&card); err != nil {
+				t.Fatal(err)
+			}
 
-	if card.Name != "test-agent" {
-		t.Fatalf("expected name test-agent, got %s", card.Name)
-	}
-	if !card.Capabilities.Streaming {
-		t.Fatal("expected streaming capability")
-	}
-	if len(card.Skills) != 1 || card.Skills[0].ID != "greet" {
-		t.Fatalf("unexpected skills: %v", card.Skills)
+			if card.Name != "test-agent" {
+				t.Fatalf("expected name test-agent, got %s", card.Name)
+			}
+			if !card.Capabilities.Streaming {
+				t.Fatal("expected streaming capability")
+			}
+			if len(card.Skills) != 1 || card.Skills[0].ID != "greet" {
+				t.Fatalf("unexpected skills: %v", card.Skills)
+			}
+		})
 	}
 }
 
@@ -590,8 +601,8 @@ func TestIntegration_ClientServer(t *testing.T) {
 
 	// Send task
 	task, err := client.SendTask(context.Background(), SendTaskRequest{
-		ID:      "integration-task",
-		Message: Message{Role: string(RoleUser), Parts: []Part{NewTextPart("Test message")}},
+		ID:       "integration-task",
+		Message:  Message{Role: string(RoleUser), Parts: []Part{NewTextPart("Test message")}},
 		Metadata: map[string]any{"source": "integration_test"},
 	})
 	if err != nil {
@@ -854,6 +865,26 @@ func TestPushNotifier(t *testing.T) {
 	}
 	if receivedTaskID != "push-task-1" {
 		t.Fatalf("expected task id push-task-1, got %s", receivedTaskID)
+	}
+}
+
+func TestPushNotifierRejectsPrivateRedirect(t *testing.T) {
+	notifier := NewPushNotifier()
+	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1/internal", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := notifier.client.CheckRedirect(req, nil); err == nil {
+		t.Fatal("expected redirect to private address to be rejected")
+	}
+}
+
+func TestPushNotifierRejectsPrivateAddressAtDialTime(t *testing.T) {
+	notifier := NewPushNotifier()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := notifier.dialContext(ctx, "tcp", "127.0.0.1:80"); err == nil {
+		t.Fatal("expected private dial target to be rejected")
 	}
 }
 
@@ -1385,7 +1416,7 @@ func TestDefaultAgentHandler_InputRequiredState(t *testing.T) {
 			URL:  "http://localhost:8080",
 			Capabilities: AgentCapabilities{
 				Streaming:              true,
-				PushNotifications:     true,
+				PushNotifications:      true,
 				StateTransitionHistory: true,
 			},
 		},
@@ -1417,7 +1448,7 @@ func TestDefaultAgentHandler_InputRequiredThenContinue(t *testing.T) {
 			URL:  "http://localhost:8080",
 			Capabilities: AgentCapabilities{
 				Streaming:              true,
-				PushNotifications:     true,
+				PushNotifications:      true,
 				StateTransitionHistory: true,
 			},
 		},
@@ -1495,9 +1526,9 @@ func TestDefaultAgentHandler_AppendToTerminalTaskFails(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 type streamingMockHandler struct {
-	card    AgentCard
-	tasks   map[string]*Task
-	mu      sync.Mutex
+	card  AgentCard
+	tasks map[string]*Task
+	mu    sync.Mutex
 }
 
 func newStreamingMockHandler() *streamingMockHandler {
@@ -1506,7 +1537,7 @@ func newStreamingMockHandler() *streamingMockHandler {
 			Name: "test-agent",
 			URL:  "http://localhost:8080",
 			Capabilities: AgentCapabilities{
-				Streaming:          true,
+				Streaming:         true,
 				PushNotifications: true,
 			},
 		},
@@ -1727,9 +1758,9 @@ func TestServer_SendTaskSubscribe_InputRequiredClosesStream(t *testing.T) {
 }
 
 type inputRequiredHandler struct {
-	card    AgentCard
-	tasks   map[string]*Task
-	mu      sync.Mutex
+	card  AgentCard
+	tasks map[string]*Task
+	mu    sync.Mutex
 }
 
 func (h *inputRequiredHandler) Card() AgentCard { return h.card }
@@ -2375,6 +2406,108 @@ func TestServer_Resubscribe_WithLastEventID(t *testing.T) {
 // ---------------------------------------------------------------------------
 // WebSocket Tests
 // ---------------------------------------------------------------------------
+
+type blockingWSHandler struct {
+	*mockHandler
+	release chan struct{}
+}
+
+func (h *blockingWSHandler) SendTask(ctx context.Context, req SendTaskRequest) (*Task, error) {
+	select {
+	case <-h.release:
+		return h.mockHandler.SendTask(ctx, req)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+type contextAwareWSHandler struct{ *mockHandler }
+
+func (h *contextAwareWSHandler) QueryTasks(ctx context.Context, req QueryTasksRequest) (*QueryTasksResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return h.mockHandler.QueryTasks(ctx, req)
+}
+
+func TestWebSocket_SubscribeDoesNotBlockRequests(t *testing.T) {
+	handler := &blockingWSHandler{mockHandler: newMockHandler(), release: make(chan struct{})}
+	server := NewServer(handler)
+	ts := httptest.NewServer(server.Handler())
+	defer ts.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http")+"/ws", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	defer close(handler.release)
+
+	if err := conn.WriteJSON(JSONRPCRequest{JSONRPC: "2.0", ID: 1, Method: "tasks/subscribe", Params: mustJSON(SendTaskRequest{ID: "slow", Message: Message{Role: string(RoleUser), Parts: []Part{NewTextPart("slow")}}})}); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WriteJSON(JSONRPCRequest{JSONRPC: "2.0", ID: 2, Method: "tasks/query", Params: mustJSON(QueryTasksRequest{})}); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	var response JSONRPCResponse
+	if err := conn.ReadJSON(&response); err != nil {
+		t.Fatalf("query blocked behind subscription: %v", err)
+	}
+	if response.ID != float64(2) && response.ID != 2 {
+		t.Fatalf("first response ID = %v, want 2", response.ID)
+	}
+}
+
+func TestWebSocket_ResubscribeCompletionKeepsConnectionAlive(t *testing.T) {
+	base := newMockHandler()
+	base.tasks["active"] = &Task{ID: "active", State: TaskStateWorking}
+	handler := &contextAwareWSHandler{mockHandler: base}
+	server := NewServer(handler)
+	ts := httptest.NewServer(server.Handler())
+	defer ts.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http")+"/ws", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteJSON(JSONRPCRequest{JSONRPC: "2.0", ID: 1, Method: "tasks/resubscribe", Params: mustJSON(GetTaskRequest{ID: "active"})}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		ts := server.getTaskState("active")
+		ts.mu.RLock()
+		subscribed := len(ts.subs) > 0
+		ts.mu.RUnlock()
+		if subscribed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("resubscribe was not registered")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	server.PublishTaskUpdate("active", &TaskUpdateEvent{Result: &Task{ID: "active", State: TaskStateCompleted}, Final: true})
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	var event TaskUpdateEvent
+	if err := conn.ReadJSON(&event); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := conn.WriteJSON(JSONRPCRequest{JSONRPC: "2.0", ID: 2, Method: "tasks/query", Params: mustJSON(QueryTasksRequest{})}); err != nil {
+		t.Fatal(err)
+	}
+	var response JSONRPCResponse
+	if err := conn.ReadJSON(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error != nil {
+		t.Fatalf("connection context cancelled by completed subscription: %v", response.Error)
+	}
+}
 
 func TestWebSocket_SendAndGetTask(t *testing.T) {
 	handler := newMockHandler()

@@ -127,6 +127,13 @@ func New(cfg agentcore.Config) *Server {
 // guard against memory-exhaustion denial-of-service via oversized payloads.
 const defaultMaxRequestBodyBytes = 10 << 20 // 10 MiB
 
+const (
+	defaultHTTPReadHeaderTimeout = 10 * time.Second
+	defaultHTTPReadTimeout       = 30 * time.Second
+	defaultHTTPIdleTimeout       = 2 * time.Minute
+	defaultHTTPMaxHeaderBytes    = 1 << 20
+)
+
 // SetMaxRequestBodyBytes overrides the maximum accepted request body size in
 // bytes. Values <= 0 reset it to the default (10 MiB).
 func (s *Server) SetMaxRequestBodyBytes(n int64) {
@@ -150,9 +157,11 @@ func (s *Server) limitedBody(w http.ResponseWriter, r *http.Request) io.Reader {
 	return http.MaxBytesReader(w, r.Body, limit)
 }
 
-func (s *Server) On(t agentcore.EventType, h agentcore.EventHandler) func() { return s.eventBus.On(t, h) }
-func (s *Server) OnAll(h agentcore.EventHandler) func()                     { return s.eventBus.OnAll(h) }
-func (s *Server) EmitEvent(e agentcore.Event)                        { s.eventBus.Emit(e) }
+func (s *Server) On(t agentcore.EventType, h agentcore.EventHandler) func() {
+	return s.eventBus.On(t, h)
+}
+func (s *Server) OnAll(h agentcore.EventHandler) func() { return s.eventBus.OnAll(h) }
+func (s *Server) EmitEvent(e agentcore.Event)           { s.eventBus.Emit(e) }
 func (s *Server) Close() {
 	s.eventBus.Close()
 	s.agentPool.Range(func(key, value any) bool {
@@ -195,8 +204,19 @@ func (s *Server) aguiHandler() http.Handler {
 }
 
 func (s *Server) ListenAndServe(addr string) error {
-	s.srv = &http.Server{Addr: addr, Handler: s.Handler()}
+	s.srv = s.newHTTPServer(addr)
 	return s.srv.ListenAndServe()
+}
+
+func (s *Server) newHTTPServer(addr string) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: defaultHTTPReadHeaderTimeout,
+		ReadTimeout:       defaultHTTPReadTimeout,
+		IdleTimeout:       defaultHTTPIdleTimeout,
+		MaxHeaderBytes:    defaultHTTPMaxHeaderBytes,
+	}
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
@@ -345,7 +365,7 @@ func (s *Server) handleStreamChat(w http.ResponseWriter, r *http.Request, req Ch
 	if saveErr != nil && runErr == nil {
 		runErr = saveErr
 	}
-	unregister()        // detach BEFORE releasing — see comment above
+	unregister() // detach BEFORE releasing — see comment above
 	s.releaseAgent(agent, req.ThreadID)
 
 	done := StreamDoneEvent{

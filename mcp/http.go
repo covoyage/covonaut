@@ -205,6 +205,9 @@ func (c *HTTPClient) initializeSession(ctx context.Context) error {
 	if result.ProtocolVersion != "" {
 		proto = result.ProtocolVersion
 	}
+	if proto != protocolVersion {
+		return fmt.Errorf("mcp: server selected unsupported protocol version %q; supported version is %s", proto, protocolVersion)
+	}
 	c.setSessionState(headers.Get(headerSessionID), proto)
 	caps, err := decodeCapabilities(result.Capabilities)
 	if err != nil {
@@ -356,12 +359,14 @@ func (c *HTTPClient) callOnce(ctx context.Context, method string, params any, ou
 	}
 	resp, err := c.doJSONRPC(ctx, msg, true)
 	if err != nil {
+		c.notifyCancelledRequest(method, id, ctx.Err())
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	rpcResp, err := c.decodeHTTPRPCResponse(ctx, resp.Body, resp.Header.Get("Content-Type"), id)
 	if err != nil {
+		c.notifyCancelledRequest(method, id, ctx.Err())
 		return resp.Header, fmt.Errorf("mcp %s decode response: %w", method, err)
 	}
 	if rpcResp.Error != nil {
@@ -373,6 +378,18 @@ func (c *HTTPClient) callOnce(ctx context.Context, method string, params any, ou
 		}
 	}
 	return resp.Header, nil
+}
+
+func (c *HTTPClient) notifyCancelledRequest(method, requestID string, cause error) {
+	if cause == nil || method == "initialize" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.bgCtx, 2*time.Second)
+	defer cancel()
+	_ = c.notify(ctx, "notifications/cancelled", map[string]any{
+		"requestId": requestID,
+		"reason":    cause.Error(),
+	})
 }
 
 func (c *HTTPClient) notify(ctx context.Context, method string, params any) error {

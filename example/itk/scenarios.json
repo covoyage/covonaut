@@ -1,0 +1,34 @@
+{
+  "tests": [
+    {
+      "name": "Star Topology (Full) - JSONRPC & HTTP_JSON",
+      "sdks": ["current", "go_v10", "go_v03", "python_v10", "python_v03"],
+      "edges": ["0->1", "0->2", "0->3", "0->4", "1->0", "2->0", "3->0", "4->0"],
+      "protocols": ["jsonrpc", "http_json"],
+      "behavior": "send_message"
+    },
+    {
+      "name": "Star Topology (Full) - JSONRPC & HTTP_JSON (Streaming)",
+      "sdks": ["current", "go_v10", "go_v03", "python_v10", "python_v03"],
+      "edges": ["0->1", "0->2", "0->3", "0->4", "1->0", "2->0", "3->0", "4->0"],
+      "protocols": ["jsonrpc", "http_json"],
+      "streaming": true,
+      "behavior": "send_message"
+    },
+    {
+      "name": "Push Notification Test - Full Topology (JSONRPC & HTTP_JSON)",
+      "sdks": ["current", "go_v10", "go_v03", "python_v10", "python_v03"],
+      "edges": ["0->1", "0->2", "0->3", "0->4", "1->0", "2->0", "3->0", "4->0"],
+      "protocols": ["jsonrpc", "http_json"],
+      "behavior": "push_notification"
+    },
+    {
+      "name": "Resubscribe Test - Full Topology (JSONRPC & HTTP_JSON)",
+      "sdks": ["current", "go_v10", "go_v03", "python_v10", "python_v03"],
+      "edges": ["0->1", "0->2", "0->3", "0->4", "1->0", "2->0", "3->0", "4->0"],
+      "protocols": ["jsonrpc", "http_json"],
+      "streaming": true,
+      "behavior": "resubscribe"
+    }
+  ]
+}

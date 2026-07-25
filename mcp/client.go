@@ -60,12 +60,12 @@ type Client struct {
 	hooksMu           sync.RWMutex
 	notificationHooks []func(context.Context, string, json.RawMessage) error
 
-	reconnectMu     sync.Mutex
+	reconnectMu      sync.Mutex
 	reconnectBackoff time.Duration
 }
 
 const (
-	maxReconnectBackoff = 30 * time.Second
+	maxReconnectBackoff   = 30 * time.Second
 	initialReconnectDelay = 500 * time.Millisecond
 )
 
@@ -259,10 +259,14 @@ func (c *Client) initialize(ctx context.Context) error {
 		},
 	}
 	var result struct {
-		Capabilities json.RawMessage `json:"capabilities"`
+		ProtocolVersion string          `json:"protocolVersion"`
+		Capabilities    json.RawMessage `json:"capabilities"`
 	}
 	if err := c.call(ctx, "initialize", params, &result); err != nil {
 		return err
+	}
+	if result.ProtocolVersion != protocolVersion {
+		return fmt.Errorf("mcp: server selected unsupported protocol version %q; supported version is %s", result.ProtocolVersion, protocolVersion)
 	}
 	caps, err := decodeCapabilities(result.Capabilities)
 	if err != nil {
@@ -410,6 +414,12 @@ func (c *Client) call(ctx context.Context, method string, params any, out any) e
 		}
 		return nil
 	case <-ctx.Done():
+		if method != "initialize" {
+			_ = c.notify("notifications/cancelled", map[string]any{
+				"requestId": id,
+				"reason":    ctx.Err().Error(),
+			})
+		}
 		return ctx.Err()
 	case <-c.closeCh:
 		err := c.connectionError()
@@ -613,8 +623,10 @@ func (c *Client) tryReconnect(ctx context.Context) bool {
 
 	// Replace pipes atomically
 	c.mu.Lock()
+	oldCmd := c.cmd
 	oldStdin := c.stdin
 	oldStdout := c.stdout
+	oldStderr := c.stderr
 	c.cmd = cmd
 	c.stdin = stdin
 	c.stdout = stdout
@@ -635,6 +647,10 @@ func (c *Client) tryReconnect(ctx context.Context) bool {
 	if oldStdout != nil {
 		_ = oldStdout.Close()
 	}
+	if oldStderr != nil {
+		_ = oldStderr.Close()
+	}
+	go reapMCPProcess(oldCmd)
 
 	// Start new readers
 	go c.readLoop()
@@ -648,6 +664,26 @@ func (c *Client) tryReconnect(ctx context.Context) bool {
 
 	c.reconnectBackoff = initialReconnectDelay
 	return true
+}
+
+func reapMCPProcess(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return
+	case <-timer.C:
+		_ = cmd.Process.Kill()
+		<-done
+	}
 }
 
 func (c *Client) isConnectionDeadLocked() bool {

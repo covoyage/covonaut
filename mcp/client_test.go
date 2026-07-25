@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -525,8 +526,12 @@ func runHelperServer() {
 		id := msg["id"]
 		switch method {
 		case "initialize":
+			version := os.Getenv("MCP_HELPER_PROTOCOL_VERSION")
+			if version == "" {
+				version = protocolVersion
+			}
 			writeMCPResponse(writer, id, map[string]any{
-				"protocolVersion": protocolVersion,
+				"protocolVersion": version,
 				"capabilities": map[string]any{
 					"tools": map[string]any{"listChanged": true},
 					"resources": map[string]any{
@@ -551,6 +556,9 @@ func runHelperServer() {
 			args, _ := params["arguments"].(map[string]any)
 			text, _ := args["text"].(string)
 			name, _ := params["name"].(string)
+			if name == "slow" {
+				continue
+			}
 			if name == "reverse" {
 				writeMCPResponse(writer, id, map[string]any{
 					"content": []map[string]any{
@@ -583,6 +591,12 @@ func runHelperServer() {
 					{"type": "text", "text": "echo: " + text},
 				},
 			})
+		case "notifications/cancelled":
+			if path := os.Getenv("MCP_HELPER_CANCEL_FILE"); path != "" {
+				params, _ := msg["params"].(map[string]any)
+				data, _ := json.Marshal(params)
+				_ = os.WriteFile(path, data, 0o600)
+			}
 		case "resources/list":
 			writeMCPResponse(writer, id, map[string]any{
 				"resources": []map[string]any{
@@ -655,6 +669,61 @@ func runHelperServer() {
 		default:
 			writeMCPError(writer, id, -32601, fmt.Sprintf("method not found: %s", method))
 		}
+	}
+}
+
+func TestStdioClientRejectsUnsupportedProtocolVersion(t *testing.T) {
+	_, err := NewStdioClient(context.Background(), StdioConfig{
+		Command: os.Args[0],
+		Args:    []string{"-test.run=TestMCPHelperProcess"},
+		Env: []string{
+			"GO_WANT_MCP_HELPER_PROCESS=1",
+			"MCP_HELPER_PROTOCOL_VERSION=1900-01-01",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsupported protocol version") {
+		t.Fatalf("error = %v, want unsupported protocol version", err)
+	}
+}
+
+func TestStdioClientSendsCancellationNotification(t *testing.T) {
+	cancelFile := t.TempDir() + "/cancel.json"
+	client, err := NewStdioClient(context.Background(), StdioConfig{
+		Command: os.Args[0],
+		Args:    []string{"-test.run=TestMCPHelperProcess"},
+		Env: []string{
+			"GO_WANT_MCP_HELPER_PROCESS=1",
+			"MCP_HELPER_CANCEL_FILE=" + cancelFile,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err = client.CallTool(ctx, "slow", nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CallTool error = %v, want deadline exceeded", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		data, readErr := os.ReadFile(cancelFile)
+		if readErr == nil {
+			var params map[string]any
+			if err := json.Unmarshal(data, &params); err != nil {
+				t.Fatal(err)
+			}
+			if params["requestId"] == nil {
+				t.Fatalf("cancellation missing requestId: %+v", params)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("helper did not receive notifications/cancelled")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

@@ -3,56 +3,61 @@ package agui
 type EventType string
 
 const (
-	EventRunStarted        EventType = "RUN_STARTED"
-	EventRunFinished       EventType = "RUN_FINISHED"
-	EventRunError          EventType = "RUN_ERROR"
-	EventStepStarted       EventType = "STEP_STARTED"
-	EventStepFinished      EventType = "STEP_FINISHED"
-	EventTextMessageStart  EventType = "TEXT_MESSAGE_START"
-	EventTextMessageContent EventType = "TEXT_MESSAGE_CONTENT"
-	EventTextMessageEnd    EventType = "TEXT_MESSAGE_END"
-	EventThinkingStart     EventType = "THINKING_START"
-	EventThinkingTextMessageStart EventType = "THINKING_TEXT_MESSAGE_START"
+	EventRunStarted                 EventType = "RUN_STARTED"
+	EventRunFinished                EventType = "RUN_FINISHED"
+	EventRunError                   EventType = "RUN_ERROR"
+	EventStepStarted                EventType = "STEP_STARTED"
+	EventStepFinished               EventType = "STEP_FINISHED"
+	EventTextMessageStart           EventType = "TEXT_MESSAGE_START"
+	EventTextMessageContent         EventType = "TEXT_MESSAGE_CONTENT"
+	EventTextMessageEnd             EventType = "TEXT_MESSAGE_END"
+	EventThinkingStart              EventType = "THINKING_START"
+	EventThinkingTextMessageStart   EventType = "THINKING_TEXT_MESSAGE_START"
 	EventThinkingTextMessageContent EventType = "THINKING_TEXT_MESSAGE_CONTENT"
-	EventThinkingTextMessageEnd EventType = "THINKING_TEXT_MESSAGE_END"
-	EventThinkingEnd       EventType = "THINKING_END"
-	EventToolCallStart     EventType = "TOOL_CALL_START"
-	EventToolCallArgs      EventType = "TOOL_CALL_ARGS"
-	EventToolCallEnd       EventType = "TOOL_CALL_END"
-	EventToolCallResult    EventType = "TOOL_CALL_RESULT"
-	EventStateSnapshot     EventType = "STATE_SNAPSHOT"
-	EventStateDelta        EventType = "STATE_DELTA"
-	EventMessagesSnapshot  EventType = "MESSAGES_SNAPSHOT"
-	EventCustom            EventType = "CUSTOM"
-	EventRaw               EventType = "RAW"
+	EventThinkingTextMessageEnd     EventType = "THINKING_TEXT_MESSAGE_END"
+	EventThinkingEnd                EventType = "THINKING_END"
+	EventReasoningStart             EventType = "REASONING_START"
+	EventReasoningMessageStart      EventType = "REASONING_MESSAGE_START"
+	EventReasoningMessageContent    EventType = "REASONING_MESSAGE_CONTENT"
+	EventReasoningMessageEnd        EventType = "REASONING_MESSAGE_END"
+	EventReasoningEnd               EventType = "REASONING_END"
+	EventToolCallStart              EventType = "TOOL_CALL_START"
+	EventToolCallArgs               EventType = "TOOL_CALL_ARGS"
+	EventToolCallEnd                EventType = "TOOL_CALL_END"
+	EventToolCallResult             EventType = "TOOL_CALL_RESULT"
+	EventStateSnapshot              EventType = "STATE_SNAPSHOT"
+	EventStateDelta                 EventType = "STATE_DELTA"
+	EventMessagesSnapshot           EventType = "MESSAGES_SNAPSHOT"
+	EventCustom                     EventType = "CUSTOM"
+	EventRaw                        EventType = "RAW"
 )
 
 type BaseEvent struct {
-	Type      EventType   `json:"type"`
-	Timestamp float64     `json:"timestamp,omitempty"`
-	RawEvent  any         `json:"rawEvent,omitempty"`
+	Type      EventType `json:"type"`
+	Timestamp float64   `json:"timestamp,omitempty"`
+	RawEvent  any       `json:"rawEvent,omitempty"`
 }
 
 func (b BaseEvent) GetType() EventType { return b.Type }
 
 type RunStartedEvent struct {
 	BaseEvent
-	ThreadID     string `json:"threadId"`
-	RunID        string `json:"runId"`
-	ParentRunID  string `json:"parentRunId,omitempty"`
+	ThreadID    string `json:"threadId"`
+	RunID       string `json:"runId"`
+	ParentRunID string `json:"parentRunId,omitempty"`
 }
 
 type RunFinishedEvent struct {
 	BaseEvent
-	ThreadID string           `json:"threadId"`
-	RunID    string           `json:"runId"`
-	Result   any              `json:"result,omitempty"`
+	ThreadID string              `json:"threadId"`
+	RunID    string              `json:"runId"`
+	Result   any                 `json:"result,omitempty"`
 	Outcome  *RunFinishedOutcome `json:"outcome,omitempty"`
 }
 
 type RunFinishedOutcome struct {
-	Type       EventType    `json:"type"`
-	Interrupts []Interrupt  `json:"interrupts,omitempty"`
+	Type       EventType   `json:"type"`
+	Interrupts []Interrupt `json:"interrupts,omitempty"`
 }
 
 type Interrupt struct {
@@ -130,6 +135,33 @@ type ThinkingEndEvent struct {
 	ThinkingID string `json:"thinkingId"`
 }
 
+type ReasoningStartEvent struct {
+	BaseEvent
+	MessageID string `json:"messageId"`
+}
+
+type ReasoningMessageStartEvent struct {
+	BaseEvent
+	MessageID string `json:"messageId"`
+	Role      string `json:"role"`
+}
+
+type ReasoningMessageContentEvent struct {
+	BaseEvent
+	MessageID string `json:"messageId"`
+	Delta     string `json:"delta"`
+}
+
+type ReasoningMessageEndEvent struct {
+	BaseEvent
+	MessageID string `json:"messageId"`
+}
+
+type ReasoningEndEvent struct {
+	BaseEvent
+	MessageID string `json:"messageId"`
+}
+
 type ToolCallStartEvent struct {
 	BaseEvent
 	ToolCallID      string `json:"toolCallId"`
@@ -179,8 +211,8 @@ type jsonPatchOp struct {
 
 type CustomEvent struct {
 	BaseEvent
-	Name    string `json:"name"`
-	Value   any    `json:"value,omitempty"`
+	Name  string `json:"name"`
+	Value any    `json:"value,omitempty"`
 }
 
 type MessageRole string
@@ -194,20 +226,20 @@ const (
 )
 
 type Message struct {
-	ID              string      `json:"id"`
-	Role            MessageRole `json:"role"`
-	Content         string      `json:"content,omitempty"`
-	Name            string      `json:"name,omitempty"`
-	ToolCalls       []ToolCall  `json:"toolCalls,omitempty"`
-	ToolCallID      string      `json:"toolCallId,omitempty"`
-	Error           string      `json:"error,omitempty"`
-	EncryptedValue  string      `json:"encryptedValue,omitempty"`
+	ID             string      `json:"id"`
+	Role           MessageRole `json:"role"`
+	Content        string      `json:"content,omitempty"`
+	Name           string      `json:"name,omitempty"`
+	ToolCalls      []ToolCall  `json:"toolCalls,omitempty"`
+	ToolCallID     string      `json:"toolCallId,omitempty"`
+	Error          string      `json:"error,omitempty"`
+	EncryptedValue string      `json:"encryptedValue,omitempty"`
 }
 
 type ToolCall struct {
-	ID       string        `json:"id"`
-	Type     string        `json:"type"`
-	Function ToolCallFunc  `json:"function"`
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function ToolCallFunc `json:"function"`
 }
 
 type ToolCallFunc struct {
@@ -234,9 +266,9 @@ type ResumeEntry struct {
 }
 
 type ToolDef struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description,omitempty"`
-	Parameters  any            `json:"parameters,omitempty"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Parameters  any    `json:"parameters,omitempty"`
 }
 
 type ContextEntry struct {
@@ -259,21 +291,21 @@ type AgentCapabilities struct {
 }
 
 type IdentityCapabilities struct {
-	Name            string         `json:"name,omitempty"`
-	Type            string         `json:"type,omitempty"`
-	Description     string         `json:"description,omitempty"`
-	Version         string         `json:"version,omitempty"`
-	Provider        string         `json:"provider,omitempty"`
-	DocumentationURL string        `json:"documentationUrl,omitempty"`
-	Metadata        map[string]any `json:"metadata,omitempty"`
+	Name             string         `json:"name,omitempty"`
+	Type             string         `json:"type,omitempty"`
+	Description      string         `json:"description,omitempty"`
+	Version          string         `json:"version,omitempty"`
+	Provider         string         `json:"provider,omitempty"`
+	DocumentationURL string         `json:"documentationUrl,omitempty"`
+	Metadata         map[string]any `json:"metadata,omitempty"`
 }
 
 type TransportCapabilities struct {
-	Streaming        bool `json:"streaming,omitempty"`
-	Websocket       bool `json:"websocket,omitempty"`
-	HTTPBinary      bool `json:"httpBinary,omitempty"`
+	Streaming         bool `json:"streaming,omitempty"`
+	Websocket         bool `json:"websocket,omitempty"`
+	HTTPBinary        bool `json:"httpBinary,omitempty"`
 	PushNotifications bool `json:"pushNotifications,omitempty"`
-	Resumable       bool `json:"resumable,omitempty"`
+	Resumable         bool `json:"resumable,omitempty"`
 }
 
 type ToolsCapabilities struct {
@@ -289,17 +321,17 @@ type OutputCapabilities struct {
 }
 
 type StateCapabilities struct {
-	Snapshots      bool `json:"snapshots,omitempty"`
-	Deltas         bool `json:"deltas,omitempty"`
-	Memory         bool `json:"memory,omitempty"`
+	Snapshots       bool `json:"snapshots,omitempty"`
+	Deltas          bool `json:"deltas,omitempty"`
+	Memory          bool `json:"memory,omitempty"`
 	PersistentState bool `json:"persistentState,omitempty"`
 }
 
 type MultiAgentCapabilities struct {
-	Supported  bool                       `json:"supported,omitempty"`
-	Delegation bool                       `json:"delegation,omitempty"`
-	Handoffs   bool                       `json:"handoffs,omitempty"`
-	SubAgents  []SubAgentDescriptor       `json:"subAgents,omitempty"`
+	Supported  bool                 `json:"supported,omitempty"`
+	Delegation bool                 `json:"delegation,omitempty"`
+	Handoffs   bool                 `json:"handoffs,omitempty"`
+	SubAgents  []SubAgentDescriptor `json:"subAgents,omitempty"`
 }
 
 type SubAgentDescriptor struct {
@@ -332,9 +364,9 @@ type MultimodalOutputCapabilities struct {
 }
 
 type ExecutionCapabilities struct {
-	CodeExecution   bool  `json:"codeExecution,omitempty"`
-	Sandboxed       bool  `json:"sandboxed,omitempty"`
-	MaxIterations   int64 `json:"maxIterations,omitempty"`
+	CodeExecution    bool  `json:"codeExecution,omitempty"`
+	Sandboxed        bool  `json:"sandboxed,omitempty"`
+	MaxIterations    int64 `json:"maxIterations,omitempty"`
 	MaxExecutionTime int64 `json:"maxExecutionTime,omitempty"`
 }
 

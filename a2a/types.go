@@ -13,17 +13,17 @@ import (
 // AgentCard is a self-describing manifest for an agent, published at
 // /.well-known/agent.json.
 type AgentCard struct {
-	Name               string              `json:"name"`
-	Description        string              `json:"description,omitempty"`
-	URL                string              `json:"url"`
-	Version            string              `json:"version,omitempty"`
-	DocumentationURL   string              `json:"documentationUrl,omitempty"`
-	Provider           *AgentProvider      `json:"provider,omitempty"`
-	Capabilities       AgentCapabilities   `json:"capabilities"`
+	Name               string               `json:"name"`
+	Description        string               `json:"description,omitempty"`
+	URL                string               `json:"url"`
+	Version            string               `json:"version,omitempty"`
+	DocumentationURL   string               `json:"documentationUrl,omitempty"`
+	Provider           *AgentProvider       `json:"provider,omitempty"`
+	Capabilities       AgentCapabilities    `json:"capabilities"`
 	Authentication     *AgentAuthentication `json:"authentication,omitempty"`
-	DefaultInputModes  []string            `json:"defaultInputModes,omitempty"`
-	DefaultOutputModes []string            `json:"defaultOutputModes,omitempty"`
-	Skills             []AgentSkill        `json:"skills,omitempty"`
+	DefaultInputModes  []string             `json:"defaultInputModes,omitempty"`
+	DefaultOutputModes []string             `json:"defaultOutputModes,omitempty"`
+	Skills             []AgentSkill         `json:"skills,omitempty"`
 }
 
 // AgentProvider describes the organization or individual providing the agent.
@@ -37,6 +37,7 @@ type AgentCapabilities struct {
 	Streaming              bool `json:"streaming,omitempty"`
 	PushNotifications      bool `json:"pushNotifications,omitempty"`
 	StateTransitionHistory bool `json:"stateTransitionHistory,omitempty"`
+	ExtendedAgentCard      bool `json:"extendedAgentCard,omitempty"`
 }
 
 // AgentAuthentication describes the authentication requirements.
@@ -67,9 +68,11 @@ const (
 	TaskStateSubmitted     TaskState = "submitted"
 	TaskStateWorking       TaskState = "working"
 	TaskStateInputRequired TaskState = "input-required"
+	TaskStateAuthRequired  TaskState = "auth-required"
 	TaskStateCompleted     TaskState = "completed"
 	TaskStateFailed        TaskState = "failed"
 	TaskStateCanceled      TaskState = "canceled"
+	TaskStateRejected      TaskState = "rejected"
 )
 
 // Task is the fundamental unit of work managed by A2A.
@@ -103,8 +106,14 @@ const (
 
 // Message is a communication turn between a client and a remote agent.
 type Message struct {
-	Role  string `json:"role"`
-	Parts []Part `json:"parts"`
+	MessageID        string         `json:"messageId,omitempty"`
+	ContextID        string         `json:"contextId,omitempty"`
+	TaskID           string         `json:"taskId,omitempty"`
+	Role             string         `json:"role"`
+	Parts            []Part         `json:"parts"`
+	Metadata         map[string]any `json:"metadata,omitempty"`
+	Extensions       []string       `json:"extensions,omitempty"`
+	ReferenceTaskIDs []string       `json:"referenceTaskIds,omitempty"`
 }
 
 // PartType identifies the kind of content in a Part.
@@ -142,6 +151,41 @@ type FilePart struct {
 type DataPart struct {
 	MIMEType string         `json:"mimeType,omitempty"`
 	Data     map[string]any `json:"data"`
+	Value    any            `json:"-"`
+}
+
+func (p DataPart) MarshalJSON() ([]byte, error) {
+	value := p.Value
+	if value == nil {
+		value = p.Data
+	}
+	return json.Marshal(struct {
+		MIMEType string `json:"mimeType,omitempty"`
+		Data     any    `json:"data"`
+	}{MIMEType: p.MIMEType, Data: value})
+}
+
+func (p *DataPart) UnmarshalJSON(data []byte) error {
+	var decoded struct {
+		MIMEType string          `json:"mimeType,omitempty"`
+		Data     json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	p.MIMEType = decoded.MIMEType
+	if len(decoded.Data) == 0 {
+		return nil
+	}
+	var value any
+	if err := json.Unmarshal(decoded.Data, &value); err != nil {
+		return err
+	}
+	p.Value = value
+	if object, ok := value.(map[string]any); ok {
+		p.Data = object
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +212,26 @@ type JSONRPCRequest struct {
 	ID      any             `json:"id,omitempty"`
 	Method  string          `json:"method"`
 	Params  json.RawMessage `json:"params,omitempty"`
+	hasID   bool
+}
+
+func (r *JSONRPCRequest) UnmarshalJSON(data []byte) error {
+	type requestAlias JSONRPCRequest
+	var decoded requestAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*r = JSONRPCRequest(decoded)
+	_, r.hasID = fields["id"]
+	return nil
+}
+
+func (r JSONRPCRequest) isNotification() bool {
+	return !r.hasID && r.ID == nil && r.Method != "" && r.JSONRPC == "2.0"
 }
 
 // JSONRPCResponse is a JSON-RPC 2.0 response.
@@ -198,11 +262,15 @@ const (
 	JSONRPCInternalError  = -32603
 
 	// A2A-specific error codes.
-	A2AErrorTaskNotFound            = -32001
-	A2AErrorTaskNotCancelable       = -32002
-	A2AErrorPushNotSupported        = -32003
-	A2AErrorUnsupportedOperation    = -32004
-	A2AErrorContentTypeNotSupported = -32005
+	A2AErrorTaskNotFound              = -32001
+	A2AErrorTaskNotCancelable         = -32002
+	A2AErrorPushNotSupported          = -32003
+	A2AErrorUnsupportedOperation      = -32004
+	A2AErrorContentTypeNotSupported   = -32005
+	A2AErrorInvalidAgentResponse      = -32006
+	A2AErrorExtendedCardNotConfigured = -32007
+	A2AErrorExtensionSupportRequired  = -32008
+	A2AErrorVersionNotSupported       = -32009
 )
 
 // ---------------------------------------------------------------------------
@@ -266,6 +334,7 @@ type TaskUpdateEvent struct {
 	Artifact *Artifact     `json:"artifact,omitempty"`
 	Error    *JSONRPCError `json:"error,omitempty"`
 	Final    bool          `json:"final,omitempty"`
+	sequence int
 }
 
 // ---------------------------------------------------------------------------

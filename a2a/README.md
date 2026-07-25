@@ -4,7 +4,11 @@ This package implements the [Agent2Agent (A2A) Protocol](https://a2a-protocol.or
 
 ## Features
 
-- **Agent Card Discovery**: Self-describing metadata at `/.well-known/agent.json`
+- **Agent Card Discovery**: A2A 1.0 metadata at `/.well-known/agent-card.json` with a legacy alias at `/.well-known/agent.json`
+- **A2A 1.0 JSON-RPC**: All 11 standard methods, including push configuration CRUD and extended Agent Cards
+- **Public V1 Client**: Standard methods through `client.V1()` with typed request, response, and stream models
+- **Security & Extensions**: Agent Card security declarations, authentication, `A2A-Version`, and required `A2A-Extensions` negotiation
+- **Legacy Compatibility**: Existing `tasks/*` methods and Go task APIs remain available
 - **Task Management**: Full task lifecycle (submitted → working → completed/failed/canceled)
 - **Synchronous & Streaming**: Support both request/response and SSE streaming modes
 - **Multi-modal Content**: Text, file, and structured data parts
@@ -73,7 +77,7 @@ func main() {
 }
 ```
 
-### 2. Call a Remote A2A Agent
+### 2. Call a Remote A2A 1.0 Agent
 
 ```go
 package main
@@ -97,29 +101,22 @@ func main() {
     }
     fmt.Printf("Connected to: %s\n", card.Name)
 
-    // Send a task
-    task, err := client.SendTask(ctx, a2a.SendTaskRequest{
-        ID: "task-123",
-        Message: a2a.Message{
-            Role: "user",
-            Parts: []a2a.Part{
-                a2a.NewTextPart("What's the weather in Tokyo?"),
-            },
+    // Use the standards-based client facade.
+    response, err := client.V1().SendMessage(ctx, a2a.V1SendMessageRequest{
+        Message: a2a.V1Message{
+            MessageID: "message-123",
+            Role:      "ROLE_USER",
+            Parts:     []a2a.V1Part{a2a.NewV1TextPart("What's the weather in Tokyo?")},
         },
     })
     if err != nil {
         log.Fatal(err)
     }
 
-    fmt.Printf("Task state: %s\n", task.State)
-    if task.State == a2a.TaskStateCompleted {
-        for _, art := range task.Artifacts {
-            for _, part := range art.Parts {
-                if part.Type == a2a.PartTypeText {
-                    fmt.Printf("Result: %s\n", part.Text)
-                }
-            }
-        }
+    if response.Message != nil {
+        fmt.Printf("Direct response: %+v\n", response.Message)
+    } else {
+        fmt.Printf("Task state: %s\n", response.Task.Status.State)
     }
 }
 ```
@@ -127,11 +124,11 @@ func main() {
 ### 3. Streaming Task Updates
 
 ```go
-stream, err := client.SendTaskSubscribe(ctx, a2a.SendTaskRequest{
-    ID: "task-456",
-    Message: a2a.Message{
-        Role: "user",
-        Parts: []a2a.Part{a2a.NewTextPart("Write a long story")},
+stream, err := client.V1().SendStreamingMessage(ctx, a2a.V1SendMessageRequest{
+    Message: a2a.V1Message{
+        MessageID: "message-456",
+        Role:      "ROLE_USER",
+        Parts:     []a2a.V1Part{a2a.NewV1TextPart("Write a long story")},
     },
 })
 if err != nil {
@@ -140,20 +137,18 @@ if err != nil {
 defer stream.Close()
 
 for {
-    ev, ok := stream.Recv()
-    if !ok {
+    ev, err := stream.Recv()
+    if errors.Is(err, io.EOF) {
         break
     }
-    if ev.Error != nil {
-        log.Printf("Error: %s\n", ev.Error.Message)
-        break
+    if err != nil {
+        log.Fatal(err)
     }
-    if ev.Result != nil {
-        fmt.Printf("State: %s\n", ev.Result.State)
-        if ev.Final {
-            fmt.Println("Stream complete!")
-            break
-        }
+    if ev.Task != nil {
+        fmt.Printf("Initial state: %s\n", ev.Task.Status.State)
+    }
+    if ev.StatusUpdate != nil {
+        fmt.Printf("State: %s\n", ev.StatusUpdate.Status.State)
     }
 }
 ```
@@ -227,10 +222,29 @@ server := a2a.NewServer(adapter)
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/.well-known/agent.json` | Agent Card discovery |
+| GET | `/.well-known/agent-card.json` | A2A 1.0 Agent Card discovery |
+| GET | `/.well-known/agent.json` | Legacy Agent Card discovery |
 | POST | `/` | JSON-RPC endpoint |
 
-### JSON-RPC Methods
+### A2A 1.0 JSON-RPC Methods
+
+| Method | Description |
+|--------|-------------|
+| `SendMessage` | Send or continue a message |
+| `SendStreamingMessage` | Send a message with standard JSON-RPC SSE responses |
+| `GetTask` | Get task state with `historyLength` support |
+| `ListTasks` | List tasks with cursor pagination and field controls |
+| `CancelTask` | Cancel a task |
+| `SubscribeToTask` | Subscribe to a non-terminal task |
+| `CreateTaskPushNotificationConfig` | Create a task webhook configuration |
+| `GetTaskPushNotificationConfig` | Get one webhook configuration |
+| `ListTaskPushNotificationConfigs` | List webhook configurations |
+| `DeleteTaskPushNotificationConfig` | Delete a webhook configuration |
+| `GetExtendedAgentCard` | Retrieve the authenticated extended card |
+
+The server accepts `A2A-Version: 1.0`. Empty version headers and `0.3` retain legacy behavior; unsupported versions return `VersionNotSupportedError`. Configure required extensions with `WithA2AExtensions` and an authenticated extended card with `WithExtendedAgentCard` plus `WithAuth`.
+
+### Legacy JSON-RPC Methods
 
 | Method | Params | Description |
 |--------|--------|-------------|

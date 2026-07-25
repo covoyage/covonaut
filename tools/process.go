@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strconv"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -75,12 +75,14 @@ func (r *ProcessRegistry) Cleanup(maxAge time.Duration) int {
 	now := time.Now()
 	removed := 0
 	for id, entry := range r.processes {
+		entry.mu.Lock()
 		if entry.Status != "running" && entry.EndTime != nil {
 			if now.Sub(*entry.EndTime) > maxAge {
 				delete(r.processes, id)
 				removed++
 			}
 		}
+		entry.mu.Unlock()
 	}
 	return removed
 }
@@ -90,6 +92,11 @@ type ProcessOperations interface {
 	Spawn(command string, cwd string) (*ProcessEntry, error)
 	Kill(pid int) error
 	Poll(entry *ProcessEntry) (string, int, []byte)
+}
+
+type registryProcessOperations interface {
+	lookupProcess(id string) (*ProcessEntry, bool)
+	listProcessIDs() []string
 }
 
 // DefaultProcessOperations uses the local system.
@@ -121,6 +128,7 @@ func (d *DefaultProcessOperations) Spawn(command string, cwd string) (*ProcessEn
 
 	cmd := exec.Command(shell, "-c", command)
 	cmd.Dir = cwd
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	// Create output capture.
 	output := &outputBuffer{maxBytes: 200 * 1024} // 200KB rolling buffer
@@ -150,6 +158,9 @@ func (d *DefaultProcessOperations) Spawn(command string, cwd string) (*ProcessEn
 		now := time.Now()
 		entry.EndTime = &now
 		entry.Output = output.Bytes()
+		if entry.Status == "killed" {
+			return
+		}
 		if err != nil {
 			if exitErr, ok := err.(*exec.ExitError); ok {
 				entry.ExitCode = exitErr.ExitCode()
@@ -174,9 +185,22 @@ func (d *DefaultProcessOperations) Kill(pid int) error {
 }
 
 func (d *DefaultProcessOperations) Poll(entry *ProcessEntry) (string, int, []byte) {
+	stored, ok := d.registry.Get(entry.ID)
+	if !ok {
+		return "not_found", -1, nil
+	}
+	entry = stored
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 	return entry.Status, entry.ExitCode, entry.Output
+}
+
+func (d *DefaultProcessOperations) lookupProcess(id string) (*ProcessEntry, bool) {
+	return d.registry.Get(id)
+}
+
+func (d *DefaultProcessOperations) listProcessIDs() []string {
+	return d.registry.List()
 }
 
 // outputBuffer is a thread-safe rolling buffer for process output.
@@ -212,7 +236,7 @@ type ProcessToolConfig struct {
 
 func (c *ProcessToolConfig) defaults() {
 	if c.Operations == nil {
-		// Will be set later when registry is available.
+		c.Operations = NewDefaultProcessOperations(NewProcessRegistry())
 	}
 	if c.MaxBytes <= 0 {
 		c.MaxBytes = 50 * 1024
@@ -295,7 +319,7 @@ func NewProcessTool(cwd string, cfg *ProcessToolConfig) *agentcore.Tool {
 			case "status":
 				return handleStatus(cfg, input)
 			case "wait":
-				return handleWait(cfg, input)
+				return handleWait(ctx, cfg, input)
 			case "kill":
 				return handleKill(cfg, input)
 			case "list":
@@ -317,11 +341,15 @@ func handleSpawn(cfg *ProcessToolConfig, cwd string, input ProcessToolInput) (an
 		return resultErrf("failed to spawn process: %w", err)
 	}
 
+	entry.mu.Lock()
+	status := entry.Status
+	entry.mu.Unlock()
+
 	return result(
 		fmt.Sprintf("Spawned process %s (PID %d): %s", entry.ID, entry.PID, input.Command),
 		ProcessToolDetails{
 			ProcessID: entry.ID,
-			Status:    entry.Status,
+			Status:    status,
 			PID:       entry.PID,
 			StartTime: entry.StartTime.Format(time.RFC3339),
 		},
@@ -334,6 +362,9 @@ func handleStatus(cfg *ProcessToolConfig, input ProcessToolInput) (any, error) {
 	}
 
 	status, exitCode, output := cfg.Operations.Poll(&ProcessEntry{ID: input.ProcessID})
+	if status == "not_found" {
+		return resultErrf("process not found: %s", input.ProcessID)
+	}
 
 	// Get full entry for metadata.
 	// Note: In real implementation, we'd need access to the registry.
@@ -360,7 +391,7 @@ func handleStatus(cfg *ProcessToolConfig, input ProcessToolInput) (any, error) {
 	return result(resultText, details)
 }
 
-func handleWait(cfg *ProcessToolConfig, input ProcessToolInput) (any, error) {
+func handleWait(ctx context.Context, cfg *ProcessToolConfig, input ProcessToolInput) (any, error) {
 	if input.ProcessID == "" {
 		return resultErrf("process_id is required for wait")
 	}
@@ -371,9 +402,15 @@ func handleWait(cfg *ProcessToolConfig, input ProcessToolInput) (any, error) {
 		timeout = *input.Timeout
 	}
 
-	deadline := time.Now().Add(time.Duration(timeout) * time.Second)
-	for time.Now().Before(deadline) {
+	timer := time.NewTimer(time.Duration(timeout) * time.Second)
+	defer timer.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
 		status, exitCode, output := cfg.Operations.Poll(&ProcessEntry{ID: input.ProcessID})
+		if status == "not_found" {
+			return resultErrf("process not found: %s", input.ProcessID)
+		}
 		if status != "running" {
 			outputText := string(output)
 			truncation := TruncateTail(outputText, TruncationOptions{
@@ -396,10 +433,15 @@ func handleWait(cfg *ProcessToolConfig, input ProcessToolInput) (any, error) {
 
 			return result(resultText, details)
 		}
-		time.Sleep(1 * time.Second)
-	}
 
-	return resultErrf("timeout waiting for process %s after %d seconds", input.ProcessID, timeout)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+			return resultErrf("timeout waiting for process %s after %d seconds", input.ProcessID, timeout)
+		case <-ticker.C:
+		}
+	}
 }
 
 func handleKill(cfg *ProcessToolConfig, input ProcessToolInput) (any, error) {
@@ -407,22 +449,48 @@ func handleKill(cfg *ProcessToolConfig, input ProcessToolInput) (any, error) {
 		return resultErrf("process_id is required for kill")
 	}
 
-	// We need to find the PID. In a real implementation, we'd look up in registry.
-	// For now, parse process_id to extract PID if it was stored there.
-	return resultErrf("kill not fully implemented: need registry lookup for PID")
+	registryOps, ok := cfg.Operations.(registryProcessOperations)
+	if !ok {
+		return resultErrf("kill is not supported by the configured process operations")
+	}
+	entry, ok := registryOps.lookupProcess(input.ProcessID)
+	if !ok {
+		return resultErrf("process not found: %s", input.ProcessID)
+	}
+	if err := cfg.Operations.Kill(entry.PID); err != nil {
+		return resultErrf("failed to kill process %s: %w", input.ProcessID, err)
+	}
+	entry.mu.Lock()
+	entry.Status = "killed"
+	entry.ExitCode = -1
+	entry.mu.Unlock()
+	return result(fmt.Sprintf("Killed process %s (PID %d)", input.ProcessID, entry.PID), ProcessToolDetails{
+		ProcessID: input.ProcessID,
+		Status:    "killed",
+		PID:       entry.PID,
+		ExitCode:  -1,
+	})
 }
 
 func handleList(cfg *ProcessToolConfig) (any, error) {
-	return resultErrf("list not fully implemented: need registry access")
-}
-
-// Helper to parse process ID for PID extraction.
-func parsePIDFromID(id string) int {
-	parts := strings.Split(id, "-")
-	if len(parts) >= 3 {
-		if pid, err := strconv.Atoi(parts[2]); err == nil {
-			return pid
-		}
+	registryOps, ok := cfg.Operations.(registryProcessOperations)
+	if !ok {
+		return resultErrf("list is not supported by the configured process operations")
 	}
-	return 0
+	ids := registryOps.listProcessIDs()
+	sort.Strings(ids)
+	if len(ids) == 0 {
+		return result("No tracked processes.", ProcessToolDetails{})
+	}
+	lines := make([]string, 0, len(ids))
+	for _, id := range ids {
+		entry, ok := registryOps.lookupProcess(id)
+		if !ok {
+			continue
+		}
+		entry.mu.Lock()
+		lines = append(lines, fmt.Sprintf("%s: status=%s pid=%d command=%s", entry.ID, entry.Status, entry.PID, entry.Command))
+		entry.mu.Unlock()
+	}
+	return result(strings.Join(lines, "\n"), ProcessToolDetails{})
 }

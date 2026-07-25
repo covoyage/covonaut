@@ -2,6 +2,7 @@ package session
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -468,53 +469,83 @@ func (m *Manager) persistEntry(entry Entry) error {
 	if err != nil {
 		return fmt.Errorf("marshal entry: %w", err)
 	}
-	f, err := os.OpenFile(m.filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return fmt.Errorf("open session file: %w", err)
-	}
-	defer f.Close()
-
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("lock session file: %w", err)
-	}
-	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-
-	if _, err := f.Write(append(data, '\n')); err != nil {
-		return fmt.Errorf("write entry: %w", err)
-	}
-	return nil
+	return m.withFileLock(func() error {
+		f, err := os.OpenFile(m.filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return fmt.Errorf("open session file: %w", err)
+		}
+		defer f.Close()
+		if _, err := f.Write(append(data, '\n')); err != nil {
+			return fmt.Errorf("write entry: %w", err)
+		}
+		return nil
+	})
 }
 
 func (m *Manager) flushAll() error {
-	f, err := os.OpenFile(m.filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		return fmt.Errorf("create session file: %w", err)
-	}
-	defer f.Close()
-
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("lock session file: %w", err)
-	}
-	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-
+	var content bytes.Buffer
 	headerData, err := json.Marshal(m.header)
 	if err != nil {
 		return fmt.Errorf("marshal header: %w", err)
 	}
-	if _, err := f.Write(append(headerData, '\n')); err != nil {
-		return fmt.Errorf("write header: %w", err)
-	}
+	content.Write(headerData)
+	content.WriteByte('\n')
 	for _, e := range m.entries {
 		data, err := json.Marshal(e)
 		if err != nil {
 			return fmt.Errorf("marshal entry: %w", err)
 		}
-		if _, err := f.Write(append(data, '\n')); err != nil {
-			return fmt.Errorf("write entry: %w", err)
+		content.Write(data)
+		content.WriteByte('\n')
+	}
+
+	err = m.withFileLock(func() error {
+		dir := filepath.Dir(m.filePath)
+		tmp, err := os.CreateTemp(dir, "."+filepath.Base(m.filePath)+".tmp-*")
+		if err != nil {
+			return fmt.Errorf("create temporary session file: %w", err)
 		}
+		tmpPath := tmp.Name()
+		defer os.Remove(tmpPath)
+
+		if err := tmp.Chmod(0o644); err != nil {
+			tmp.Close()
+			return fmt.Errorf("set temporary session permissions: %w", err)
+		}
+		if _, err := tmp.Write(content.Bytes()); err != nil {
+			tmp.Close()
+			return fmt.Errorf("write temporary session file: %w", err)
+		}
+		if err := tmp.Sync(); err != nil {
+			tmp.Close()
+			return fmt.Errorf("sync temporary session file: %w", err)
+		}
+		if err := tmp.Close(); err != nil {
+			return fmt.Errorf("close temporary session file: %w", err)
+		}
+		if err := os.Rename(tmpPath, m.filePath); err != nil {
+			return fmt.Errorf("replace session file: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 	m.flushed = true
 	return nil
+}
+
+func (m *Manager) withFileLock(fn func() error) error {
+	lockFile, err := os.OpenFile(m.filePath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("open session lock: %w", err)
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("lock session file: %w", err)
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	return fn()
 }
 
 // ---------------------------------------------------------------------------

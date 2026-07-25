@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -132,6 +133,73 @@ func TestHTTPClient_SubscribeRequiresCapability(t *testing.T) {
 	err = client.SubscribeResource(context.Background(), "file:///notes/readme.txt")
 	if err == nil || !strings.Contains(err.Error(), "does not advertise resources.subscribe") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestHTTPClientRejectsUnsupportedProtocolVersion(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&request)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      request["id"],
+			"result": map[string]any{
+				"protocolVersion": "1900-01-01",
+				"capabilities":    map[string]any{},
+			},
+		})
+	}))
+	defer server.Close()
+
+	_, err := NewHTTPClient(context.Background(), HTTPConfig{Endpoint: server.URL})
+	if err == nil || !strings.Contains(err.Error(), "unsupported protocol version") {
+		t.Fatalf("error = %v, want unsupported protocol version", err)
+	}
+}
+
+func TestHTTPClientSendsCancellationNotification(t *testing.T) {
+	cancelled := make(chan map[string]any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&request)
+		method, _ := request["method"].(string)
+		switch method {
+		case "initialize":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": request["id"], "result": map[string]any{"protocolVersion": protocolVersion, "capabilities": map[string]any{}}})
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/call":
+			<-r.Context().Done()
+		case "notifications/cancelled":
+			params, _ := request["params"].(map[string]any)
+			cancelled <- params
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			w.WriteHeader(http.StatusAccepted)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewHTTPClient(context.Background(), HTTPConfig{Endpoint: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err = client.CallTool(ctx, "slow", nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CallTool error = %v, want deadline exceeded", err)
+	}
+	select {
+	case params := <-cancelled:
+		if params["requestId"] == nil {
+			t.Fatalf("cancellation missing requestId: %+v", params)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive notifications/cancelled")
 	}
 }
 

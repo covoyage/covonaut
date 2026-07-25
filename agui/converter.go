@@ -9,15 +9,16 @@ import (
 )
 
 type Converter struct {
-	threadID      string
-	runID         string
-	parentRunID   string
-	msgSeq        atomic.Int64
-	toolSeq       atomic.Int64
-	thinkingSeq   atomic.Int64
-	activeMsgID   atomic.Value
-	activeMsgRole atomic.Value
-	activeThinkingID atomic.Value
+	threadID                string
+	runID                   string
+	parentRunID             string
+	msgSeq                  atomic.Int64
+	toolSeq                 atomic.Int64
+	thinkingSeq             atomic.Int64
+	activeMsgID             atomic.Value
+	activeMsgRole           atomic.Value
+	activeThinkingID        atomic.Value
+	activeThinkingMessageID atomic.Value
 }
 
 func NewConverter(threadID, runID string) *Converter {
@@ -28,6 +29,7 @@ func NewConverter(threadID, runID string) *Converter {
 	c.activeMsgID.Store("")
 	c.activeMsgRole.Store("")
 	c.activeThinkingID.Store("")
+	c.activeThinkingMessageID.Store("")
 	return c
 }
 
@@ -40,6 +42,7 @@ func NewConverterWithParent(threadID, runID, parentRunID string) *Converter {
 	c.activeMsgID.Store("")
 	c.activeMsgRole.Store("")
 	c.activeThinkingID.Store("")
+	c.activeThinkingMessageID.Store("")
 	return c
 }
 
@@ -136,11 +139,21 @@ func (c *Converter) CloseThinking(t time.Time) []any {
 	if prevID == "" {
 		return nil
 	}
+	messageID := c.activeThinkingMessageID.Load().(string)
 	c.activeThinkingID.Store("")
-	return []any{ThinkingEndEvent{
-		BaseEvent:  baseEvent(EventThinkingEnd, t),
-		ThinkingID: prevID,
-	}}
+	c.activeThinkingMessageID.Store("")
+	events := make([]any, 0, 2)
+	if messageID != "" {
+		events = append(events, ReasoningMessageEndEvent{
+			BaseEvent: baseEvent(EventReasoningMessageEnd, t),
+			MessageID: messageID,
+		})
+	}
+	events = append(events, ReasoningEndEvent{
+		BaseEvent: baseEvent(EventReasoningEnd, t),
+		MessageID: prevID,
+	})
+	return events
 }
 
 func (c *Converter) closeAll(t time.Time) []any {
@@ -448,30 +461,29 @@ func (c *Converter) convertThinkingDelta(t time.Time, delta string) []any {
 		thinkingID := c.nextThinkingID()
 		msgID := c.nextMsgID()
 		c.activeThinkingID.Store(thinkingID)
+		c.activeThinkingMessageID.Store(msgID)
 		return []any{
-			ThinkingStartEvent{
-				BaseEvent:  baseEvent(EventThinkingStart, t),
-				ThinkingID: thinkingID,
+			ReasoningStartEvent{
+				BaseEvent: baseEvent(EventReasoningStart, t),
+				MessageID: thinkingID,
 			},
-			ThinkingTextMessageStartEvent{
-				BaseEvent:  baseEvent(EventThinkingTextMessageStart, t),
-				ThinkingID: thinkingID,
-				MessageID:  msgID,
+			ReasoningMessageStartEvent{
+				BaseEvent: baseEvent(EventReasoningMessageStart, t),
+				MessageID: msgID,
+				Role:      "reasoning",
 			},
-			ThinkingTextMessageContentEvent{
-				BaseEvent:  baseEvent(EventThinkingTextMessageContent, t),
-				ThinkingID: thinkingID,
-				MessageID:  msgID,
-				Delta:      delta,
+			ReasoningMessageContentEvent{
+				BaseEvent: baseEvent(EventReasoningMessageContent, t),
+				MessageID: msgID,
+				Delta:     delta,
 			},
 		}
 	}
-	msgID := fmt.Sprintf("thinking_msg_%d", c.msgSeq.Add(1))
-	return []any{ThinkingTextMessageContentEvent{
-		BaseEvent:  baseEvent(EventThinkingTextMessageContent, t),
-		ThinkingID: prevID,
-		MessageID:  msgID,
-		Delta:      delta,
+	msgID := c.activeThinkingMessageID.Load().(string)
+	return []any{ReasoningMessageContentEvent{
+		BaseEvent: baseEvent(EventReasoningMessageContent, t),
+		MessageID: msgID,
+		Delta:     delta,
 	}}
 }
 

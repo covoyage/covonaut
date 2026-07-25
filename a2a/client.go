@@ -22,16 +22,32 @@ import (
 
 // Client is an A2A client for interacting with remote agents.
 type Client struct {
-	baseURL     string
-	httpClient  *http.Client
-	apiKey      string
-	bearerToken string
+	baseURL      string
+	httpClient   *http.Client
+	apiKey       string
+	bearerToken  string
+	v1Extensions []string
+	rest         bool
 
 	mu           sync.RWMutex
 	idCounter    int64
 	maxRetries   int
 	retryBackoff time.Duration
 }
+
+// V1Client exposes the A2A 1.0 JSON-RPC API while Client retains legacy APIs.
+type V1Client struct{ client *Client }
+
+type V1TaskStream struct {
+	body    io.ReadCloser
+	scanner *bufio.Scanner
+	closed  bool
+	mu      sync.Mutex
+	rest    bool
+}
+
+// V1 returns an A2A 1.0 client facade sharing this client's transport and auth.
+func (c *Client) V1() *V1Client { return &V1Client{client: c} }
 
 // ClientOption configures a Client.
 type ClientOption func(*Client)
@@ -62,6 +78,13 @@ func WithRetry(maxRetries int, backoff time.Duration) ClientOption {
 	return func(c *Client) {
 		c.maxRetries = maxRetries
 		c.retryBackoff = backoff
+	}
+}
+
+// WithRequestedA2AExtensions declares extension URIs on all A2A 1.0 requests.
+func WithRequestedA2AExtensions(extensions ...string) ClientOption {
+	return func(c *Client) {
+		c.v1Extensions = append([]string(nil), extensions...)
 	}
 }
 
@@ -104,35 +127,326 @@ func (c *Client) setAuthHeaders(req *http.Request) {
 // Discovery
 // ---------------------------------------------------------------------------
 
-// GetAgentCard fetches the agent card from /.well-known/agent.json.
+// GetAgentCard fetches the standard Agent Card, falling back to the legacy path.
 func (c *Client) GetAgentCard(ctx context.Context) (*AgentCard, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/.well-known/agent.json", nil)
-	if err != nil {
+	card, status, err := c.getAgentCardAt(ctx, "/.well-known/agent-card.json")
+	if err == nil {
+		return card, nil
+	}
+	if status != http.StatusNotFound {
 		return nil, err
+	}
+	card, _, err = c.getAgentCardAt(ctx, "/.well-known/agent.json")
+	return card, err
+}
+
+func (c *Client) getAgentCardAt(ctx context.Context, path string) (*AgentCard, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return nil, 0, err
 	}
 	c.setAuthHeaders(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return nil, fmt.Errorf("agent card: %d %s", resp.StatusCode, string(body))
+		return nil, resp.StatusCode, fmt.Errorf("agent card: %d %s", resp.StatusCode, string(body))
 	}
 
-	var card AgentCard
-	if err := json.NewDecoder(resp.Body).Decode(&card); err != nil {
-		return nil, fmt.Errorf("decode agent card: %w", err)
+	if path == "/.well-known/agent-card.json" {
+		var card V1AgentCard
+		if err := json.NewDecoder(resp.Body).Decode(&card); err != nil {
+			return nil, resp.StatusCode, fmt.Errorf("decode A2A v1 Agent Card: %w", err)
+		}
+		legacy := agentCardV1ToLegacy(card)
+		return &legacy, resp.StatusCode, nil
 	}
-	return &card, nil
+	var legacy AgentCard
+	if err := json.NewDecoder(resp.Body).Decode(&legacy); err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("decode legacy Agent Card: %w", err)
+	}
+	return &legacy, resp.StatusCode, nil
+}
+
+func agentCardV1ToLegacy(card V1AgentCard) AgentCard {
+	legacy := AgentCard{
+		Name:               card.Name,
+		Description:        card.Description,
+		Version:            card.Version,
+		DocumentationURL:   card.DocumentationURL,
+		Capabilities:       AgentCapabilities{Streaming: card.Capabilities.Streaming, PushNotifications: card.Capabilities.PushNotifications, ExtendedAgentCard: card.Capabilities.ExtendedAgentCard},
+		DefaultInputModes:  append([]string(nil), card.DefaultInputModes...),
+		DefaultOutputModes: append([]string(nil), card.DefaultOutputModes...),
+	}
+	if len(card.SupportedInterfaces) > 0 {
+		legacy.URL = card.SupportedInterfaces[0].URL
+	}
+	if card.Provider != nil {
+		legacy.Provider = &AgentProvider{Organization: card.Provider.Organization, URL: card.Provider.URL}
+	}
+	legacy.Skills = make([]AgentSkill, 0, len(card.Skills))
+	for _, skill := range card.Skills {
+		legacy.Skills = append(legacy.Skills, AgentSkill{
+			ID: skill.ID, Name: skill.Name, Description: skill.Description,
+			Tags: append([]string(nil), skill.Tags...), Examples: append([]string(nil), skill.Examples...),
+			InputModes: append([]string(nil), skill.InputModes...), OutputModes: append([]string(nil), skill.OutputModes...),
+		})
+	}
+	for _, scheme := range card.SecuritySchemes {
+		switch {
+		case scheme.HTTPAuth != nil:
+			legacy.Authentication = &AgentAuthentication{Schemes: appendScheme(legacy.Authentication, scheme.HTTPAuth.Scheme)}
+		case scheme.APIKey != nil:
+			legacy.Authentication = &AgentAuthentication{Schemes: appendScheme(legacy.Authentication, "apiKey")}
+		}
+	}
+	return legacy
+}
+
+func appendScheme(authentication *AgentAuthentication, scheme string) []string {
+	if authentication == nil {
+		return []string{scheme}
+	}
+	return append(authentication.Schemes, scheme)
 }
 
 // ---------------------------------------------------------------------------
 // Task operations
 // ---------------------------------------------------------------------------
+
+func (c *V1Client) SendMessage(ctx context.Context, req V1SendMessageRequest) (*V1SendMessageResponse, error) {
+	if c.client.rest {
+		return c.restSendMessage(ctx, req)
+	}
+	var result V1SendMessageResponse
+	if err := c.call(ctx, "SendMessage", req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *V1Client) GetAgentCard(ctx context.Context) (*V1AgentCard, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.client.baseURL+"/.well-known/agent-card.json", nil)
+	if err != nil {
+		return nil, err
+	}
+	c.client.setAuthHeaders(request)
+	streamHTTPClient := *c.client.httpClient
+	streamHTTPClient.Timeout = 0
+	response, err := streamHTTPClient.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+		return nil, fmt.Errorf("A2A v1 Agent Card HTTP %d: %s", response.StatusCode, body)
+	}
+	var card V1AgentCard
+	if err := json.NewDecoder(response.Body).Decode(&card); err != nil {
+		return nil, fmt.Errorf("decode A2A v1 Agent Card: %w", err)
+	}
+	return &card, nil
+}
+
+func (c *V1Client) GetTask(ctx context.Context, req V1GetTaskRequest) (*V1Task, error) {
+	if c.client.rest {
+		return c.restGetTask(ctx, req)
+	}
+	var result V1Task
+	if err := c.call(ctx, "GetTask", req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *V1Client) ListTasks(ctx context.Context, req V1ListTasksRequest) (*V1ListTasksResponse, error) {
+	var result V1ListTasksResponse
+	if err := c.call(ctx, "ListTasks", req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *V1Client) CancelTask(ctx context.Context, id string) (*V1Task, error) {
+	if c.client.rest {
+		return c.restCancelTask(ctx, id)
+	}
+	var result V1Task
+	if err := c.call(ctx, "CancelTask", map[string]string{"id": id}, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *V1Client) SendStreamingMessage(ctx context.Context, req V1SendMessageRequest) (*V1TaskStream, error) {
+	if c.client.rest {
+		return c.restSendStreamingMessage(ctx, req)
+	}
+	return c.openStream(ctx, "SendStreamingMessage", req)
+}
+
+func (c *V1Client) SubscribeToTask(ctx context.Context, id string) (*V1TaskStream, error) {
+	if c.client.rest {
+		return c.restSubscribeToTask(ctx, id)
+	}
+	return c.openStream(ctx, "SubscribeToTask", map[string]string{"id": id})
+}
+
+func (c *V1Client) CreateTaskPushNotificationConfig(ctx context.Context, config V1TaskPushNotificationConfig) (*V1TaskPushNotificationConfig, error) {
+	if c.client.rest {
+		return c.restCreatePushConfig(ctx, config)
+	}
+	var result V1TaskPushNotificationConfig
+	if err := c.call(ctx, "CreateTaskPushNotificationConfig", config, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *V1Client) GetTaskPushNotificationConfig(ctx context.Context, ref V1PushConfigRef) (*V1TaskPushNotificationConfig, error) {
+	var result V1TaskPushNotificationConfig
+	if err := c.call(ctx, "GetTaskPushNotificationConfig", ref, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *V1Client) ListTaskPushNotificationConfigs(ctx context.Context, req V1ListPushConfigsRequest) (*V1ListPushConfigsResponse, error) {
+	var result V1ListPushConfigsResponse
+	if err := c.call(ctx, "ListTaskPushNotificationConfigs", req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *V1Client) DeleteTaskPushNotificationConfig(ctx context.Context, ref V1PushConfigRef) error {
+	var result map[string]any
+	return c.call(ctx, "DeleteTaskPushNotificationConfig", ref, &result)
+}
+
+func (c *V1Client) GetExtendedAgentCard(ctx context.Context) (*V1AgentCard, error) {
+	var result V1AgentCard
+	if err := c.call(ctx, "GetExtendedAgentCard", map[string]any{}, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (c *V1Client) openStream(ctx context.Context, method string, params any) (*V1TaskStream, error) {
+	rpcRequest := JSONRPCRequest{JSONRPC: "2.0", ID: c.client.nextID(), Method: method}
+	data, err := json.Marshal(params)
+	if err != nil {
+		return nil, err
+	}
+	rpcRequest.Params = data
+	body, err := json.Marshal(rpcRequest)
+	if err != nil {
+		return nil, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.client.baseURL+"/", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "text/event-stream")
+	request.Header.Set("A2A-Version", a2aProtocolVersion)
+	c.client.setV1ExtensionHeader(request)
+	c.client.setAuthHeaders(request)
+	response, err := c.client.httpClient.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	if response.StatusCode != http.StatusOK {
+		responseBody, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+		response.Body.Close()
+		return nil, fmt.Errorf("A2A v1 stream HTTP %d: %s", response.StatusCode, responseBody)
+	}
+	if !strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
+		response.Body.Close()
+		return nil, fmt.Errorf("A2A v1 stream expected text/event-stream, got %q", response.Header.Get("Content-Type"))
+	}
+	scanner := bufio.NewScanner(response.Body)
+	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	return &V1TaskStream{body: response.Body, scanner: scanner}, nil
+}
+
+func (s *V1TaskStream) Recv() (*V1StreamResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, io.EOF
+	}
+	for s.scanner.Scan() {
+		line := s.scanner.Bytes()
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(line[len("data:"):])
+		if s.rest {
+			// REST transport: SSE data is a direct V1StreamResponse JSON.
+			var result V1StreamResponse
+			if err := json.Unmarshal(payload, &result); err != nil {
+				return nil, fmt.Errorf("decode REST stream event: %w", err)
+			}
+			return &result, nil
+		}
+		// JSON-RPC transport: SSE data is wrapped in a JSON-RPC result envelope.
+		var envelope struct {
+			Result json.RawMessage `json:"result"`
+			Error  *JSONRPCError   `json:"error,omitempty"`
+		}
+		if err := json.Unmarshal(payload, &envelope); err != nil {
+			return nil, fmt.Errorf("decode A2A v1 stream envelope: %w", err)
+		}
+		if envelope.Error != nil {
+			return nil, envelope.Error
+		}
+		var result V1StreamResponse
+		if err := json.Unmarshal(envelope.Result, &result); err != nil {
+			return nil, fmt.Errorf("decode A2A v1 stream result: %w", err)
+		}
+		return &result, nil
+	}
+	if err := s.scanner.Err(); err != nil {
+		return nil, err
+	}
+	s.closed = true
+	return nil, io.EOF
+}
+
+func (s *V1TaskStream) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	return s.body.Close()
+}
+
+func (c *V1Client) call(ctx context.Context, method string, params, out any) error {
+	response, err := c.client.callWithVersion(ctx, method, params, a2aProtocolVersion)
+	if err != nil {
+		return err
+	}
+	if response.Error != nil {
+		return response.Error
+	}
+	data, err := json.Marshal(response.Result)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(data, out); err != nil {
+		return fmt.Errorf("decode %s result: %w", method, err)
+	}
+	return nil
+}
 
 // SendTask sends a task to the remote agent (synchronous).
 func (c *Client) SendTask(ctx context.Context, req SendTaskRequest) (*Task, error) {
@@ -359,6 +673,10 @@ func (c *Client) resubscribe(ctx context.Context, taskID, lastEventID string) (*
 // ---------------------------------------------------------------------------
 
 func (c *Client) call(ctx context.Context, method string, params any) (*JSONRPCResponse, error) {
+	return c.callWithVersion(ctx, method, params, "")
+}
+
+func (c *Client) callWithVersion(ctx context.Context, method string, params any, version string) (*JSONRPCResponse, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
 		if attempt > 0 {
@@ -390,6 +708,10 @@ func (c *Client) call(ctx context.Context, method string, params any) (*JSONRPCR
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/json")
+		if version != "" {
+			req.Header.Set("A2A-Version", version)
+			c.setV1ExtensionHeader(req)
+		}
 		c.setAuthHeaders(req)
 
 		resp, err := c.httpClient.Do(req)
@@ -429,6 +751,12 @@ func (c *Client) call(ctx context.Context, method string, params any) (*JSONRPCR
 		return &rpcResp, nil
 	}
 	return nil, fmt.Errorf("after %d retries: %w", c.maxRetries, lastErr)
+}
+
+func (c *Client) setV1ExtensionHeader(req *http.Request) {
+	if len(c.v1Extensions) > 0 {
+		req.Header.Set("A2A-Extensions", strings.Join(c.v1Extensions, ","))
+	}
 }
 
 func isRetryableError(err error) bool {
@@ -496,11 +824,11 @@ type TaskStream struct {
 	cancel   context.Context
 	err      error
 	mu       sync.Mutex
-	lastID    string
-	client    *Client
-	taskID    string
-	maxRetry  int
-	retryNum  int
+	lastID   string
+	client   *Client
+	taskID   string
+	maxRetry int
+	retryNum int
 }
 
 // Recv returns the next task update event. Returns nil, false when done.

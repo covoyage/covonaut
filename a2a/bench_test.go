@@ -185,13 +185,25 @@ func BenchmarkPublishTaskUpdate(b *testing.B) {
 	server := NewServer(handler)
 
 	// Create multiple subscribers
+	subscribers := make([]*taskSubscriber, 0, 10)
 	for i := 0; i < 10; i++ {
-		ch := make(chan *TaskUpdateEvent, 16)
-		ts := server.getTaskState("bench-pub")
-		ts.mu.Lock()
-		ts.subs = append(ts.subs, ch)
-		ts.mu.Unlock()
+		subscriber := server.subscribeToTask("bench-pub")
+		subscribers = append(subscribers, subscriber)
+		go func() {
+			for {
+				select {
+				case <-subscriber.done:
+					return
+				case <-subscriber.events:
+				}
+			}
+		}()
 	}
+	defer func() {
+		for _, subscriber := range subscribers {
+			server.unsubscribeFromTask("bench-pub", subscriber)
+		}
+	}()
 
 	ev := &TaskUpdateEvent{
 		Result: &Task{ID: "bench-pub", State: TaskStateWorking},

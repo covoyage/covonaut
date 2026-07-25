@@ -174,7 +174,9 @@ func (a *Agent) inheritRuntime(target *Agent) {
 
 	// Re-register source extensions on target.
 	if len(a.config.Extensions) > 0 {
-		_ = target.extensions.Register(context.Background(), target, a.config.Extensions...)
+		if err := target.extensions.Register(context.Background(), target, a.config.Extensions...); err != nil {
+			target.initErr = fmt.Errorf("initialize inherited extensions: %w", err)
+		}
 	}
 
 	// Merge config-level runtime state.

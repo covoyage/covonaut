@@ -73,7 +73,6 @@ func NewSessionManager(cfg SessionManagerConfig) *SessionManager {
 		persistPath:  filepath.Join(cfg.HomeDir, "acp_sessions.json"),
 		logger:       cfg.Logger,
 	}
-	sm.loadPersistedSessions()
 	return sm
 }
 
@@ -204,19 +203,34 @@ func (sm *SessionManager) ForkSession(sessionID, cwd string) (*sessionState, err
 
 func (sm *SessionManager) ListSessions(cwd string) []SessionInfo {
 	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-
-	var result []SessionInfo
+	active := make(map[string]SessionInfo, len(sm.sessions))
 	for id, state := range sm.sessions {
 		if cwd != "" && state.CWD != cwd {
 			continue
 		}
-		result = append(result, SessionInfo{
+		active[id] = SessionInfo{
 			SessionID: id,
 			CWD:       state.CWD,
 			Title:     filepath.Base(state.CWD),
 			UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+		}
+	}
+	sm.mu.RUnlock()
+
+	result := make([]SessionInfo, 0, len(active))
+	for _, meta := range sm.sessionStore.ListSessions(cwd) {
+		if _, loaded := active[meta.SessionID]; loaded {
+			continue
+		}
+		result = append(result, SessionInfo{
+			SessionID: meta.SessionID,
+			CWD:       meta.CWD,
+			Title:     meta.Title,
+			UpdatedAt: meta.UpdatedAt,
 		})
+	}
+	for _, info := range active {
+		result = append(result, info)
 	}
 	return result
 }
@@ -257,8 +271,16 @@ func (sm *SessionManager) Cleanup() {
 	defer sm.mu.Unlock()
 
 	for id, state := range sm.sessions {
-		if state.cancel != nil {
-			state.cancel()
+		state.mu.Lock()
+		cancel := state.cancel
+		state.cancel = nil
+		state.running = false
+		state.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		if state.Agent != nil && state.Agent.Core() != nil {
+			state.Agent.Core().Close()
 		}
 		delete(sm.sessions, id)
 	}
@@ -274,32 +296,6 @@ func (sm *SessionManager) saveSessionMeta(state *sessionState) {
 	}
 	if err := sm.sessionStore.SaveSessionMeta(meta); err != nil {
 		sm.logger.Error("failed to save session meta", "err", err)
-	}
-}
-
-func (sm *SessionManager) loadPersistedSessions() {
-	metas := sm.sessionStore.ListSessions("")
-	loaded := 0
-	for _, meta := range metas {
-		if _, exists := sm.sessions[meta.SessionID]; exists {
-			continue
-		}
-		agent, err := sm.agentFactory.CreateAgent(context.Background(), meta.SessionID, meta.CWD, meta.Model, meta.Mode)
-		if err != nil {
-			sm.logger.Warn("failed to restore session", "session_id", meta.SessionID, "err", err)
-			continue
-		}
-		sm.sessions[meta.SessionID] = &sessionState{
-			SessionID: meta.SessionID,
-			Agent:     agent,
-			CWD:       meta.CWD,
-			Model:     agent.Model(),
-			Mode:      agent.Mode(),
-		}
-		loaded++
-	}
-	if loaded > 0 {
-		sm.logger.Info("restored persisted sessions", "count", loaded)
 	}
 }
 
@@ -427,32 +423,32 @@ func parseToolArgs(raw string) map[string]any {
 
 func ToolKind(name string) string {
 	kinds := map[string]string{
-		"read_file":         "read",
-		"write_file":        "edit",
-		"patch":             "edit",
-		"search_files":      "search",
-		"terminal":          "execute",
-		"process":           "execute",
-		"execute_code":      "execute",
-		"todo":              "other",
-		"skill_view":        "read",
-		"skills_list":       "read",
-		"skill_manage":      "edit",
-		"web_search":        "fetch",
-		"web_extract":       "fetch",
-		"browser_navigate":  "fetch",
-		"browser_click":     "execute",
-		"browser_type":      "execute",
-		"browser_snapshot":  "read",
-		"browser_vision":    "read",
-		"browser_scroll":    "execute",
-		"browser_press":     "execute",
-		"browser_back":      "execute",
+		"read_file":          "read",
+		"write_file":         "edit",
+		"patch":              "edit",
+		"search_files":       "search",
+		"terminal":           "execute",
+		"process":            "execute",
+		"execute_code":       "execute",
+		"todo":               "other",
+		"skill_view":         "read",
+		"skills_list":        "read",
+		"skill_manage":       "edit",
+		"web_search":         "fetch",
+		"web_extract":        "fetch",
+		"browser_navigate":   "fetch",
+		"browser_click":      "execute",
+		"browser_type":       "execute",
+		"browser_snapshot":   "read",
+		"browser_vision":     "read",
+		"browser_scroll":     "execute",
+		"browser_press":      "execute",
+		"browser_back":       "execute",
 		"browser_get_images": "read",
-		"delegate_task":     "execute",
-		"vision_analyze":    "read",
-		"image_generate":    "execute",
-		"_thinking":         "think",
+		"delegate_task":      "execute",
+		"vision_analyze":     "read",
+		"image_generate":     "execute",
+		"_thinking":          "think",
 	}
 	if k, ok := kinds[name]; ok {
 		return k

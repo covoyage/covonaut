@@ -581,23 +581,50 @@ func TestConvertThinkingDelta(t *testing.T) {
 	if len(events) != 3 {
 		t.Fatalf("expected 3 events (THINKING_START + TEXT_MESSAGE_START + CONTENT), got %d", len(events))
 	}
-	ts, ok := events[0].(ThinkingStartEvent)
+	ts, ok := events[0].(ReasoningStartEvent)
 	if !ok {
-		t.Fatal("expected ThinkingStartEvent")
+		t.Fatal("expected ReasoningStartEvent")
 	}
-	tms, ok := events[1].(ThinkingTextMessageStartEvent)
+	tms, ok := events[1].(ReasoningMessageStartEvent)
 	if !ok {
-		t.Fatal("expected ThinkingTextMessageStartEvent")
+		t.Fatal("expected ReasoningMessageStartEvent")
 	}
-	tmc, ok := events[2].(ThinkingTextMessageContentEvent)
+	tmc, ok := events[2].(ReasoningMessageContentEvent)
 	if !ok {
-		t.Fatal("expected ThinkingTextMessageContentEvent")
+		t.Fatal("expected ReasoningMessageContentEvent")
 	}
 	if tmc.Delta != "let me think" {
 		t.Errorf("expected 'let me think', got %s", tmc.Delta)
 	}
-	if ts.ThinkingID != tms.ThinkingID || ts.ThinkingID != tmc.ThinkingID {
-		t.Error("thinking IDs should match across events")
+	if ts.MessageID == "" || tms.MessageID != tmc.MessageID {
+		t.Error("reasoning IDs should be non-empty and message content must match its start")
+	}
+
+	second := c.Convert(makeEvent[agentcore.MessageDeltaEvent](agentcore.EventMessageDelta, map[string]any{
+		"delta": " some more",
+		"kind":  string(agentcore.BlockKindThinking),
+	}))
+	if len(second) != 1 {
+		t.Fatalf("second thinking delta events = %d, want 1", len(second))
+	}
+	secondContent, ok := second[0].(ReasoningMessageContentEvent)
+	if !ok {
+		t.Fatalf("second event type = %T", second[0])
+	}
+	if secondContent.MessageID != tms.MessageID {
+		t.Fatalf("second delta message ID = %q, want %q", secondContent.MessageID, tms.MessageID)
+	}
+
+	closed := c.CloseThinking(time.Now())
+	if len(closed) != 2 {
+		t.Fatalf("close events = %d, want text-message-end and thinking-end", len(closed))
+	}
+	messageEnd, ok := closed[0].(ReasoningMessageEndEvent)
+	if !ok || messageEnd.MessageID != tms.MessageID {
+		t.Fatalf("unexpected thinking message end: %#v", closed[0])
+	}
+	if _, ok := closed[1].(ReasoningEndEvent); !ok {
+		t.Fatalf("unexpected final close event: %T", closed[1])
 	}
 }
 
@@ -618,7 +645,7 @@ func TestConvertThinkingThenText(t *testing.T) {
 
 	var hasThinkingEnd, hasTextStart bool
 	for _, e := range events2 {
-		if _, ok := e.(ThinkingEndEvent); ok {
+		if _, ok := e.(ReasoningEndEvent); ok {
 			hasThinkingEnd = true
 		}
 		if _, ok := e.(TextMessageStartEvent); ok {
@@ -646,7 +673,7 @@ func TestCloseAllClosesBothMessageAndThinking(t *testing.T) {
 	events := c.closeAll(time.Now())
 	var hasThinkingEnd bool
 	for _, e := range events {
-		if _, ok := e.(ThinkingEndEvent); ok {
+		if _, ok := e.(ReasoningEndEvent); ok {
 			hasThinkingEnd = true
 		}
 	}
@@ -672,7 +699,7 @@ func TestCloseAllClosesMessageAfterThinkingTransition(t *testing.T) {
 
 	var thinkingClosedInTransition bool
 	for _, e := range textEvents {
-		if _, ok := e.(ThinkingEndEvent); ok {
+		if _, ok := e.(ReasoningEndEvent); ok {
 			thinkingClosedInTransition = true
 		}
 	}
