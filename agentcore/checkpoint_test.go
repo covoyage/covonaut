@@ -119,3 +119,45 @@ func TestAgent_RunCheckpointRestore(t *testing.T) {
 		}
 	}
 }
+
+func TestRestoreLatestCheckpointMigratesLegacySnapshot(t *testing.T) {
+	ctx := context.Background()
+	saver := NewMemoryCheckpointSaver()
+	_, err := saver.Append(ctx, "legacy", StateSnapshot{
+		Version:  0,
+		Status:   StatusInterrupted,
+		Messages: []Message{{Role: RoleUser, Content: "before"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := New(StubConfig(seqStubProvider{}, WithCheckpoint(&CheckpointSettings{
+		Saver:    saver,
+		ThreadID: "legacy",
+		Migrators: map[int]StateSnapshotMigrator{
+			0: func(_ context.Context, snapshot StateSnapshot) (StateSnapshot, error) {
+				snapshot.Messages = append(snapshot.Messages, Message{Role: RoleSystem, Content: "migrated"})
+				return snapshot, nil
+			},
+		},
+	})))
+	if err := agent.RestoreLatestCheckpoint(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	got := agent.State().Snapshot()
+	if got.Version != CurrentStateSnapshotVersion || len(got.Messages) != 2 || got.Messages[1].Content != "migrated" {
+		t.Fatalf("migrated snapshot = %#v", got)
+	}
+}
+
+func TestMigrateStateSnapshotRejectsVersionJump(t *testing.T) {
+	_, err := MigrateStateSnapshot(context.Background(), StateSnapshot{}, map[int]StateSnapshotMigrator{
+		0: func(_ context.Context, snapshot StateSnapshot) (StateSnapshot, error) {
+			snapshot.Version = CurrentStateSnapshotVersion + 1
+			return snapshot, nil
+		},
+	})
+	if err == nil {
+		t.Fatal("expected version jump error")
+	}
+}

@@ -240,7 +240,8 @@ type SessionNotification struct {
 // tool_call, tool_call_update, plan, available_commands_update,
 // current_mode_update.
 type SessionUpdate struct {
-	SessionUpdate string `json:"sessionUpdate"`
+	SessionUpdate string         `json:"sessionUpdate"`
+	Meta          map[string]any `json:"_meta,omitempty"`
 
 	// *_message_chunk / agent_thought_chunk
 	Content any `json:"content,omitempty"`

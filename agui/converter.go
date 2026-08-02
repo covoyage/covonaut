@@ -248,6 +248,14 @@ func (c *Converter) Convert(e agentcore.Event) []any {
 		return c.convertMessageDelta(ev.EventTime(), ev.Delta, ev.Kind)
 	case *agentcore.MessageDeltaEvent:
 		return c.convertMessageDelta(ev.EventTime(), ev.Delta, ev.Kind)
+	case agentcore.MessageResetEvent:
+		return c.convertMessageReset(ev.EventTime(), ev.AttemptID, ev.Reason)
+	case *agentcore.MessageResetEvent:
+		return c.convertMessageReset(ev.EventTime(), ev.AttemptID, ev.Reason)
+	case agentcore.ModelFailoverEvent:
+		return []any{CustomEvent{BaseEvent: baseEvent(EventCustom, ev.EventTime()), Name: "model_failover", Value: map[string]any{"attempt": ev.Attempt, "from": ev.From, "to": ev.To, "from_model": ev.FromModel, "to_model": ev.ToModel}}}
+	case *agentcore.ModelFailoverEvent:
+		return []any{CustomEvent{BaseEvent: baseEvent(EventCustom, ev.EventTime()), Name: "model_failover", Value: map[string]any{"attempt": ev.Attempt, "from": ev.From, "to": ev.To, "from_model": ev.FromModel, "to_model": ev.ToModel}}}
 
 	case agentcore.ToolCallStartEvent:
 		var events []any
@@ -453,6 +461,15 @@ func (c *Converter) convertMessageDelta(t time.Time, delta string, kind agentcor
 		Delta:     delta,
 	})
 	return events
+}
+
+func (c *Converter) convertMessageReset(t time.Time, attemptID, reason string) []any {
+	events := c.closeAll(t)
+	return append(events, CustomEvent{
+		BaseEvent: baseEvent(EventCustom, t),
+		Name:      "message_reset",
+		Value:     map[string]any{"attempt_id": attemptID, "reason": reason},
+	})
 }
 
 func (c *Converter) convertThinkingDelta(t time.Time, delta string) []any {

@@ -334,7 +334,7 @@ func EnsureHomeDir(homeDir string) (string, error) {
 // handlers accumulate and each new prompt re-notifies through stale closures
 // bound to the previous prompt's notify channel.
 func RegisterEventListeners(sessionID string, core *agentcore.Agent, notify func(method string, params any)) (unregister func()) {
-	unsubs := make([]func(), 0, 3)
+	unsubs := make([]func(), 0, 4)
 	unsubs = append(unsubs, core.On(agentcore.EventToolCallStart, func(e agentcore.Event) {
 		ev, ok := e.(*agentcore.ToolCallStartEvent)
 		if !ok {
@@ -401,6 +401,25 @@ func RegisterEventListeners(sessionID string, core *agentcore.Agent, notify func
 				},
 			})
 		}
+	}))
+
+	unsubs = append(unsubs, core.On(agentcore.EventMessageReset, func(e agentcore.Event) {
+		ev, ok := e.(*agentcore.MessageResetEvent)
+		if !ok {
+			return
+		}
+		notify("session/update", SessionNotification{
+			SessionID: sessionID,
+			Update: SessionUpdate{
+				SessionUpdate: "agent_message_chunk",
+				Content:       TextContentBlock{Type: "text", Text: ""},
+				Meta: map[string]any{"covonaut": map[string]any{
+					"type":       "message_reset",
+					"attempt_id": ev.AttemptID,
+					"reason":     ev.Reason,
+				}},
+			},
+		})
 	}))
 
 	return func() {

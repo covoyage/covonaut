@@ -1,6 +1,65 @@
 package agentcore
 
-import "context"
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+)
+
+// RunInfo identifies one component invocation in a parent/child execution tree.
+type RunInfo struct {
+	RunID       string   `json:"run_id"`
+	ParentRunID string   `json:"parent_run_id,omitempty"`
+	Component   string   `json:"component"`
+	Name        string   `json:"name,omitempty"`
+	Path        []string `json:"path,omitempty"`
+}
+
+type runInfoContextKey struct{}
+
+func RunInfoFromContext(ctx context.Context) (RunInfo, bool) {
+	info, ok := ctx.Value(runInfoContextKey{}).(RunInfo)
+	return info, ok
+}
+
+func WithRunInfo(ctx context.Context, info RunInfo) context.Context {
+	info.Path = append([]string(nil), info.Path...)
+	return context.WithValue(ctx, runInfoContextKey{}, info)
+}
+
+// StartComponentRun creates correlated metadata and a span for a component.
+func StartComponentRun(ctx context.Context, tracer Tracer, component, name string, attrs ...SpanAttribute) (context.Context, Span, RunInfo) {
+	parent, hasParent := RunInfoFromContext(ctx)
+	info := RunInfo{RunID: newRunID(), Component: component, Name: name}
+	if hasParent {
+		info.ParentRunID = parent.RunID
+		info.Path = append(append([]string(nil), parent.Path...), name)
+	} else if name != "" {
+		info.Path = []string{name}
+	}
+	ctx = WithRunInfo(ctx, info)
+	if tracer == nil {
+		tracer = noopTracer{}
+	}
+	common := []SpanAttribute{
+		Attr("run.id", info.RunID),
+		Attr("run.parent_id", info.ParentRunID),
+		Attr("component", component),
+		Attr("component.name", name),
+		Attr("component.path", append([]string(nil), info.Path...)),
+	}
+	ctx, span := tracer.Start(ctx, component+"."+name, append(common, attrs...)...)
+	ctx = WithRunInfo(ctx, info)
+	return ctx, span, info
+}
+
+func newRunID() string {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return newArtifactID()
+	}
+	return hex.EncodeToString(value[:])
+}
 
 // Span represents a unit of work in a distributed trace.
 // Implement this interface with OpenTelemetry, Datadog, Jaeger, or any other backend.
@@ -45,7 +104,7 @@ func (noopSpan) AddEvent(_ string, _ ...SpanAttribute) {}
 func TracingMiddleware(tracer Tracer) Middleware {
 	return func(next ExecuteFunc) ExecuteFunc {
 		return func(ctx context.Context, tc ToolCall) (string, error) {
-			ctx, span := tracer.Start(ctx, "tool."+tc.Name,
+			ctx, span, _ := StartComponentRun(ctx, tracer, "tool", tc.Name,
 				Attr("tool.name", tc.Name),
 				Attr("tool.call_id", tc.ID),
 			)

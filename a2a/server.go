@@ -482,14 +482,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/ws", s.handleWebSocket)
 
-	// REST transport (HTTP+JSON binding).
-	mux.HandleFunc("POST /rest/message:send", s.handleRESTSendMessage)
-	mux.HandleFunc("POST /rest/message:stream", s.handleRESTStreamMessage)
-	mux.HandleFunc("GET /rest/tasks", s.handleRESTListTasks)
-	mux.HandleFunc("GET /rest/tasks/{id}", s.handleRESTGetTask)
-	mux.HandleFunc("POST /rest/tasks/{idAndAction}", s.handleRESTTaskAction)
-	mux.HandleFunc("POST /rest/tasks/{id}/pushNotificationConfigs", s.handleRESTCreatePushConfig)
-
 	h := withAuth(withCORS(s.withA2AVersion(mux), s.cors), s.auth)
 	if s.rateLimiter != nil {
 		h = s.rateLimiter.Middleware(h)
@@ -1683,9 +1675,24 @@ func (h *DefaultAgentHandler) subscribeAgentEvents(taskID string) (unsub func())
 					State: TaskStateWorking,
 				},
 				Artifact: &Artifact{
+					Name:      "output",
+					Index:     0,
 					Parts:     []Part{NewTextPart(ev.Delta)},
 					Append:    boolPtr(true),
 					LastChunk: boolPtr(false),
+				},
+				Final: false,
+			})
+		case *agentcore.MessageResetEvent:
+			h.publish(taskID, &TaskUpdateEvent{
+				Result: &Task{ID: taskID, State: TaskStateWorking},
+				Artifact: &Artifact{
+					Name:      "output",
+					Index:     0,
+					Parts:     []Part{NewTextPart("")},
+					Append:    boolPtr(false),
+					LastChunk: boolPtr(false),
+					Metadata:  map[string]any{"messageReset": true, "attemptId": ev.AttemptID, "reason": ev.Reason},
 				},
 				Final: false,
 			})

@@ -31,6 +31,10 @@ type ModelConfig struct {
 	// FastMode requests priority/low-latency processing where supported
 	// (e.g. OpenAI Priority Processing, Anthropic Fast Mode).
 	FastMode bool
+
+	// Failover switches to alternate provider/model targets after retries for
+	// the current target are exhausted.
+	Failover *ModelFailoverConfig
 }
 
 // SkillConfig groups skill loading, selection, and API control.
@@ -67,6 +71,10 @@ type ExecutionConfig struct {
 	// It receives the raw arguments string and tool name, and should return
 	// repaired JSON or the original string if no repair is possible.
 	ArgumentRepairFunc func(rawArgs string, toolName string) string
+
+	// ToolSelection limits the tool definitions exposed on each model request.
+	// All registered tools remain available to the executor.
+	ToolSelection *ToolSelectionConfig
 }
 
 // CompactionConfig groups context window management and compaction behavior.
@@ -176,6 +184,11 @@ func WithFastMode(enabled bool) ConfigOption {
 	return func(c *Config) { c.FastMode = enabled }
 }
 
+// WithModelFailover configures provider/model fallback behavior.
+func WithModelFailover(cfg *ModelFailoverConfig) ConfigOption {
+	return func(c *Config) { c.Failover = cfg }
+}
+
 // WithModelConfig applies a full ModelConfig.
 func WithModelConfig(mc ModelConfig) ConfigOption {
 	return func(c *Config) {
@@ -266,6 +279,11 @@ func WithExecutionConfig(ec ExecutionConfig) ConfigOption {
 	}
 }
 
+// WithToolSelection enables dynamic per-request tool visibility.
+func WithToolSelection(cfg *ToolSelectionConfig) ConfigOption {
+	return func(c *Config) { c.ToolSelection = cfg }
+}
+
 // --- Compaction options ---
 
 // WithContextWindow sets the context window size for auto-compaction.
@@ -347,6 +365,12 @@ func WithStore(s Store) ConfigOption {
 	return func(c *Config) { c.Store = s }
 }
 
+// WithStateMigrators configures schema migrations for snapshots loaded from
+// either Store or CheckpointSaver.
+func WithStateMigrators(migrators map[int]StateSnapshotMigrator) ConfigOption {
+	return func(c *Config) { c.StateMigrators = migrators }
+}
+
 // WithCheckpoint sets the checkpoint settings.
 func WithCheckpoint(cs *CheckpointSettings) ConfigOption {
 	return func(c *Config) { c.Checkpoint = cs }
@@ -375,6 +399,11 @@ func WithExtensions(exts ...Extension) ConfigOption {
 // WithLifecycle sets the lifecycle hook.
 func WithLifecycle(hook LifecycleHook) ConfigOption {
 	return func(c *Config) { c.Lifecycle = hook }
+}
+
+// WithArtifactOffload enables automatic offloading of large tool results.
+func WithArtifactOffload(cfg *ArtifactOffloadConfig) ConfigOption {
+	return func(c *Config) { c.ArtifactOffload = cfg }
 }
 
 // WithTransformContext sets the context transform function.

@@ -40,13 +40,22 @@ func (s *FuncStep) Run(ctx context.Context, input string) (string, error) {
 
 // Pipeline runs steps sequentially.
 type Pipeline struct {
-	Steps []Step
+	Steps  []Step
+	Tracer agentcore.Tracer
 }
 
 func (p *Pipeline) Run(ctx context.Context, input string) (string, error) {
+	ctx, workflowSpan, _ := agentcore.StartComponentRun(ctx, p.Tracer, "workflow", "pipeline")
+	defer workflowSpan.End()
 	current := input
 	for i, step := range p.Steps {
-		output, err := step.Run(ctx, current)
+		stepName := fmt.Sprintf("pipeline[%d]", i)
+		stepCtx, span, _ := agentcore.StartComponentRun(ctx, p.Tracer, "workflow_step", stepName)
+		output, err := step.Run(stepCtx, current)
+		if err != nil {
+			span.RecordError(err)
+		}
+		span.End()
 		if err != nil {
 			return "", agentcore.WrapNodeError(err, fmt.Sprintf("pipeline[%d]", i))
 		}
@@ -57,11 +66,14 @@ func (p *Pipeline) Run(ctx context.Context, input string) (string, error) {
 
 // Parallel runs steps concurrently with the same input and merges the results.
 type Parallel struct {
-	Steps []Step
-	Merge func(results []string) string
+	Steps  []Step
+	Merge  func(results []string) string
+	Tracer agentcore.Tracer
 }
 
 func (p *Parallel) Run(ctx context.Context, input string) (string, error) {
+	ctx, workflowSpan, _ := agentcore.StartComponentRun(ctx, p.Tracer, "workflow", "parallel")
+	defer workflowSpan.End()
 	results := make([]string, len(p.Steps))
 	errs := make([]error, len(p.Steps))
 	var wg sync.WaitGroup
@@ -70,7 +82,13 @@ func (p *Parallel) Run(ctx context.Context, input string) (string, error) {
 		wg.Add(1)
 		go func(idx int, s Step) {
 			defer wg.Done()
-			out, err := s.Run(ctx, input)
+			stepName := fmt.Sprintf("parallel[%d]", idx)
+			stepCtx, span, _ := agentcore.StartComponentRun(ctx, p.Tracer, "workflow_step", stepName)
+			defer span.End()
+			out, err := s.Run(stepCtx, input)
+			if err != nil {
+				span.RecordError(err)
+			}
 			results[idx] = out
 			errs[idx] = err
 		}(i, step)
@@ -92,18 +110,24 @@ func (p *Parallel) Run(ctx context.Context, input string) (string, error) {
 
 // Router dynamically picks a step based on the input.
 type Router struct {
-	Route func(ctx context.Context, input string) string
-	Steps map[string]Step
+	Route  func(ctx context.Context, input string) string
+	Steps  map[string]Step
+	Tracer agentcore.Tracer
 }
 
 func (r *Router) Run(ctx context.Context, input string) (string, error) {
+	ctx, workflowSpan, _ := agentcore.StartComponentRun(ctx, r.Tracer, "workflow", "router")
+	defer workflowSpan.End()
 	key := r.Route(ctx, input)
 	step, ok := r.Steps[key]
 	if !ok {
 		return "", agentcore.NewNodeError("no step found", nil, "router", key)
 	}
-	output, err := step.Run(ctx, input)
+	stepCtx, span, _ := agentcore.StartComponentRun(ctx, r.Tracer, "workflow_step", "router:"+key)
+	defer span.End()
+	output, err := step.Run(stepCtx, input)
 	if err != nil {
+		span.RecordError(err)
 		return "", agentcore.WrapNodeError(err, "router:"+key)
 	}
 	return output, nil

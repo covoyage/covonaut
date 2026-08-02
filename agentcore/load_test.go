@@ -19,15 +19,16 @@ func (m *mockThreadStore) GetThreadConfig(_ context.Context, _ string) (*CallCon
 }
 
 type mockStore struct {
-	has bool
-	err error
+	has      bool
+	err      error
+	snapshot StateSnapshot
 }
 
 func (m *mockStore) Save(_ context.Context, _ string, _ StateSnapshot) error {
 	return nil
 }
 func (m *mockStore) Load(_ context.Context, _ string) (StateSnapshot, error) {
-	return StateSnapshot{}, m.err
+	return m.snapshot, m.err
 }
 func (m *mockStore) Has(_ context.Context, _ string) (bool, error) {
 	return m.has, m.err
@@ -99,7 +100,7 @@ func TestLoadAgentThreadStoreError(t *testing.T) {
 	cfg := Config{}
 	cfg.Model = "m"
 	opts := LoadAgentOptions{
-		ThreadID: "tid",
+		ThreadID:          "tid",
 		ThreadCfgProvider: &mockThreadStore{err: errors.New("store error")},
 	}
 	_, err := LoadAgent(context.Background(), cfg, opts)
@@ -156,5 +157,33 @@ func TestLoadAgentNoThread(t *testing.T) {
 	}
 	if agent == nil {
 		t.Fatal("expected non-nil agent")
+	}
+}
+
+func TestLoadAgentMigratesStoreSnapshot(t *testing.T) {
+	store := &mockStore{
+		has: true,
+		snapshot: StateSnapshot{
+			Version:  0,
+			Status:   StatusInterrupted,
+			Messages: []Message{{Role: RoleUser, Content: "legacy"}},
+		},
+	}
+	agent, err := LoadAgent(context.Background(), Config{
+		ModelConfig: ModelConfig{Model: "m"},
+		Store:       store,
+		StateMigrators: map[int]StateSnapshotMigrator{
+			0: func(_ context.Context, snapshot StateSnapshot) (StateSnapshot, error) {
+				snapshot.Messages = append(snapshot.Messages, Message{Role: RoleSystem, Content: "migrated"})
+				return snapshot, nil
+			},
+		},
+	}, LoadAgentOptions{ThreadID: "tid"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := agent.State().Snapshot()
+	if snapshot.Version != CurrentStateSnapshotVersion || len(snapshot.Messages) != 2 || snapshot.Messages[1].Content != "migrated" {
+		t.Fatalf("snapshot = %#v", snapshot)
 	}
 }

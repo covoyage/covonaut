@@ -43,6 +43,8 @@ type Config struct {
 	SystemPrompt string
 
 	Store Store // optional: enables SaveState / LoadState
+	// StateMigrators upgrades versioned snapshots loaded from Store or checkpoints.
+	StateMigrators map[int]StateSnapshotMigrator
 	// Checkpoint optional durable snapshots per thread (see CheckpointSettings).
 	Checkpoint *CheckpointSettings
 
@@ -80,6 +82,9 @@ type Config struct {
 	// Lifecycle hooks intercept every stage of agent execution.
 	// Multiple hooks are composed via LifecycleChain.
 	Lifecycle LifecycleHook
+
+	// ArtifactOffload stores large tool results outside model history.
+	ArtifactOffload *ArtifactOffloadConfig
 }
 
 // Agent is the core runtime that orchestrates LLM calls and tool execution.
@@ -98,6 +103,8 @@ type Agent struct {
 	contextEngine ContextEngine
 	engineReg     *EngineRegistry
 	interrupted   *InterruptReason
+	failoverMu    sync.Mutex
+	lastTarget    *ModelTarget
 }
 
 func New(cfg Config) *Agent {
@@ -108,6 +115,11 @@ func New(cfg Config) *Agent {
 
 	reg := NewRegistry()
 	reg.Register(cfg.Tools...)
+	if cfg.ArtifactOffload != nil && cfg.ArtifactOffload.Store != nil {
+		if _, exists := reg.Get("artifact_read"); !exists {
+			reg.Register(NewArtifactReadTool(cfg.ArtifactOffload.Store))
+		}
+	}
 
 	unknownHandler := cfg.UnknownToolHandler
 	if unknownHandler == nil {
@@ -124,6 +136,7 @@ func New(cfg Config) *Agent {
 		UnknownToolHandler: unknownHandler,
 		ArgumentRepairFunc: cfg.ArgumentRepairFunc,
 	}
+	execCfg.Middleware = append([]Middleware{TracingMiddleware(cfg.Tracer)}, execCfg.Middleware...)
 
 	engineReg := NewEngineRegistry()
 
@@ -208,10 +221,11 @@ func (a *Agent) rebuildExecutor() {
 	if unknownHandler == nil {
 		unknownHandler = DynamicUnknownToolHandler(a.registry)
 	}
+	middleware := append([]Middleware{TracingMiddleware(cfg.Tracer)}, cfg.Middleware...)
 	a.executor = NewExecutor(a.registry, ExecutorConfig{
 		Mode:               cfg.ExecutionMode,
 		Concurrency:        cfg.Concurrency,
-		Middleware:         cfg.Middleware,
+		Middleware:         middleware,
 		Before:             cfg.GlobalBefore,
 		After:              cfg.GlobalAfter,
 		ValidateArguments:  cfg.ValidateArguments,
@@ -426,7 +440,22 @@ func (a *Agent) LoadState(ctx context.Context, key string) error {
 	if err != nil {
 		return err
 	}
+	snap, err = MigrateStateSnapshot(ctx, snap, a.stateMigrators())
+	if err != nil {
+		return err
+	}
 	a.state.Restore(snap)
+	a.interrupted = a.state.GetInterruptReason()
+	return nil
+}
+
+func (a *Agent) stateMigrators() map[int]StateSnapshotMigrator {
+	if a.config.StateMigrators != nil {
+		return a.config.StateMigrators
+	}
+	if a.config.Checkpoint != nil {
+		return a.config.Checkpoint.Migrators
+	}
 	return nil
 }
 
@@ -462,6 +491,10 @@ func (a *Agent) RestoreLatestCheckpoint(ctx context.Context, threadID string) er
 	if err != nil {
 		return err
 	}
+	snap, err = MigrateStateSnapshot(ctx, snap, a.stateMigrators())
+	if err != nil {
+		return err
+	}
 	a.state.Restore(snap)
 	a.interrupted = a.state.GetInterruptReason()
 	return nil
@@ -484,7 +517,7 @@ func (a *Agent) Run(ctx context.Context, input string) (string, error) {
 	if a.initErr != nil {
 		return "", a.initErr
 	}
-	ctx, span := a.tracer().Start(ctx, "agent.run",
+	ctx, span, _ := StartComponentRun(ctx, a.tracer(), "agent", a.config.Name,
 		Attr("agent.name", a.config.Name),
 		Attr("agent.model", a.config.Model),
 	)
@@ -492,7 +525,7 @@ func (a *Agent) Run(ctx context.Context, input string) (string, error) {
 	defer a.eventBus.Drain()
 
 	a.state.SetStatus(StatusRunning)
-	a.emit(&AgentStartEvent{
+	a.emit(ctx, &AgentStartEvent{
 		baseEvent: newBase(EventAgentStart),
 		AgentName: a.config.Name,
 		Input:     input,
@@ -542,14 +575,14 @@ func (a *Agent) Continue(ctx context.Context) (string, error) {
 	if a.initErr != nil {
 		return "", a.initErr
 	}
-	ctx, span := a.tracer().Start(ctx, "agent.continue",
+	ctx, span, _ := StartComponentRun(ctx, a.tracer(), "agent", a.config.Name,
 		Attr("agent.name", a.config.Name),
 	)
 	defer span.End()
 	defer a.eventBus.Drain()
 
 	a.state.SetStatus(StatusRunning)
-	a.emit(&AgentStartEvent{
+	a.emit(ctx, &AgentStartEvent{
 		baseEvent: newBase(EventAgentStart),
 		AgentName: a.config.Name,
 	})
@@ -579,16 +612,23 @@ func (a *Agent) Resume(ctx context.Context) (string, error) {
 	if ir == nil {
 		return "", fmt.Errorf("agent is not interrupted (status: %s)", a.state.Status())
 	}
+	ctx, span, _ := StartComponentRun(ctx, a.tracer(), "agent", a.config.Name,
+		Attr("agent.name", a.config.Name),
+		Attr("agent.resume", true),
+	)
+	defer span.End()
 	a.interrupted = nil
 	a.state.ClearInterruptReason()
 	a.state.SetStatus(StatusRunning)
-	a.emit(&AgentStartEvent{
+	a.emit(ctx, &AgentStartEvent{
 		baseEvent: newBase(EventAgentStart),
 		AgentName: a.config.Name,
 	})
+
 	defer a.eventBus.Drain()
 	output, err := a.runLoop(ctx)
 	if err != nil {
+		span.RecordError(err)
 		return "", WrapNodeError(err, "resume")
 	}
 	return output, nil
@@ -624,7 +664,7 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 			if turn-loopStartTurn > a.config.MaxTurns {
 				err := NewNodeError("exceeded max turns", ErrExceedMaxSteps, a.config.Name, fmt.Sprintf("turn:%d", turn))
 				a.state.SetStatus(StatusError)
-				a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: err})
+				a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: err})
 				return "", err
 			}
 
@@ -641,7 +681,7 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 			if err := a.maybeCompact(ctx); err != nil {
 				ne := NewNodeError("compaction failed", err, a.config.Name, fmt.Sprintf("turn:%d", turn), "compaction")
 				a.state.SetStatus(StatusError)
-				a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
+				a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
 				return "", ne
 			}
 
@@ -651,7 +691,7 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 					if err := a.persistMessage(ctx, msg); err != nil {
 						ne := NewNodeError("lifecycle persist steering failed", err, a.config.Name, fmt.Sprintf("turn:%d", turn))
 						a.state.SetStatus(StatusError)
-						a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
+						a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
 						return "", ne
 					}
 				}
@@ -662,18 +702,18 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 				if err := lc.BeforeTurn(ctx, arc); err != nil {
 					ne := NewNodeError("lifecycle before_turn failed", err, a.config.Name, fmt.Sprintf("turn:%d", turn))
 					a.state.SetStatus(StatusError)
-					a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
+					a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
 					return "", ne
 				}
 			}
 
 			if err := a.checkpointTurnStart(ctx, turn); err != nil {
 				a.state.SetStatus(StatusError)
-				a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: err})
+				a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: err})
 				return "", err
 			}
 
-			a.emit(&TurnStartEvent{baseEvent: newBase(EventTurnStart), Turn: turn})
+			a.emit(ctx, &TurnStartEvent{baseEvent: newBase(EventTurnStart), Turn: turn})
 
 			// Build request: TransformContext → ConvertToLLM
 			msgs := a.state.Messages()
@@ -684,12 +724,24 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 			if converter == nil {
 				converter = DefaultConvertToLLM
 			}
-			msgs = converter(msgs)
+			msgs = NormalizeToolCallHistory(converter(msgs))
+
+			allToolDefs := a.registry.Definitions()
+			toolDefs, selectErr := selectToolDefinitions(ctx, a.config.ToolSelection, msgs, allToolDefs)
+			if selectErr != nil {
+				ne := NewNodeError("tool selection failed", selectErr, a.config.Name, fmt.Sprintf("turn:%d", turn))
+				a.state.SetStatus(StatusError)
+				a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
+				return "", ne
+			}
+			if a.config.ArtifactOffload != nil && a.config.ArtifactOffload.Store != nil {
+				toolDefs = ensureToolDefinition(toolDefs, allToolDefs, "artifact_read")
+			}
 
 			req := &ProviderRequest{
 				Model:            a.config.Model,
 				Messages:         msgs,
-				Tools:            a.registry.Definitions(),
+				Tools:            toolDefs,
 				Temperature:      a.config.Temperature,
 				FrequencyPenalty: a.config.FrequencyPenalty,
 				PresencePenalty:  a.config.PresencePenalty,
@@ -706,7 +758,7 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 				if lcErr := lc.BeforeModelCall(ctx, arc, mcc); lcErr != nil {
 					ne := NewNodeError("lifecycle before_model_call failed", lcErr, a.config.Name, fmt.Sprintf("turn:%d", turn))
 					a.state.SetStatus(StatusError)
-					a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
+					a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
 					return "", ne
 				}
 			}
@@ -720,7 +772,7 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 						if tc := a.transformContext(); tc != nil {
 							msgs = tc(ctx, msgs)
 						}
-						msgs = converter(msgs)
+						msgs = NormalizeToolCallHistory(converter(msgs))
 						req.Messages = msgs
 						resp, err = a.callProviderWithRetry(ctx, req)
 					}
@@ -739,18 +791,19 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 							Role:    RoleSystem,
 							Content: a.repetitionPrompt(RepetitionKindStream, streamRepeatAttempts),
 						})
-						a.emit(&RepetitionRecoveryEvent{
+						a.emit(ctx, &RepetitionRecoveryEvent{
 							baseEvent:   newBase(EventRepetitionRecovery),
 							Kind:        RepetitionKindStream,
 							Attempt:     streamRepeatAttempts,
 							MaxAttempts: a.repetitionMaxAttempts(),
 						})
+
 						streamRepeatAttempts++
 						continue
 					}
 					ne := NewNodeError("repetition loop", ErrRepetitionLoop, a.config.Name, fmt.Sprintf("turn:%d", turn))
 					a.state.SetStatus(StatusError)
-					a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
+					a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
 					return "", ne
 				}
 
@@ -758,15 +811,16 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 					if errors.Is(err, context.Canceled) {
 						// User interrupted — emit clean end event instead of cryptic error
 						a.state.SetStatus(StatusFinished)
-						a.emit(&AgentEndEvent{
+						a.emit(ctx, &AgentEndEvent{
 							baseEvent: newBase(EventAgentEnd),
 							AgentName: a.config.Name,
 						})
+
 						return "", nil
 					}
 					ne := NewNodeError("provider call failed", err, a.config.Name, fmt.Sprintf("turn:%d", turn), "provider")
 					a.state.SetStatus(StatusError)
-					a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
+					a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
 					return "", ne
 				}
 			}
@@ -786,7 +840,7 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 						}); pErr != nil {
 							ne := NewNodeError("lifecycle persist assistant failed", pErr, a.config.Name, fmt.Sprintf("turn:%d", turn))
 							a.state.SetStatus(StatusError)
-							a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
+							a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
 							return "", ne
 						}
 					}
@@ -796,7 +850,7 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 					}); err != nil {
 						ne := NewNodeError("lifecycle persist guardrail error failed", err, a.config.Name, fmt.Sprintf("turn:%d", turn))
 						a.state.SetStatus(StatusError)
-						a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
+						a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
 						return "", ne
 					}
 					continue
@@ -820,7 +874,7 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 				}); err != nil {
 					ne := NewNodeError("lifecycle persist assistant failed", err, a.config.Name, fmt.Sprintf("turn:%d", turn))
 					a.state.SetStatus(StatusError)
-					a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
+					a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
 					return "", ne
 				}
 			}
@@ -828,18 +882,19 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 			if len(resp.ToolCalls) == 0 {
 				finalOutput = resp.Content
 				a.state.SetStatus(StatusFinished)
-				a.emit(&TurnEndEvent{
+				a.emit(ctx, &TurnEndEvent{
 					baseEvent: newBase(EventTurnEnd),
 					Turn:      turn,
 					Usage:     resp.Usage,
 				})
+
 				if lc := a.lifecycle(); lc != nil {
 					arc := &AgentRunContext{Agent: a, Messages: a.state.Messages(), Turn: turn}
 					lc.AfterTurn(ctx, arc, TurnInfo{HadToolCalls: false})
 				}
 				if err := a.checkpointTurnEnd(ctx, turn); err != nil {
 					a.state.SetStatus(StatusError)
-					a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: err})
+					a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: err})
 					return "", err
 				}
 				break
@@ -861,22 +916,23 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 					}); perr != nil {
 						ne := NewNodeError("truncation guard persist failed", perr, a.config.Name, fmt.Sprintf("turn:%d", turn))
 						a.state.SetStatus(StatusError)
-						a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
+						a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
 						return "", ne
 					}
 				}
-				a.emit(&TurnEndEvent{
+				a.emit(ctx, &TurnEndEvent{
 					baseEvent: newBase(EventTurnEnd),
 					Turn:      turn,
 					Usage:     resp.Usage,
 				})
+
 				if lc := a.lifecycle(); lc != nil {
 					arc := &AgentRunContext{Agent: a, Messages: a.state.Messages(), Turn: turn}
 					lc.AfterTurn(ctx, arc, TurnInfo{HadToolCalls: true})
 				}
 				if err := a.checkpointTurnEnd(ctx, turn); err != nil {
 					a.state.SetStatus(StatusError)
-					a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: err})
+					a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: err})
 					return "", err
 				}
 				continue
@@ -886,40 +942,43 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 				if IsInterrupt(err) {
 					a.state.SetStatus(StatusInterrupted)
 					a.state.SetInterruptReason(a.interrupted)
-					a.emit(&AgentInterruptEvent{
+					a.emit(ctx, &AgentInterruptEvent{
 						baseEvent: newBase(EventAgentInterrupt),
 						AgentName: a.config.Name,
 						Reason:    a.interrupted,
 					})
+
 					return "", nil
 				}
 				ne := NewNodeError("tool execution persist failed", err, a.config.Name, fmt.Sprintf("turn:%d", turn))
 				a.state.SetStatus(StatusError)
-				a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
+				a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
 				return "", ne
 			}
 
 			// Context cancellation during tool execution — exit cleanly.
 			if errors.Is(ctx.Err(), context.Canceled) {
 				a.state.SetStatus(StatusFinished)
-				a.emit(&AgentEndEvent{
+				a.emit(ctx, &AgentEndEvent{
 					baseEvent: newBase(EventAgentEnd),
 					AgentName: a.config.Name,
 				})
+
 				return "", nil
 			}
-			a.emit(&TurnEndEvent{
+			a.emit(ctx, &TurnEndEvent{
 				baseEvent: newBase(EventTurnEnd),
 				Turn:      turn,
 				Usage:     resp.Usage,
 			})
+
 			if lc := a.lifecycle(); lc != nil {
 				arc := &AgentRunContext{Agent: a, Messages: a.state.Messages(), Turn: turn}
 				lc.AfterTurn(ctx, arc, TurnInfo{HadToolCalls: true})
 			}
 			if err := a.checkpointTurnEnd(ctx, turn); err != nil {
 				a.state.SetStatus(StatusError)
-				a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: err})
+				a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: err})
 				return "", err
 			}
 
@@ -945,19 +1004,20 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 							Role:    RoleSystem,
 							Content: a.repetitionPrompt(RepetitionKindText, textRecoveryAttempts),
 						})
-						a.emit(&RepetitionRecoveryEvent{
+						a.emit(ctx, &RepetitionRecoveryEvent{
 							baseEvent:   newBase(EventRepetitionRecovery),
 							Kind:        RepetitionKindText,
 							Attempt:     textRecoveryAttempts,
 							MaxAttempts: a.repetitionMaxAttempts(),
 						})
+
 						textRecoveryAttempts++
 						lastContent = ""
 						repeatCount = 0
 					} else {
 						ne := NewNodeError("repetition loop", ErrRepetitionLoop, a.config.Name, fmt.Sprintf("turn:%d", turn))
 						a.state.SetStatus(StatusError)
-						a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
+						a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
 						return "", ne
 					}
 				}
@@ -983,19 +1043,20 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 								Role:    RoleSystem,
 								Content: a.repetitionPrompt(RepetitionKindTool, toolRecoveryAttempts),
 							})
-							a.emit(&RepetitionRecoveryEvent{
+							a.emit(ctx, &RepetitionRecoveryEvent{
 								baseEvent:   newBase(EventRepetitionRecovery),
 								Kind:        RepetitionKindTool,
 								Attempt:     toolRecoveryAttempts,
 								MaxAttempts: a.repetitionMaxAttempts(),
 							})
+
 							toolRecoveryAttempts++
 							lastToolSignature = ""
 							toolRepeatCount = 0
 						} else {
 							ne := NewNodeError("repetition loop", ErrRepetitionLoop, a.config.Name, fmt.Sprintf("turn:%d", turn))
 							a.state.SetStatus(StatusError)
-							a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
+							a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
 							return "", ne
 						}
 					}
@@ -1018,17 +1079,18 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 			if err := a.persistMessage(ctx, msg); err != nil {
 				ne := NewNodeError("lifecycle persist follow-up failed", err, a.config.Name, "follow_up")
 				a.state.SetStatus(StatusError)
-				a.emit(&AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
+				a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
 				return "", ne
 			}
 		}
 	}
 
-	a.emit(&AgentEndEvent{
+	a.emit(ctx, &AgentEndEvent{
 		baseEvent: newBase(EventAgentEnd),
 		AgentName: a.config.Name,
 		Output:    finalOutput,
 	})
+
 	return finalOutput, nil
 }
 
@@ -1134,7 +1196,7 @@ func (a *Agent) ForceCompactWithTopic(ctx context.Context, focusTopic string) er
 	toolDefs := a.registry.Definitions()
 	tokensBefore := EstimateMessagesTokens(msgs) + EstimateToolDefinitionsTokens(toolDefs)
 
-	a.emit(&CompactionStartEvent{
+	a.emit(ctx, &CompactionStartEvent{
 		baseEvent:     newBase(EventCompactionStart),
 		TokensBefore:  tokensBefore,
 		ContextWindow: a.config.ContextWindow,
@@ -1151,27 +1213,97 @@ func (a *Agent) ForceCompactWithTopic(ctx context.Context, focusTopic string) er
 
 	tokensAfter := EstimateMessagesTokens(a.state.Messages()) + EstimateToolDefinitionsTokens(toolDefs)
 
-	a.emit(&CompactionEndEvent{
+	a.emit(ctx, &CompactionEndEvent{
 		baseEvent:    newBase(EventCompactionEnd),
 		TokensBefore: tokensBefore,
 		TokensAfter:  tokensAfter,
 		MessagesCut:  messagesCut,
 		Duration:     time.Since(start),
 	})
+
 	return nil
 }
 
 // --- provider call with retry ---
 
 func (a *Agent) callProviderWithRetry(ctx context.Context, req *ProviderRequest) (*ProviderResponse, error) {
-	resp, err := a.callProvider(ctx, req)
+	primary := ModelTarget{Name: "primary", Model: req.Model, Provider: a.config.Provider}
+	cfg := a.config.Failover
+	if cfg != nil {
+		a.failoverMu.Lock()
+		if a.lastTarget != nil {
+			primary = *a.lastTarget
+		}
+		a.failoverMu.Unlock()
+	}
+
+	resp, err := a.callTargetWithRetry(ctx, req, primary)
+	if err == nil {
+		return resp, nil
+	}
+
+	maxAttempts := 0
+	if cfg != nil {
+		maxAttempts = cfg.MaxAttempts
+		if maxAttempts <= 0 {
+			maxAttempts = len(cfg.Targets)
+		}
+	}
+	lastTarget := primary
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		failure := ModelFailoverContext{
+			Attempt:      attempt,
+			LastTarget:   lastTarget,
+			LastResponse: resp,
+			LastErr:      err,
+		}
+		if !cfg.shouldFailover(ctx, failure) {
+			break
+		}
+		target, selectErr := cfg.target(ctx, failure)
+		if selectErr != nil {
+			return nil, selectErr
+		}
+		if target.Provider == nil {
+			break
+		}
+		if target.Model == "" {
+			target.Model = req.Model
+		}
+		a.emit(ctx, &ModelFailoverEvent{
+			baseEvent: newBase(EventModelFailover),
+			Attempt:   attempt,
+			From:      lastTarget.Name,
+			To:        target.Name,
+			FromModel: lastTarget.Model,
+			ToModel:   target.Model,
+			Err:       err,
+		})
+		resp, err = a.callTargetWithRetry(ctx, req, target)
+		if err == nil {
+			a.rememberSuccessfulTarget(target)
+			return resp, nil
+		}
+		lastTarget = target
+	}
+	return resp, err
+}
+
+func (a *Agent) rememberSuccessfulTarget(target ModelTarget) {
+	a.failoverMu.Lock()
+	defer a.failoverMu.Unlock()
+	a.lastTarget = &target
+}
+
+func (a *Agent) callTargetWithRetry(ctx context.Context, req *ProviderRequest, target ModelTarget) (*ProviderResponse, error) {
+	resp, err := a.callProvider(ctx, req, target)
 	if err == nil {
 		return resp, nil
 	}
 
 	cfg := a.config.RetryConfig
 	if cfg == nil || !IsRetryableError(err) {
-		return nil, err
+		return resp, err
 	}
 
 	maxRetries := cfg.MaxRetries
@@ -1181,7 +1313,7 @@ func (a *Agent) callProviderWithRetry(ctx context.Context, req *ProviderRequest)
 
 	for attempt := int64(1); attempt <= maxRetries; attempt++ {
 		delay := applyFullJitter(retryDelay(attempt, cfg))
-		a.emit(&AutoRetryEvent{
+		a.emit(ctx, &AutoRetryEvent{
 			baseEvent:  newBase(EventAutoRetry),
 			Attempt:    attempt,
 			MaxRetries: maxRetries,
@@ -1195,37 +1327,42 @@ func (a *Agent) callProviderWithRetry(ctx context.Context, req *ProviderRequest)
 			return nil, ctx.Err()
 		}
 
-		resp, err = a.callProvider(ctx, req)
+		resp, err = a.callProvider(ctx, req, target)
 		if err == nil {
 			return resp, nil
 		}
 		if !IsRetryableError(err) {
-			return nil, err
+			return resp, err
 		}
 	}
 
-	return nil, fmt.Errorf("after %d retries: %w", maxRetries, err)
+	return resp, fmt.Errorf("after %d retries: %w", maxRetries, err)
 }
 
 // --- internal helpers ---
 
-func (a *Agent) callProvider(ctx context.Context, req *ProviderRequest) (*ProviderResponse, error) {
-	if a.config.Provider == nil {
+func (a *Agent) callProvider(ctx context.Context, req *ProviderRequest, target ModelTarget) (*ProviderResponse, error) {
+	if target.Provider == nil {
 		return nil, errors.New("agent: provider is nil")
 	}
-	ctx, span := a.tracer().Start(ctx, "agent.llm",
-		Attr("model", req.Model),
+	targetReq := *req
+	if target.Model != "" {
+		targetReq.Model = target.Model
+	}
+	ctx, span, _ := StartComponentRun(ctx, a.tracer(), "model", targetReq.Model,
+		Attr("model", targetReq.Model),
+		Attr("target", target.Name),
 		Attr("streaming", a.config.Streaming),
-		Attr("tool_count", len(req.Tools)),
+		Attr("tool_count", len(targetReq.Tools)),
 	)
 	defer span.End()
 
 	var resp *ProviderResponse
 	var err error
 	if a.config.Streaming {
-		resp, err = a.runStreaming(ctx, req)
+		resp, err = a.runStreamingWithProvider(ctx, target.Provider, &targetReq)
 	} else {
-		resp, err = a.config.Provider.Complete(ctx, req)
+		resp, err = target.Provider.Complete(ctx, &targetReq)
 	}
 	if err != nil {
 		span.RecordError(err)
@@ -1234,7 +1371,11 @@ func (a *Agent) callProvider(ctx context.Context, req *ProviderRequest) (*Provid
 }
 
 func (a *Agent) runStreaming(ctx context.Context, req *ProviderRequest) (*ProviderResponse, error) {
-	ch, err := a.config.Provider.Stream(ctx, req)
+	return a.runStreamingWithProvider(ctx, a.config.Provider, req)
+}
+
+func (a *Agent) runStreamingWithProvider(ctx context.Context, provider Provider, req *ProviderRequest) (*ProviderResponse, error) {
+	ch, err := provider.Stream(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -1244,37 +1385,51 @@ func (a *Agent) runStreaming(ctx context.Context, req *ProviderRequest) (*Provid
 	toolCallMap := make(map[int64]*ToolCall)
 	var usage TokenUsage
 	var finishReason string
+	attemptID := newRunID()
+	emitted := false
+	reset := func(reason string) {
+		if !emitted {
+			return
+		}
+		a.emit(ctx, &MessageResetEvent{
+			baseEvent: newBase(EventMessageReset),
+			AttemptID: attemptID,
+			Reason:    reason,
+		})
+		emitted = false
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
+			reset(ctx.Err().Error())
 			return nil, ctx.Err()
 		case delta, ok := <-ch:
 			if !ok {
 				goto buildResponse
 			}
 			if delta.Err != nil {
-				// Terminal mid-stream condition (e.g. repetition loop) signaled by a
-				// provider middleware. Discard whatever content/blocks were
-				// accumulated so far -- it's degenerate output that must never be
-				// persisted as a real assistant turn -- and surface the error so the
-				// caller's recovery ladder (runLoop) can react.
-				return nil, delta.Err
+				reset(delta.Err.Error())
+				return &ProviderResponse{Content: content.String(), Blocks: blocks}, delta.Err
 			}
 			if delta.Content != "" {
 				content.WriteString(delta.Content)
-				a.emit(&MessageDeltaEvent{
+				emitted = true
+				a.emit(ctx, &MessageDeltaEvent{
 					baseEvent: newBase(EventMessageDelta),
 					Delta:     delta.Content,
 					Kind:      BlockKindText,
+					AttemptID: attemptID,
 				})
 			}
 			for _, bl := range delta.Blocks {
 				if bl.Kind == BlockKindThinking && bl.Text != "" && bl.Text != delta.Content {
-					a.emit(&MessageDeltaEvent{
+					emitted = true
+					a.emit(ctx, &MessageDeltaEvent{
 						baseEvent: newBase(EventMessageDelta),
 						Delta:     bl.Text,
 						Kind:      BlockKindThinking,
+						AttemptID: attemptID,
 					})
 				}
 			}
@@ -1366,13 +1521,14 @@ func (a *Agent) executeToolCalls(ctx context.Context, calls []ToolCall) error {
 
 	cb := &ExecuteCallbacks{
 		OnStart: func(tc ToolCall) {
-			a.emit(&ToolCallStartEvent{
+			a.emit(ctx, &ToolCallStartEvent{
 				baseEvent: newBase(EventToolCallStart),
 				ToolCall:  tc,
 			})
+
 		},
 		OnEnd: func(r ToolResult) {
-			a.emit(&ToolCallEndEvent{
+			a.emit(ctx, &ToolCallEndEvent{
 				baseEvent:  newBase(EventToolCallEnd),
 				ToolCallID: r.ToolCallID,
 				ToolName:   r.ToolName,
@@ -1380,6 +1536,7 @@ func (a *Agent) executeToolCalls(ctx context.Context, calls []ToolCall) error {
 				Err:        r.Err,
 				Duration:   r.Duration,
 			})
+
 		},
 	}
 
@@ -1401,6 +1558,7 @@ func (a *Agent) executeToolCalls(ctx context.Context, calls []ToolCall) error {
 	if a.config.PostProcessResults != nil {
 		results = a.config.PostProcessResults(ctx, calls, results)
 	}
+	results = offloadToolResults(ctx, a.config.ArtifactOffload, results)
 
 	for i, tc := range calls {
 		r := results[i]
@@ -1503,7 +1661,16 @@ func (a *Agent) executeWithLoopHooks(ctx context.Context, calls []ToolCall, cb *
 	return results
 }
 
-func (a *Agent) emit(e Event) { a.eventBus.Emit(e) }
+func (a *Agent) emit(ctx context.Context, event Event) {
+	if info, ok := RunInfoFromContext(ctx); ok {
+		copy := info
+		copy.Path = append([]string(nil), info.Path...)
+		if carrier, ok := event.(interface{ setEventRunInfo(*RunInfo) }); ok {
+			carrier.setEventRunInfo(&copy)
+		}
+	}
+	a.eventBus.Emit(event)
+}
 
 func (a *Agent) tracer() Tracer {
 	if a.config.Tracer != nil {

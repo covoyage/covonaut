@@ -12,13 +12,13 @@ import (
 
 // Checkpoint captures the complete execution state at a specific point.
 type Checkpoint struct {
-	ID        string           `json:"id"`
-	GraphID   string           `json:"graph_id,omitempty"`
-	NodeName  string           `json:"node_name"`
-	StepIndex int64            `json:"step_index"`
-	State     json.RawMessage  `json:"state"`
-	Metadata  map[string]any   `json:"metadata,omitempty"`
-	CreatedAt time.Time        `json:"created_at"`
+	ID        string          `json:"id"`
+	GraphID   string          `json:"graph_id,omitempty"`
+	NodeName  string          `json:"node_name"`
+	StepIndex int64           `json:"step_index"`
+	State     json.RawMessage `json:"state"`
+	Metadata  map[string]any  `json:"metadata,omitempty"`
+	CreatedAt time.Time       `json:"created_at"`
 }
 
 // CheckpointStore persists and retrieves checkpoints.
@@ -153,10 +153,9 @@ func (ig *InterruptableGraph) runFrom(ctx context.Context, input string, startLa
 
 			ig.mu.Lock()
 			ig.nodeOutputs[name] = out
-			for _, to := range ig.graph.graph.edges[name] {
-				if _, exists := ig.nodeOutputs[to]; !exists {
-					ig.nodeOutputs[to] = ""
-				}
+			if err := ig.graph.graph.activateSuccessors(ctx, name, out, ig.nodeOutputs); err != nil {
+				ig.mu.Unlock()
+				return "", nil, err
 			}
 			ig.mu.Unlock()
 

@@ -371,12 +371,12 @@ func TestChatAppSubscribe(t *testing.T) {
 	adapter := &testSubscriber{handlers: make(map[ChatEventType]func(ChatEvent))}
 	app.Subscribe(adapter)
 
-	if len(adapter.handlers) != 14 {
-		t.Fatalf("expected 14 handlers registered, got %d", len(adapter.handlers))
+	if len(adapter.handlers) != 15 {
+		t.Fatalf("expected 15 handlers registered, got %d", len(adapter.handlers))
 	}
 	for _, et := range []ChatEventType{
 		ChatEventAgentStart, ChatEventAgentEnd, ChatEventAgentError,
-		ChatEventTurnStart, ChatEventTurnEnd, ChatEventMessageDelta,
+		ChatEventTurnStart, ChatEventTurnEnd, ChatEventMessageDelta, ChatEventMessageReset,
 		ChatEventToolCallStart, ChatEventToolCallEnd,
 		ChatEventHandoffStart, ChatEventHandoffEnd,
 		ChatEventCompactionStart, ChatEventCompactionEnd,
@@ -385,6 +385,18 @@ func TestChatAppSubscribe(t *testing.T) {
 		if adapter.handlers[et] == nil {
 			t.Errorf("handler for %s not registered", et)
 		}
+	}
+}
+
+func TestChatAppMessageResetRemovesFailedAttempt(t *testing.T) {
+	app, _ := newTestChatApp(t, ChatAppConfig{})
+	app.onMessageDelta(MessageDeltaChatEvent{Delta: "partial", AttemptID: "attempt-1"})
+	if len(app.history.Messages()) != 1 {
+		t.Fatalf("messages before reset = %#v", app.history.Messages())
+	}
+	app.onMessageReset(MessageResetChatEvent{AttemptID: "attempt-1"})
+	if len(app.history.Messages()) != 0 {
+		t.Fatalf("messages after reset = %#v", app.history.Messages())
 	}
 }
 

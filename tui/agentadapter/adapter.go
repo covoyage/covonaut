@@ -62,7 +62,15 @@ func (s *subscriberAdapter) On(eventType chat.ChatEventType, handler func(chat.C
 			if !ok {
 				return
 			}
-			handler(chat.MessageDeltaChatEvent{Delta: ev.Delta, Kind: string(ev.Kind)})
+			handler(chat.MessageDeltaChatEvent{Delta: ev.Delta, Kind: string(ev.Kind), AttemptID: ev.AttemptID})
+		})
+	case chat.ChatEventMessageReset:
+		s.agent.On(agentcore.EventMessageReset, func(e agentcore.Event) {
+			ev, ok := e.(*agentcore.MessageResetEvent)
+			if !ok {
+				return
+			}
+			handler(chat.MessageResetChatEvent{AttemptID: ev.AttemptID, Reason: ev.Reason})
 		})
 	case chat.ChatEventToolCallStart:
 		s.agent.On(agentcore.EventToolCallStart, func(e agentcore.Event) {

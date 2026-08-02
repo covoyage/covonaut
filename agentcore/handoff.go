@@ -85,7 +85,7 @@ func (a *Agent) createHandoffTool(h HandoffConfig) *Tool {
 // executeDelegate creates a sub-agent, runs it, and returns its output as a tool result.
 func (a *Agent) executeDelegate(ctx context.Context, h HandoffConfig, input string) (any, error) {
 	start := time.Now()
-	a.emit(&HandoffStartEvent{
+	a.emit(ctx, &HandoffStartEvent{
 		baseEvent:   newBase(EventHandoffStart),
 		SourceAgent: a.config.Name,
 		TargetAgent: h.Name,
@@ -99,7 +99,7 @@ func (a *Agent) executeDelegate(ctx context.Context, h HandoffConfig, input stri
 
 	output, err := sub.Run(ctx, input)
 
-	a.emit(&HandoffEndEvent{
+	a.emit(ctx, &HandoffEndEvent{
 		baseEvent:   newBase(EventHandoffEnd),
 		TargetAgent: h.Name,
 		Output:      output,
@@ -117,7 +117,7 @@ func (a *Agent) executeDelegate(ctx context.Context, h HandoffConfig, input stri
 // state from the source agent, and transfers control.
 func (a *Agent) handleTransfer(ctx context.Context, handoff *PendingHandoff) (string, error) {
 	start := time.Now()
-	a.emit(&HandoffStartEvent{
+	a.emit(ctx, &HandoffStartEvent{
 		baseEvent:   newBase(EventHandoffStart),
 		SourceAgent: a.config.Name,
 		TargetAgent: handoff.TargetName,
@@ -149,7 +149,7 @@ func (a *Agent) handleTransfer(ctx context.Context, handoff *PendingHandoff) (st
 
 	output, err := target.Continue(ctx)
 
-	a.emit(&HandoffEndEvent{
+	a.emit(ctx, &HandoffEndEvent{
 		baseEvent:   newBase(EventHandoffEnd),
 		TargetAgent: handoff.TargetName,
 		Output:      output,

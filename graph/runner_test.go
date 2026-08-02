@@ -49,6 +49,23 @@ func TestNewDAGRunner_CustomMode(t *testing.T) {
 	}
 }
 
+func TestRunnerConstructorsPinExecutionMode(t *testing.T) {
+	dag := NewGraph()
+	dag.AddNode("a", constStep("a", "ok"))
+	compiledDAG, _ := dag.Compile(CompileOptions{EntryNode: "a"})
+	if got := NewDAGRunner(compiledDAG, RunnerConfig{Mode: RunModePregl}).config.Mode; got != RunModeDAG {
+		t.Fatalf("DAG runner mode = %q", got)
+	}
+
+	pregel := NewPregelGraph()
+	pregel.AddNode("a", func(_ context.Context, state PregelState) (PregelState, error) { return state, nil })
+	compiledPregel, _ := pregel.Compile("a")
+	state := PregelState{}
+	if got := NewPregelRunner(compiledPregel, &state, RunnerConfig{Mode: RunModeDAG}).config.Mode; got != RunModePregl {
+		t.Fatalf("Pregel runner mode = %q", got)
+	}
+}
+
 // ---- NewPregelRunner ----
 
 func TestNewPregelRunner(t *testing.T) {
@@ -175,6 +192,82 @@ func TestRunner_Pregel_Single(t *testing.T) {
 	}
 	if state.GetString("output") != "hello" {
 		t.Fatalf("state output = %q", state.GetString("output"))
+	}
+}
+
+func TestRunnerPregelExecutesConditionalTarget(t *testing.T) {
+	graph := NewPregelGraph()
+	if err := graph.AddNode("start", func(_ context.Context, state PregelState) (PregelState, error) {
+		state["route"] = "next"
+		return state, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.AddNode("next", func(_ context.Context, state PregelState) (PregelState, error) {
+		state["visited"] = "yes"
+		return state, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.SetConditionalEdgeWithTargets("start", []string{"next"}, func(_ context.Context, state PregelState) []string {
+		return []string{state.GetString("route")}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	compiled, err := graph.Compile("start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := PregelState{}
+	if _, err := NewPregelRunner(compiled, &state).Run(context.Background(), "input"); err != nil {
+		t.Fatal(err)
+	}
+	if state.GetString("visited") != "yes" {
+		t.Fatalf("state = %#v", state)
+	}
+}
+
+func TestRunnerPregelParallelNodesShareOneSuperstepSnapshot(t *testing.T) {
+	graph := NewPregelGraph()
+	graph.AddNode("start", func(_ context.Context, state PregelState) (PregelState, error) { return state, nil })
+	graph.AddNode("left", func(_ context.Context, state PregelState) (PregelState, error) {
+		state["left_saw"] = state.GetString("value")
+		state["left"] = "done"
+		return state, nil
+	})
+	graph.AddNode("right", func(_ context.Context, state PregelState) (PregelState, error) {
+		state["right_saw"] = state.GetString("value")
+		state["right"] = "done"
+		return state, nil
+	})
+	graph.AddEdge("start", "left")
+	graph.AddEdge("start", "right")
+	compiled, _ := graph.Compile("start")
+	state := PregelState{"value": "before"}
+	if _, err := NewPregelRunner(compiled, &state).Run(context.Background(), "input"); err != nil {
+		t.Fatal(err)
+	}
+	if state.GetString("left_saw") != "before" || state.GetString("right_saw") != "before" || state.GetString("left") != "done" || state.GetString("right") != "done" {
+		t.Fatalf("state = %#v", state)
+	}
+}
+
+func TestNewPregelRunnerInitializesNilState(t *testing.T) {
+	graph := NewPregelGraph()
+	graph.AddNode("start", func(_ context.Context, state PregelState) (PregelState, error) {
+		state["route"] = "next"
+		return state, nil
+	})
+	graph.AddNode("next", func(_ context.Context, state PregelState) (PregelState, error) {
+		state["visited"] = "yes"
+		return state, nil
+	})
+	graph.SetConditionalEdgeWithTargets("start", []string{"next"}, func(_ context.Context, state PregelState) []string {
+		return []string{state.GetString("route")}
+	})
+	compiled, _ := graph.Compile("start")
+	if _, err := NewPregelRunner(compiled, nil).Run(context.Background(), "input"); err != nil {
+		t.Fatal(err)
 	}
 }
 

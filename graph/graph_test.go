@@ -296,45 +296,23 @@ func TestRun_MaxSteps(t *testing.T) {
 
 // ---- Conditional Edge ----
 
-func TestConditionalEdge_Bridge_Success(t *testing.T) {
-	cb := &conditionalBridge{
-		route: func(_ context.Context, output string) string {
-			if output == "route_to_b" {
-				return "b"
-			}
-			return "c"
-		},
-		targets: []string{"b", "c"},
-	}
-
-	output, err := cb.Run(context.Background(), "route_to_b")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if output != "b" {
-		t.Fatalf("bridge output = %q, want b", output)
-	}
+type recordingStep struct {
+	output string
+	inputs []string
 }
 
-func TestConditionalEdge_Bridge_NoMatch(t *testing.T) {
-	cb := &conditionalBridge{
-		route: func(_ context.Context, output string) string {
-			return "nonexistent"
-		},
-		targets: []string{"b", "c"},
-	}
-
-	_, err := cb.Run(context.Background(), "anything")
-	if err == nil {
-		t.Fatal("expected error for route to nonexistent target")
-	}
+func (step *recordingStep) Run(_ context.Context, input string) (string, error) {
+	step.inputs = append(step.inputs, input)
+	return step.output, nil
 }
 
 func TestAddConditionalEdge_Integration(t *testing.T) {
 	g := NewGraph()
 	g.AddNode("a", constStep("a", "route_to_b"))
-	g.AddNode("b", constStep("b", "output_b"))
-	g.AddNode("c", constStep("c", "output_c"))
+	b := &recordingStep{output: "output_b"}
+	c := &recordingStep{output: "output_c"}
+	g.AddNode("b", b)
+	g.AddNode("c", c)
 
 	err := g.AddConditionalEdge("a", func(_ context.Context, output string) string {
 		if output == "route_to_b" {
@@ -351,26 +329,18 @@ func TestAddConditionalEdge_Integration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The bridge is added as a node after "a" in the graph.
-	// Verify the bridge exists and has the correct structure.
-	if _, ok := cg.graph.nodes["__conditional_a"]; !ok {
-		t.Fatal("conditional bridge not found")
-	}
-	if _, ok := cg.graph.nodes["b"]; !ok {
-		t.Fatal("target b not found")
-	}
-
-	// Run the graph: a -> __conditional_a (bridge returns "b")
-	// The bridge output is the target name, but the graph does NOT 
-	// auto-follow to execute the target.
 	out, err := cg.Run(context.Background(), "input")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Since __conditional_a is a terminal node (no edges from it to targets),
-	// its output is "b" (the target name returned by the route function)
-	if out != "b" {
-		t.Fatalf("output = %q, want b", out)
+	if out != "output_b" {
+		t.Fatalf("output = %q, want output_b", out)
+	}
+	if len(b.inputs) != 1 || b.inputs[0] != "route_to_b" {
+		t.Fatalf("b inputs = %#v", b.inputs)
+	}
+	if len(c.inputs) != 0 {
+		t.Fatalf("unselected c inputs = %#v", c.inputs)
 	}
 }
 
@@ -398,6 +368,19 @@ func TestAddConditionalEdge_UnknownSource(t *testing.T) {
 	err := g.AddConditionalEdge("unknown", nil, nil)
 	if err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestGraphRejectsMixedStaticAndConditionalEdges(t *testing.T) {
+	graph := NewGraph()
+	graph.AddNode("a", identityStep("a"))
+	graph.AddNode("b", identityStep("b"))
+	graph.AddNode("c", identityStep("c"))
+	if err := graph.AddEdge("a", "b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := graph.AddConditionalEdge("a", func(context.Context, string) string { return "c" }, []string{"c"}); err == nil {
+		t.Fatal("expected mixed edge error")
 	}
 }
 

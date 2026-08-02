@@ -6,6 +6,36 @@ import (
 	"sync"
 )
 
+const CurrentStateSnapshotVersion = 1
+
+// StateSnapshotMigrator upgrades one snapshot version to the next version.
+type StateSnapshotMigrator func(ctx context.Context, snapshot StateSnapshot) (StateSnapshot, error)
+
+// MigrateStateSnapshot upgrades a snapshot to the current schema. Version zero
+// is the legacy unversioned format and uses an identity migration by default.
+func MigrateStateSnapshot(ctx context.Context, snapshot StateSnapshot, migrators map[int]StateSnapshotMigrator) (StateSnapshot, error) {
+	if snapshot.Version > CurrentStateSnapshotVersion {
+		return StateSnapshot{}, fmt.Errorf("checkpoint: snapshot version %d is newer than supported version %d", snapshot.Version, CurrentStateSnapshotVersion)
+	}
+	for snapshot.Version < CurrentStateSnapshotVersion {
+		fromVersion := snapshot.Version
+		if migrate := migrators[fromVersion]; migrate != nil {
+			var err error
+			snapshot, err = migrate(ctx, snapshot)
+			if err != nil {
+				return StateSnapshot{}, fmt.Errorf("checkpoint: migrate version %d: %w", fromVersion, err)
+			}
+		}
+		if snapshot.Version <= fromVersion {
+			snapshot.Version = fromVersion + 1
+		}
+		if snapshot.Version != fromVersion+1 {
+			return StateSnapshot{}, fmt.Errorf("checkpoint: migrator for version %d produced version %d, want %d", fromVersion, snapshot.Version, fromVersion+1)
+		}
+	}
+	return snapshot, nil
+}
+
 // CheckpointSaver persists StateSnapshot sequences for a logical thread
 // (conversation). Implementations must be safe for concurrent use if agents
 // share a saver.
@@ -29,15 +59,18 @@ type CheckpointSettings struct {
 	SkipSaveOnTurnEnd bool
 	// SaveOnTurnStart appends a snapshot before each LLM call (after steering/compaction).
 	SaveOnTurnStart bool
+	// Migrators upgrades older snapshots during RestoreLatestCheckpoint. Keys
+	// are source versions and each migrator advances one schema version.
+	Migrators map[int]StateSnapshotMigrator
 }
 
 // MemoryCheckpointSaver is an in-memory CheckpointSaver for tests and single-process resume.
 // To prevent unbounded memory growth, set MaxCheckpointsPerThread to limit how many
 // checkpoints are retained per thread (oldest are evicted). Zero means unlimited.
 type MemoryCheckpointSaver struct {
-	mu                     sync.Mutex
-	nextSeq                int64
-	byThread               map[string][]memoryCP
+	mu                      sync.Mutex
+	nextSeq                 int64
+	byThread                map[string][]memoryCP
 	MaxCheckpointsPerThread int
 }
 

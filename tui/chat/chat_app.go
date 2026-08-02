@@ -89,6 +89,7 @@ type ChatAppConfig struct {
 
 type chatModel struct {
 	StreamID    string
+	AttemptID   string
 	ActiveTools map[string]time.Time
 	Running     bool
 }
@@ -315,6 +316,7 @@ func (a *ChatApp) snapshot() chatModel {
 	}
 	return chatModel{
 		StreamID:    a.model.StreamID,
+		AttemptID:   a.model.AttemptID,
 		ActiveTools: tools,
 		Running:     a.model.Running,
 	}
@@ -329,6 +331,7 @@ func (a *ChatApp) isRunning() bool {
 func (a *ChatApp) Subscribe(sub EventSubscriber) {
 	sub.On(ChatEventAgentStart, a.onAgentStart)
 	sub.On(ChatEventMessageDelta, a.onMessageDelta)
+	sub.On(ChatEventMessageReset, a.onMessageReset)
 	sub.On(ChatEventToolCallStart, a.onToolStart)
 	sub.On(ChatEventToolCallEnd, a.onToolEnd)
 	sub.On(ChatEventHandoffStart, a.onHandoffStart)
@@ -497,6 +500,7 @@ func (a *ChatApp) onAgentStart(e ChatEvent) {
 	}
 	a.mu.Lock()
 	a.model.StreamID = ""
+	a.model.AttemptID = ""
 	a.mu.Unlock()
 	a.Busy("thinking...")
 }
@@ -512,10 +516,33 @@ func (a *ChatApp) onMessageDelta(e ChatEvent) {
 	// and both append to the same baseline — corrupting the stream.
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.model.AttemptID != "" && d.AttemptID != "" && a.model.AttemptID != d.AttemptID {
+		a.finalizeStreamLocked()
+	}
+	a.model.AttemptID = d.AttemptID
 	id := a.model.StreamID
 	newID := a.history.AppendDeltaWithKind(id, d.Delta, d.Kind)
 	if newID != id {
 		a.model.StreamID = newID
+	}
+}
+
+func (a *ChatApp) onMessageReset(e ChatEvent) {
+	reset, ok := e.(MessageResetChatEvent)
+	if !ok {
+		return
+	}
+	a.mu.Lock()
+	if reset.AttemptID != "" && a.model.AttemptID != "" && reset.AttemptID != a.model.AttemptID {
+		a.mu.Unlock()
+		return
+	}
+	staleID := a.model.StreamID
+	a.model.StreamID = ""
+	a.model.AttemptID = ""
+	a.mu.Unlock()
+	if staleID != "" {
+		a.history.RemoveMessage(staleID)
 	}
 }
 

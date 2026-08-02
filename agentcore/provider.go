@@ -281,6 +281,8 @@ type ToolDefinition struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	Parameters  map[string]any `json:"parameters"`
+	// SearchTerms contains local retrieval tags and is never sent to providers.
+	SearchTerms []string `json:"-"`
 }
 
 // ProviderResponse is the output of a non-streaming completion call.

@@ -8,11 +8,11 @@ import (
 type Status string
 
 const (
-	StatusIdle         Status = "idle"
-	StatusRunning      Status = "running"
-	StatusFinished     Status = "finished"
-	StatusError        Status = "error"
-	StatusInterrupted  Status = "interrupted"
+	StatusIdle        Status = "idle"
+	StatusRunning     Status = "running"
+	StatusFinished    Status = "finished"
+	StatusError       Status = "error"
+	StatusInterrupted Status = "interrupted"
 )
 
 // AgentState holds the mutable conversation state across turns.
@@ -137,6 +137,7 @@ func (s *AgentState) TotalUsage() TokenUsage {
 
 // Snapshot serializes the current state for persistence / resume.
 type StateSnapshot struct {
+	Version         int              `json:"version,omitempty"`
 	Status          Status           `json:"status"`
 	Messages        []Message        `json:"messages"`
 	Turn            int64            `json:"turn"`
@@ -157,6 +158,7 @@ func (s *AgentState) Snapshot() StateSnapshot {
 		ir = &c
 	}
 	return StateSnapshot{
+		Version:         CurrentStateSnapshotVersion,
 		Status:          s.status,
 		Messages:        msgs,
 		Turn:            s.turn,

@@ -14,6 +14,7 @@ type ToolFunc func(ctx context.Context, args json.RawMessage) (any, error)
 type Tool struct {
 	Name        string
 	Description string
+	Tags        []string
 	Parameters  map[string]any
 	Func        ToolFunc
 	Before      []BeforeHook
@@ -26,6 +27,7 @@ func (t *Tool) Definition() ToolDefinition {
 		Name:        t.Name,
 		Description: t.Description,
 		Parameters:  t.Parameters,
+		SearchTerms: append([]string(nil), t.Tags...),
 	}
 }
 

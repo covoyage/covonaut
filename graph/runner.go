@@ -12,8 +12,8 @@ import (
 type RunMode string
 
 const (
-	RunModeDAG    RunMode = "dag"
-	RunModePregl  RunMode = "pregel"
+	RunModeDAG   RunMode = "dag"
+	RunModePregl RunMode = "pregel"
 )
 
 // NodeTriggerMode controls when a node fires.
@@ -33,31 +33,35 @@ type RunnerConfig struct {
 	MaxSteps int64
 	Store    CheckpointStore // optional: enable checkpointing
 	StateFn  GenStateFn      // optional: per-run GraphState generator
+	Tracer   agentcore.Tracer
 }
 
 // Runner is the unified execution engine for both DAG and Pregel graphs.
 // It replaces the separate CompiledGraph.Run() and CompiledPregelGraph.Run()
 // with a single execution model.
 type Runner struct {
-	nodes       map[string]Step
-	streamNodes map[string]agentcore.StreamStep
-	edges       map[string][]string
-	revEdges    map[string][]string
-	entry       string
-	config      RunnerConfig
-	sorted      [][]string // only for DAG mode
-	stateFn     GenStateFn
+	nodes                    map[string]Step
+	streamNodes              map[string]agentcore.StreamStep
+	edges                    map[string][]string
+	conditionals             map[string]conditionalEdge
+	pregelConditionals       map[string]PregelEdgeRouter
+	pregelConditionalTargets map[string][]string
+	pregelNodes              map[string]PregelNode
+	pregelState              *PregelState
+	revEdges                 map[string][]string
+	entry                    string
+	config                   RunnerConfig
+	sorted                   [][]string // only for DAG mode
+	stateFn                  GenStateFn
 }
 
 // NewDAGRunner creates a runner from a CompiledGraph.
 func NewDAGRunner(cg *CompiledGraph, opts ...RunnerConfig) *Runner {
-	cfg := RunnerConfig{Mode: RunModeDAG, Trigger: TriggerAllPredecessors, MaxSteps: cg.MaxSteps}
+	cfg := RunnerConfig{Mode: RunModeDAG, Trigger: TriggerAllPredecessors, MaxSteps: cg.MaxSteps, Tracer: cg.Tracer}
 	stateFn := cg.StateFn
 	if len(opts) > 0 {
 		cfg = opts[0]
-		if cfg.Mode == "" {
-			cfg.Mode = RunModeDAG
-		}
+		cfg.Mode = RunModeDAG
 		if cfg.Trigger == "" {
 			cfg.Trigger = TriggerAllPredecessors
 		}
@@ -66,6 +70,9 @@ func NewDAGRunner(cg *CompiledGraph, opts ...RunnerConfig) *Runner {
 		}
 		if cfg.StateFn != nil {
 			stateFn = cfg.StateFn
+		}
+		if cfg.Tracer == nil {
+			cfg.Tracer = cg.Tracer
 		}
 	}
 
@@ -80,26 +87,26 @@ func NewDAGRunner(cg *CompiledGraph, opts ...RunnerConfig) *Runner {
 	}
 
 	return &Runner{
-		nodes:       cg.graph.nodes,
-		streamNodes: streamNodes,
-		edges:       cg.graph.edges,
-		revEdges:    revEdges,
-		entry:       cg.Entry,
-		config:      cfg,
-		sorted:      cg.Sorted,
-		stateFn:     stateFn,
+		nodes:        cg.graph.nodes,
+		streamNodes:  streamNodes,
+		edges:        cg.graph.edges,
+		conditionals: cg.graph.conditionalEdges,
+		revEdges:     revEdges,
+		entry:        cg.Entry,
+		config:       cfg,
+		sorted:       cg.Sorted,
+		stateFn:      stateFn,
 	}
 }
 
-// NewPregelRunner creates a runner from a CompiledPregelGraph by wrapping
-// PregelNodes as Steps operating on shared state.
+// NewPregelRunner creates a runner from a CompiledPregelGraph. Each superstep
+// gives active nodes independent clones of one shared snapshot, then merges
+// their outputs deterministically after all nodes finish.
 func NewPregelRunner(cpg *CompiledPregelGraph, state *PregelState, opts ...RunnerConfig) *Runner {
 	cfg := RunnerConfig{Mode: RunModePregl, Trigger: TriggerAnyPredecessor, MaxSteps: cpg.maxSteps}
 	if len(opts) > 0 {
 		cfg = opts[0]
-		if cfg.Mode == "" {
-			cfg.Mode = RunModePregl
-		}
+		cfg.Mode = RunModePregl
 		if cfg.Trigger == "" {
 			cfg.Trigger = TriggerAnyPredecessor
 		}
@@ -107,12 +114,11 @@ func NewPregelRunner(cpg *CompiledPregelGraph, state *PregelState, opts ...Runne
 			cfg.MaxSteps = cpg.maxSteps
 		}
 	}
-
-	nodes := make(map[string]Step)
-	var stateMu sync.Mutex
-	for name, fn := range cpg.pg.nodes {
-		nodeFn := fn
-		nodes[name] = &pregelStepAdapter{fn: nodeFn, state: state, stateMu: &stateMu}
+	if state == nil {
+		internalState := PregelState{}
+		state = &internalState
+	} else if *state == nil {
+		*state = PregelState{}
 	}
 
 	revEdges := make(map[string][]string)
@@ -125,36 +131,21 @@ func NewPregelRunner(cpg *CompiledPregelGraph, state *PregelState, opts ...Runne
 	}
 
 	return &Runner{
-		nodes:    nodes,
-		edges:    cpg.pg.edges,
-		revEdges: revEdges,
-		entry:    cpg.entry,
-		config:   cfg,
+		edges:                    cpg.pg.edges,
+		revEdges:                 revEdges,
+		entry:                    cpg.entry,
+		config:                   cfg,
+		pregelConditionals:       cpg.pg.conditionalEdges,
+		pregelConditionalTargets: cpg.pg.conditionalTargets,
+		pregelNodes:              cpg.pg.nodes,
+		pregelState:              state,
 	}
-}
-
-type pregelStepAdapter struct {
-	fn      PregelNode
-	state   *PregelState
-	stateMu *sync.Mutex
-}
-
-func (a *pregelStepAdapter) Run(ctx context.Context, _ string) (string, error) {
-	stateClone := a.state.Clone()
-	out, err := a.fn(ctx, stateClone)
-	if err != nil {
-		return "", err
-	}
-	a.stateMu.Lock()
-	for k, v := range out {
-		(*a.state)[k] = v
-	}
-	a.stateMu.Unlock()
-	return "ok", nil
 }
 
 // Run executes the graph using the configured mode.
 func (r *Runner) Run(ctx context.Context, input string) (string, error) {
+	ctx, span, _ := agentcore.StartComponentRun(ctx, r.config.Tracer, "graph", r.entry)
+	defer span.End()
 	switch r.config.Mode {
 	case RunModeDAG:
 		return r.runDAG(ctx, input)
@@ -174,6 +165,11 @@ func (r *Runner) RunStream(ctx context.Context, input string) (*agentcore.Stream
 	if r.config.Mode != RunModeDAG {
 		return nil, fmt.Errorf("streaming mode only supports RunModeDAG")
 	}
+	if len(r.conditionals) > 0 {
+		return nil, fmt.Errorf("streaming mode does not support output-based conditional edges")
+	}
+	ctx, span, _ := agentcore.StartComponentRun(ctx, r.config.Tracer, "graph", r.entry)
+	defer span.End()
 	if r.stateFn != nil {
 		state := r.stateFn(ctx)
 		if state != nil {
@@ -217,8 +213,11 @@ func (r *Runner) RunStream(ctx context.Context, input string) (*agentcore.Stream
 			wg.Add(1)
 			go func(nodeName string, ss agentcore.StreamStep, in *agentcore.StreamReader[string]) {
 				defer wg.Done()
-				out, err := ss.RunStream(ctx, in)
+				nodeCtx, span, _ := agentcore.StartComponentRun(ctx, r.config.Tracer, "graph_node", nodeName)
+				defer span.End()
+				out, err := ss.RunStream(nodeCtx, in)
 				if err != nil {
+					span.RecordError(err)
 					errCh <- agentcore.WrapNodeError(err, "runner:dag:stream:"+nodeName)
 					return
 				}
@@ -331,7 +330,12 @@ func (r *Runner) runDAG(ctx context.Context, input string) (string, error) {
 			wg.Add(1)
 			go func(nodeName, nodeIn string) {
 				defer wg.Done()
-				out, err := r.runnerGetNode(nodeName).Run(ctx, nodeIn)
+				nodeCtx, span, _ := agentcore.StartComponentRun(ctx, r.config.Tracer, "graph_node", nodeName)
+				defer span.End()
+				out, err := r.runnerGetNode(nodeName).Run(nodeCtx, nodeIn)
+				if err != nil {
+					span.RecordError(err)
+				}
 				mu.Lock()
 				results[nodeName] = out
 				errs[nodeName] = err
@@ -348,8 +352,23 @@ func (r *Runner) runDAG(ctx context.Context, input string) (string, error) {
 		}
 		for name, out := range results {
 			outputs[name] = out
-			for _, to := range r.edges[name] {
-				outputs[to] = ""
+			if conditional, ok := r.conditionals[name]; ok {
+				target := conditional.route(ctx, out)
+				matched := false
+				for _, candidate := range conditional.targets {
+					if candidate == target {
+						outputs[target] = ""
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					return "", agentcore.NewNodeError("conditional edge: no matching target", nil, "runner:dag", name, target)
+				}
+				continue
+			}
+			for _, target := range r.edges[name] {
+				outputs[target] = ""
 			}
 		}
 	}
@@ -392,21 +411,29 @@ func (r *Runner) runPregelStyle(ctx context.Context, input string) (string, erro
 		var nextActive []string
 		nextSet := make(map[string]bool)
 
+		baseState := r.pregelState.Clone()
+		results := make(map[string]PregelState, len(active))
 		errs := make(map[string]error)
 		var mu sync.Mutex
 		var wg sync.WaitGroup
 
 		for _, name := range active {
-			node, ok := r.nodes[name]
+			node, ok := r.pregelNodes[name]
 			if !ok {
 				return "", agentcore.NewNodeError("node not found", nil, "runner:pregel", name)
 			}
 
 			wg.Add(1)
-			go func(nodeName string, step Step) {
+			go func(nodeName string, nodeFn PregelNode) {
 				defer wg.Done()
-				_, err := step.Run(ctx, input)
+				nodeCtx, span, _ := agentcore.StartComponentRun(ctx, r.config.Tracer, "graph_node", nodeName)
+				output, err := nodeFn(nodeCtx, baseState.Clone())
+				if err != nil {
+					span.RecordError(err)
+				}
+				span.End()
 				mu.Lock()
+				results[nodeName] = output
 				errs[nodeName] = err
 				mu.Unlock()
 			}(name, node)
@@ -417,6 +444,11 @@ func (r *Runner) runPregelStyle(ctx context.Context, input string) (string, erro
 		for name, err := range errs {
 			if err != nil {
 				return "", agentcore.WrapNodeError(err, "runner:pregel:"+name)
+			}
+		}
+		for _, name := range active {
+			for key, value := range results[name] {
+				(*r.pregelState)[key] = value
 			}
 		}
 
@@ -432,12 +464,46 @@ func (r *Runner) runPregelStyle(ctx context.Context, input string) (string, erro
 					}
 				}
 			}
+			if router, ok := r.pregelConditionals[name]; ok {
+				state := r.pregelState.Clone()
+				for _, target := range router(ctx, state) {
+					if err := r.validatePregelTarget(name, target); err != nil {
+						return "", err
+					}
+					if target == PregelEnd {
+						return "done", nil
+					}
+					if !nextSet[target] {
+						nextSet[target] = true
+						nextActive = append(nextActive, target)
+					}
+				}
+			}
 		}
 
 		active = nextActive
 	}
 
 	return "done", nil
+}
+
+func (r *Runner) validatePregelTarget(source, target string) error {
+	declared := r.pregelConditionalTargets[source]
+	if len(declared) > 0 {
+		for _, candidate := range declared {
+			if candidate == target {
+				return nil
+			}
+		}
+		return agentcore.NewNodeError("conditional edge returned undeclared target", nil, "runner:pregel", source, target)
+	}
+	if target == PregelEnd {
+		return nil
+	}
+	if _, ok := r.pregelNodes[target]; !ok {
+		return agentcore.NewNodeError("conditional edge returned unknown target", nil, "runner:pregel", source, target)
+	}
+	return nil
 }
 
 func (r *Runner) resolveInput(name, graphInput string, outputs map[string]string) string {

@@ -176,6 +176,29 @@ func TestConvertMessageDeltaEvent(t *testing.T) {
 	}
 }
 
+func TestConvertMessageResetClosesActiveMessage(t *testing.T) {
+	c := NewConverter("t1", "r1")
+	delta := makeEvent[agentcore.MessageDeltaEvent](agentcore.EventMessageDelta, map[string]any{"delta": "partial", "attempt_id": "attempt-1"})
+	started := c.Convert(delta)
+	start, ok := started[0].(TextMessageStartEvent)
+	if !ok {
+		t.Fatalf("start event = %#v", started)
+	}
+	reset := makeEvent[agentcore.MessageResetEvent](agentcore.EventMessageReset, map[string]any{"attempt_id": "attempt-1", "reason": "provider failed"})
+	events := c.Convert(reset)
+	if len(events) != 2 {
+		t.Fatalf("reset events = %#v", events)
+	}
+	end, ok := events[0].(TextMessageEndEvent)
+	if !ok || end.MessageID != start.MessageID {
+		t.Fatalf("end event = %#v", events[0])
+	}
+	custom, ok := events[1].(CustomEvent)
+	if !ok || custom.Name != "message_reset" {
+		t.Fatalf("custom event = %#v", events[1])
+	}
+}
+
 func TestConvertMessageDeltaStreamWithEnd(t *testing.T) {
 	c := NewConverter("t1", "r1")
 

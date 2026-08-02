@@ -224,7 +224,7 @@ pg := graph.NewPregelGraph()
 pg.AddNode("agent", agentNode)
 pg.AddNode("tools", toolsNode)
 pg.AddEdge("tools", "agent")
-pg.SetConditionalEdge("agent", func(ctx context.Context, state graph.PregelState) []string {
+pg.SetConditionalEdgeWithTargets("agent", []string{"tools", graph.PregelEnd}, func(ctx context.Context, state graph.PregelState) []string {
     if state.GetString("done") == "true" {
         return []string{graph.PregelEnd}
     }
@@ -244,6 +244,76 @@ runner := graph.NewPregelRunner(compiledPregelGraph, &state)
 
 output, _ := runner.Run(ctx, input)
 ```
+
+Compiled DAG and Pregel graphs expose deterministic introspection, diagnostics,
+conditional targets, and Mermaid export. Typed nodes keep their internal
+`Runnable[I, O]` boundary while using explicit codecs to remain compatible with
+the string graph engine:
+
+```go
+info := compiledGraph.Info()
+diagram := compiledGraph.Mermaid()
+
+graph.AddTypedNode(g, graph.TypedNode[int, Result]{
+    Name:     "calculate",
+    Runnable: calculationRunnable,
+    Decode:   parseInteger,
+    Encode:   graph.JSONEncode[Result],
+})
+```
+
+For homogeneous pipelines, `TypedGraph[T]` keeps values typed through nodes,
+parallel branches, fan-in merges, and terminal outputs without string or JSON
+conversion:
+
+```go
+typed := graph.NewTypedGraph[Document]()
+typed.AddNode("load", loadRunnable)
+typed.AddNode("enrich", enrichRunnable)
+typed.AddEdge("load", "enrich")
+
+compiled, _ := typed.Compile(graph.TypedCompileOptions[Document]{
+    EntryNode: "load",
+})
+result, _ := compiled.Run(ctx, inputDocument)
+```
+
+### Runtime Reliability
+
+Large tool registries can expose only relevant definitions per model request,
+provider failures can move through an ordered model chain, and large tool
+results can be offloaded to retrievable artifacts:
+
+```go
+artifactStore := agentcore.NewMemoryArtifactStore()
+semanticSelector := &agentcore.EmbeddingToolSelector{
+    Embed: embeddingService.Embed,
+    MinScore: 0.6,
+    Fallback: agentcore.KeywordToolSelector{},
+}
+agent := agentcore.New(agentcore.NewConfig(
+    agentcore.WithToolSelection(&agentcore.ToolSelectionConfig{
+        Selector: semanticSelector,
+        MaxVisible: 12,
+    }),
+    agentcore.WithModelFailover(&agentcore.ModelFailoverConfig{
+        Targets: []agentcore.ModelTarget{
+            {Name: "backup", Model: "backup-model", Provider: backupProvider},
+        },
+    }),
+    agentcore.WithArtifactOffload(&agentcore.ArtifactOffloadConfig{
+        Store: artifactStore,
+    }),
+))
+```
+
+Before each provider call, incomplete tool-call history is normalized with
+synthetic interrupted results. Streaming deltas carry an `AttemptID`; failed
+attempts emit `message_reset` before retry or failover so UIs can retract stale
+partial output. Checkpoints and ordinary `Store` snapshots share schema
+migrations configured with `WithStateMigrators`. Agent, model, tool, graph, and
+workflow executions propagate correlated `agentcore.RunInfo` through both
+`context.Context`, EventBus events, SSE envelopes, and configured tracers.
 
 ### Session Management
 

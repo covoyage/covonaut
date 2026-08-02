@@ -88,11 +88,12 @@ type MCPStreamRefreshEvent struct {
 }
 
 type AgentStreamEvent struct {
-	Schema    string    `json:"schema"`
-	Type      string    `json:"type"`
-	ThreadID  string    `json:"thread_id,omitempty"`
-	Timestamp time.Time `json:"timestamp"`
-	Payload   any       `json:"payload"`
+	Schema    string             `json:"schema"`
+	Type      string             `json:"type"`
+	ThreadID  string             `json:"thread_id,omitempty"`
+	Timestamp time.Time          `json:"timestamp"`
+	RunInfo   *agentcore.RunInfo `json:"run_info,omitempty"`
+	Payload   any                `json:"payload"`
 }
 
 type SkillsSnapshotStreamEvent struct {
@@ -154,7 +155,23 @@ type TurnEndStreamPayload struct {
 }
 
 type MessageDeltaStreamPayload struct {
-	Delta string `json:"delta"`
+	Delta     string `json:"delta"`
+	Kind      string `json:"kind,omitempty"`
+	AttemptID string `json:"attempt_id,omitempty"`
+}
+
+type MessageResetStreamPayload struct {
+	AttemptID string `json:"attempt_id"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+type ModelFailoverStreamPayload struct {
+	Attempt   int    `json:"attempt"`
+	From      string `json:"from,omitempty"`
+	To        string `json:"to,omitempty"`
+	FromModel string `json:"from_model,omitempty"`
+	ToModel   string `json:"to_model,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 type ToolCallStartStreamPayload struct {
@@ -277,13 +294,17 @@ func streamEventPayload(threadID string, e agentcore.Event) any {
 }
 
 func agentEventEnvelope(threadID string, e agentcore.Event) AgentStreamEvent {
-	return AgentStreamEvent{
+	envelope := AgentStreamEvent{
 		Schema:    streamSchemaAgentEvent,
 		Type:      string(e.EventKind()),
 		ThreadID:  threadID,
 		Timestamp: e.EventTime(),
 		Payload:   agentEventPayload(e),
 	}
+	if info, ok := agentcore.EventRunInfo(e); ok {
+		envelope.RunInfo = &info
+	}
+	return envelope
 }
 
 func agentEventPayload(e agentcore.Event) any {
@@ -371,9 +392,17 @@ func agentEventPayload(e agentcore.Event) any {
 			Usage: ev.Usage,
 		}
 	case agentcore.MessageDeltaEvent:
-		return MessageDeltaStreamPayload{Delta: ev.Delta}
+		return MessageDeltaStreamPayload{Delta: ev.Delta, Kind: string(ev.Kind), AttemptID: ev.AttemptID}
 	case *agentcore.MessageDeltaEvent:
-		return MessageDeltaStreamPayload{Delta: ev.Delta}
+		return MessageDeltaStreamPayload{Delta: ev.Delta, Kind: string(ev.Kind), AttemptID: ev.AttemptID}
+	case agentcore.MessageResetEvent:
+		return MessageResetStreamPayload{AttemptID: ev.AttemptID, Reason: ev.Reason}
+	case *agentcore.MessageResetEvent:
+		return MessageResetStreamPayload{AttemptID: ev.AttemptID, Reason: ev.Reason}
+	case agentcore.ModelFailoverEvent:
+		return ModelFailoverStreamPayload{Attempt: ev.Attempt, From: ev.From, To: ev.To, FromModel: ev.FromModel, ToModel: ev.ToModel, Error: util.ErrorString(ev.Err)}
+	case *agentcore.ModelFailoverEvent:
+		return ModelFailoverStreamPayload{Attempt: ev.Attempt, From: ev.From, To: ev.To, FromModel: ev.FromModel, ToModel: ev.ToModel, Error: util.ErrorString(ev.Err)}
 	case agentcore.ToolCallStartEvent:
 		return ToolCallStartStreamPayload{ToolCall: ev.ToolCall}
 	case *agentcore.ToolCallStartEvent:

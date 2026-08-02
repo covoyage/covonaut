@@ -1,5 +1,7 @@
 package agentcore
 
+import "fmt"
+
 // Role represents the sender of a message in a conversation.
 type Role string
 
@@ -138,6 +140,45 @@ func DefaultConvertToLLM(msgs []Message) []Message {
 			out = append(out, Message{
 				Role:    msg.Role,
 				Content: msg.Content,
+			})
+		}
+	}
+	return out
+}
+
+// NormalizeToolCallHistory inserts synthetic tool results for assistant tool
+// calls that do not have a matching result in the immediately following tool
+// message group. The returned slice is safe to send to providers that require
+// every tool call to have a corresponding result.
+func NormalizeToolCallHistory(msgs []Message) []Message {
+	if len(msgs) == 0 {
+		return nil
+	}
+
+	out := make([]Message, 0, len(msgs))
+	for i := 0; i < len(msgs); i++ {
+		msg := msgs[i]
+		out = append(out, msg)
+		if msg.Role != RoleAssistant || len(msg.ToolCalls) == 0 {
+			continue
+		}
+
+		matched := make(map[string]bool, len(msg.ToolCalls))
+		for i+1 < len(msgs) && msgs[i+1].Role == RoleTool {
+			i++
+			toolMsg := msgs[i]
+			matched[toolMsg.ToolCallID] = true
+			out = append(out, toolMsg)
+		}
+		for _, call := range msg.ToolCalls {
+			if call.ID == "" || matched[call.ID] {
+				continue
+			}
+			out = append(out, Message{
+				Role:       RoleTool,
+				ToolCallID: call.ID,
+				Name:       call.Name,
+				Content:    fmt.Sprintf("Tool call %s was interrupted before it produced a result.", call.Name),
 			})
 		}
 	}

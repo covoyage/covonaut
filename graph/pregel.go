@@ -99,16 +99,18 @@ type PregelNode func(ctx context.Context, state PregelState) (PregelState, error
 type PregelEdgeRouter func(ctx context.Context, state PregelState) []string
 
 type PregelGraph struct {
-	nodes            map[string]PregelNode
-	edges            map[string][]string
-	conditionalEdges map[string]PregelEdgeRouter
+	nodes              map[string]PregelNode
+	edges              map[string][]string
+	conditionalEdges   map[string]PregelEdgeRouter
+	conditionalTargets map[string][]string
 }
 
 func NewPregelGraph() *PregelGraph {
 	return &PregelGraph{
-		nodes:            make(map[string]PregelNode),
-		edges:            make(map[string][]string),
-		conditionalEdges: make(map[string]PregelEdgeRouter),
+		nodes:              make(map[string]PregelNode),
+		edges:              make(map[string][]string),
+		conditionalEdges:   make(map[string]PregelEdgeRouter),
+		conditionalTargets: make(map[string][]string),
 	}
 }
 
@@ -137,10 +139,28 @@ func (pg *PregelGraph) AddEdge(from, to string) error {
 }
 
 func (pg *PregelGraph) SetConditionalEdge(from string, router PregelEdgeRouter) error {
+	return pg.SetConditionalEdgeWithTargets(from, nil, router)
+}
+
+// SetConditionalEdgeWithTargets registers a dynamic router and declares its
+// possible targets for validation, introspection, and visualization.
+func (pg *PregelGraph) SetConditionalEdgeWithTargets(from string, targets []string, router PregelEdgeRouter) error {
 	if _, ok := pg.nodes[from]; !ok {
 		return fmt.Errorf("pregel: unknown source node %q", from)
 	}
+	if router == nil {
+		return fmt.Errorf("pregel: conditional router is required")
+	}
+	for _, target := range targets {
+		if target == PregelEnd {
+			continue
+		}
+		if _, ok := pg.nodes[target]; !ok {
+			return fmt.Errorf("pregel: unknown conditional target node %q", target)
+		}
+	}
 	pg.conditionalEdges[from] = router
+	pg.conditionalTargets[from] = append([]string(nil), targets...)
 	return nil
 }
 
@@ -230,6 +250,9 @@ func (cpg *CompiledPregelGraph) Run(ctx context.Context, initial PregelState) (P
 			if router, ok := cpg.pg.conditionalEdges[name]; ok {
 				targets := router(ctx, state)
 				for _, t := range targets {
+					if err := cpg.pg.validateConditionalTarget(name, t); err != nil {
+						return state, err
+					}
 					if t == PregelEnd {
 						return state, nil
 					}
@@ -323,6 +346,9 @@ func (pc *PregelCheckpointer) RunWithCheckpoints(ctx context.Context, initial Pr
 			}
 			if router, ok := pc.graph.pg.conditionalEdges[name]; ok {
 				for _, t := range router(ctx, state) {
+					if err := pc.graph.pg.validateConditionalTarget(name, t); err != nil {
+						return state, err
+					}
 					if t == PregelEnd {
 						return state, nil
 					}
@@ -338,4 +364,23 @@ func (pc *PregelCheckpointer) RunWithCheckpoints(ctx context.Context, initial Pr
 	}
 
 	return state, nil
+}
+
+func (pg *PregelGraph) validateConditionalTarget(source, target string) error {
+	declared := pg.conditionalTargets[source]
+	if len(declared) > 0 {
+		for _, candidate := range declared {
+			if candidate == target {
+				return nil
+			}
+		}
+		return agentcore.NewNodeError("conditional edge returned undeclared target", nil, "pregel", source, target)
+	}
+	if target == PregelEnd {
+		return nil
+	}
+	if _, ok := pg.nodes[target]; !ok {
+		return agentcore.NewNodeError("conditional edge returned unknown target", nil, "pregel", source, target)
+	}
+	return nil
 }

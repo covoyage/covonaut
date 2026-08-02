@@ -843,6 +843,26 @@ func TestStreamEventPayloadFallsBackForUnknownEvent(t *testing.T) {
 	}
 }
 
+func TestStreamEventPayloadIncludesRunInfoAndReset(t *testing.T) {
+	var reset agentcore.MessageResetEvent
+	if err := json.Unmarshal([]byte(`{"type":"message_reset","timestamp":"2026-01-01T00:00:00Z","attempt_id":"attempt-1","reason":"provider failed"}`), &reset); err != nil {
+		t.Fatal(err)
+	}
+	agentcore.WithEventRunInfo(&reset, agentcore.RunInfo{RunID: "run-1", ParentRunID: "parent-1", Component: "model", Name: "backup"})
+	payload := streamEventPayload("thread-1", &reset)
+	envelope, ok := payload.(AgentStreamEvent)
+	if !ok {
+		t.Fatalf("payload type = %T", payload)
+	}
+	if envelope.RunInfo == nil || envelope.RunInfo.RunID != "run-1" || envelope.RunInfo.ParentRunID != "parent-1" {
+		t.Fatalf("run info = %#v", envelope.RunInfo)
+	}
+	resetPayload, ok := envelope.Payload.(MessageResetStreamPayload)
+	if !ok || resetPayload.AttemptID != "attempt-1" || resetPayload.Reason != "provider failed" {
+		t.Fatalf("reset payload = %#v", envelope.Payload)
+	}
+}
+
 func TestServerChatThreadPersistsConversationState(t *testing.T) {
 	store := newMemoryStore()
 	srv := New(agentcore.Config{

@@ -19,6 +19,7 @@ const (
 	ChatEventTurnStart          ChatEventType = "turn_start"
 	ChatEventTurnEnd            ChatEventType = "turn_end"
 	ChatEventMessageDelta       ChatEventType = "message_delta"
+	ChatEventMessageReset       ChatEventType = "message_reset"
 	ChatEventToolCallStart      ChatEventType = "tool_call_start"
 	ChatEventToolCallEnd        ChatEventType = "tool_call_end"
 	ChatEventHandoffStart       ChatEventType = "handoff_start"
@@ -67,11 +68,19 @@ type TurnEndChatEvent struct {
 func (TurnEndChatEvent) ChatEventKind() ChatEventType { return ChatEventTurnEnd }
 
 type MessageDeltaChatEvent struct {
-	Delta string
-	Kind  string // "text" or "thinking"
+	Delta     string
+	Kind      string // "text" or "thinking"
+	AttemptID string
 }
 
 func (MessageDeltaChatEvent) ChatEventKind() ChatEventType { return ChatEventMessageDelta }
+
+type MessageResetChatEvent struct {
+	AttemptID string
+	Reason    string
+}
+
+func (MessageResetChatEvent) ChatEventKind() ChatEventType { return ChatEventMessageReset }
 
 type ToolCallInfo struct {
 	ID        string

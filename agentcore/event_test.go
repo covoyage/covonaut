@@ -6,6 +6,14 @@ import (
 	"time"
 )
 
+func TestEventRunInfoRejectsIncompleteMetadata(t *testing.T) {
+	event := &AgentStartEvent{baseEvent: newBase(EventAgentStart)}
+	WithEventRunInfo(event, RunInfo{Component: "agent"})
+	if info, ok := EventRunInfo(event); ok {
+		t.Fatalf("unexpected incomplete run info: %#v", info)
+	}
+}
+
 func TestEventBus_EmitNonBlocking(t *testing.T) {
 	eb := NewEventBus()
 	defer eb.Close()

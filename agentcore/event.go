@@ -26,6 +26,8 @@ const (
 	EventTurnStart          EventType = "turn_start"
 	EventTurnEnd            EventType = "turn_end"
 	EventMessageDelta       EventType = "message_delta"
+	EventMessageReset       EventType = "message_reset"
+	EventModelFailover      EventType = "model_failover"
 	EventToolCallStart      EventType = "tool_call_start"
 	EventToolCallEnd        EventType = "tool_call_end"
 	EventHandoffStart       EventType = "handoff_start"
@@ -46,6 +48,7 @@ type Event interface {
 type baseEvent struct {
 	Kind EventType `json:"type"`
 	At   time.Time `json:"timestamp"`
+	Run  *RunInfo  `json:"run_info,omitempty"`
 }
 
 func (e baseEvent) EventKind() EventType { return e.Kind }
@@ -53,6 +56,39 @@ func (e baseEvent) EventTime() time.Time { return e.At }
 
 func newBase(t EventType) baseEvent {
 	return baseEvent{Kind: t, At: time.Now()}
+}
+
+// EventRunInfo returns correlated execution metadata when the event was
+// emitted from a component run context.
+func EventRunInfo(event Event) (RunInfo, bool) {
+	type carrier interface {
+		eventRunInfo() *RunInfo
+	}
+	value, ok := event.(carrier)
+	if !ok || value.eventRunInfo() == nil {
+		return RunInfo{}, false
+	}
+	info := *value.eventRunInfo()
+	if info.RunID == "" || info.Component == "" {
+		return RunInfo{}, false
+	}
+	info.Path = append([]string(nil), info.Path...)
+	return info, true
+}
+
+func (e baseEvent) eventRunInfo() *RunInfo { return e.Run }
+
+func (e *baseEvent) setEventRunInfo(info *RunInfo) { e.Run = info }
+
+// WithEventRunInfo attaches a defensive copy of execution metadata to a
+// framework event. Events not implemented by agentcore are returned unchanged.
+func WithEventRunInfo(event Event, info RunInfo) Event {
+	copy := info
+	copy.Path = append([]string(nil), info.Path...)
+	if carrier, ok := event.(interface{ setEventRunInfo(*RunInfo) }); ok {
+		carrier.setEventRunInfo(&copy)
+	}
+	return event
 }
 
 type AgentStartEvent struct {
@@ -134,8 +170,29 @@ type TurnEndEvent struct {
 
 type MessageDeltaEvent struct {
 	baseEvent
-	Delta string    `json:"delta"`
-	Kind  BlockKind `json:"kind,omitempty"`
+	Delta     string    `json:"delta"`
+	Kind      BlockKind `json:"kind,omitempty"`
+	AttemptID string    `json:"attempt_id,omitempty"`
+}
+
+// MessageResetEvent retracts all deltas emitted for one failed streaming
+// attempt. Streaming consumers should discard that attempt before rendering
+// deltas from a retry or failover target.
+type MessageResetEvent struct {
+	baseEvent
+	AttemptID string `json:"attempt_id"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// ModelFailoverEvent reports a switch to an alternate provider/model target.
+type ModelFailoverEvent struct {
+	baseEvent
+	Attempt   int    `json:"attempt"`
+	From      string `json:"from,omitempty"`
+	To        string `json:"to,omitempty"`
+	FromModel string `json:"from_model,omitempty"`
+	ToModel   string `json:"to_model,omitempty"`
+	Err       error  `json:"-"`
 }
 
 type ToolCallStartEvent struct {
@@ -208,15 +265,17 @@ func (e AgentErrorEvent) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		Type      EventType `json:"type"`
 		Timestamp time.Time `json:"timestamp"`
+		RunInfo   *RunInfo  `json:"run_info,omitempty"`
 		Error     string    `json:"error"`
 		ErrorType string    `json:"error_type,omitempty"`
-	}{e.Kind, e.At, util.ErrorString(e.Err), errorType(e.Err)})
+	}{e.Kind, e.At, e.Run, util.ErrorString(e.Err), errorType(e.Err)})
 }
 
 func (e *AgentErrorEvent) UnmarshalJSON(data []byte) error {
 	var raw struct {
 		Type      EventType `json:"type"`
 		Timestamp time.Time `json:"timestamp"`
+		RunInfo   *RunInfo  `json:"run_info,omitempty"`
 		Error     string    `json:"error"`
 		ErrorType string    `json:"error_type,omitempty"`
 	}
@@ -225,6 +284,7 @@ func (e *AgentErrorEvent) UnmarshalJSON(data []byte) error {
 	}
 	e.Kind = raw.Type
 	e.At = raw.Timestamp
+	e.Run = raw.RunInfo
 	if raw.Error != "" {
 		e.Err = reconstructError(raw.Error, raw.ErrorType)
 	}
@@ -235,19 +295,21 @@ func (e ToolCallEndEvent) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		Type       EventType     `json:"type"`
 		Timestamp  time.Time     `json:"timestamp"`
+		RunInfo    *RunInfo      `json:"run_info,omitempty"`
 		ToolCallID string        `json:"tool_call_id"`
 		ToolName   string        `json:"tool_name"`
 		Result     string        `json:"result"`
 		Duration   time.Duration `json:"duration"`
 		Error      string        `json:"error,omitempty"`
 		ErrorType  string        `json:"error_type,omitempty"`
-	}{e.Kind, e.At, e.ToolCallID, e.ToolName, e.Result, e.Duration, util.ErrorString(e.Err), errorType(e.Err)})
+	}{e.Kind, e.At, e.Run, e.ToolCallID, e.ToolName, e.Result, e.Duration, util.ErrorString(e.Err), errorType(e.Err)})
 }
 
 func (e *ToolCallEndEvent) UnmarshalJSON(data []byte) error {
 	var raw struct {
 		Type       EventType     `json:"type"`
 		Timestamp  time.Time     `json:"timestamp"`
+		RunInfo    *RunInfo      `json:"run_info,omitempty"`
 		ToolCallID string        `json:"tool_call_id"`
 		ToolName   string        `json:"tool_name"`
 		Result     string        `json:"result"`
@@ -260,6 +322,7 @@ func (e *ToolCallEndEvent) UnmarshalJSON(data []byte) error {
 	}
 	e.Kind = raw.Type
 	e.At = raw.Timestamp
+	e.Run = raw.RunInfo
 	e.ToolCallID = raw.ToolCallID
 	e.ToolName = raw.ToolName
 	e.Result = raw.Result
@@ -274,18 +337,20 @@ func (e HandoffEndEvent) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		Type        EventType     `json:"type"`
 		Timestamp   time.Time     `json:"timestamp"`
+		RunInfo     *RunInfo      `json:"run_info,omitempty"`
 		TargetAgent string        `json:"target_agent"`
 		Output      string        `json:"output"`
 		Duration    time.Duration `json:"duration"`
 		Error       string        `json:"error,omitempty"`
 		ErrorType   string        `json:"error_type,omitempty"`
-	}{e.Kind, e.At, e.TargetAgent, e.Output, e.Duration, util.ErrorString(e.Err), errorType(e.Err)})
+	}{e.Kind, e.At, e.Run, e.TargetAgent, e.Output, e.Duration, util.ErrorString(e.Err), errorType(e.Err)})
 }
 
 func (e *HandoffEndEvent) UnmarshalJSON(data []byte) error {
 	var raw struct {
 		Type        EventType     `json:"type"`
 		Timestamp   time.Time     `json:"timestamp"`
+		RunInfo     *RunInfo      `json:"run_info,omitempty"`
 		TargetAgent string        `json:"target_agent"`
 		Output      string        `json:"output"`
 		Duration    time.Duration `json:"duration"`
@@ -297,6 +362,7 @@ func (e *HandoffEndEvent) UnmarshalJSON(data []byte) error {
 	}
 	e.Kind = raw.Type
 	e.At = raw.Timestamp
+	e.Run = raw.RunInfo
 	e.TargetAgent = raw.TargetAgent
 	e.Output = raw.Output
 	e.Duration = raw.Duration
@@ -310,18 +376,20 @@ func (e AutoRetryEvent) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		Type       EventType     `json:"type"`
 		Timestamp  time.Time     `json:"timestamp"`
+		RunInfo    *RunInfo      `json:"run_info,omitempty"`
 		Attempt    int64         `json:"attempt"`
 		MaxRetries int64         `json:"max_retries"`
 		Delay      time.Duration `json:"delay"`
 		Error      string        `json:"error"`
 		ErrorType  string        `json:"error_type,omitempty"`
-	}{e.Kind, e.At, e.Attempt, e.MaxRetries, e.Delay, util.ErrorString(e.Err), errorType(e.Err)})
+	}{e.Kind, e.At, e.Run, e.Attempt, e.MaxRetries, e.Delay, util.ErrorString(e.Err), errorType(e.Err)})
 }
 
 func (e *AutoRetryEvent) UnmarshalJSON(data []byte) error {
 	var raw struct {
 		Type       EventType     `json:"type"`
 		Timestamp  time.Time     `json:"timestamp"`
+		RunInfo    *RunInfo      `json:"run_info,omitempty"`
 		Attempt    int64         `json:"attempt"`
 		MaxRetries int64         `json:"max_retries"`
 		Delay      time.Duration `json:"delay"`
@@ -333,6 +401,7 @@ func (e *AutoRetryEvent) UnmarshalJSON(data []byte) error {
 	}
 	e.Kind = raw.Type
 	e.At = raw.Timestamp
+	e.Run = raw.RunInfo
 	e.Attempt = raw.Attempt
 	e.MaxRetries = raw.MaxRetries
 	e.Delay = raw.Delay

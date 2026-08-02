@@ -17,16 +17,23 @@ type Step = agentcore.Step
 // by directed edges. The engine performs topological sorting at compile time
 // and executes independent branches in parallel at runtime.
 type Graph struct {
-	nodes       map[string]Step
-	streamNodes map[string]agentcore.StreamStep
-	edges       map[string][]string
+	nodes            map[string]Step
+	streamNodes      map[string]agentcore.StreamStep
+	edges            map[string][]string
+	conditionalEdges map[string]conditionalEdge
+}
+
+type conditionalEdge struct {
+	route   func(ctx context.Context, output string) string
+	targets []string
 }
 
 func NewGraph() *Graph {
 	return &Graph{
-		nodes:       make(map[string]Step),
-		streamNodes: make(map[string]agentcore.StreamStep),
-		edges:       make(map[string][]string),
+		nodes:            make(map[string]Step),
+		streamNodes:      make(map[string]agentcore.StreamStep),
+		edges:            make(map[string][]string),
+		conditionalEdges: make(map[string]conditionalEdge),
 	}
 }
 
@@ -66,6 +73,9 @@ func (g *Graph) AddEdge(from, to string) error {
 	if !g.nodeExists(to) {
 		return fmt.Errorf("graph: unknown target node %q", to)
 	}
+	if _, conditional := g.conditionalEdges[from]; conditional {
+		return fmt.Errorf("graph: node %q already has conditional outgoing edges", from)
+	}
 	g.edges[from] = append(g.edges[from], to)
 	return nil
 }
@@ -79,36 +89,28 @@ func (g *Graph) AddConditionalEdge(from string, route func(ctx context.Context, 
 			return fmt.Errorf("graph: unknown target node %q", t)
 		}
 	}
-	routerName := "__conditional_" + from
-	g.nodes[routerName] = &conditionalBridge{
-		route:   route,
-		targets: targets,
-		graph:   g,
+	if route == nil {
+		return fmt.Errorf("graph: conditional route is required")
 	}
-	g.edges[from] = append(g.edges[from], routerName)
+	if len(targets) == 0 {
+		return fmt.Errorf("graph: conditional targets are required")
+	}
+	if len(g.edges[from]) > 0 {
+		return fmt.Errorf("graph: node %q already has static outgoing edges", from)
+	}
+	if _, exists := g.conditionalEdges[from]; exists {
+		return fmt.Errorf("graph: node %q already has conditional outgoing edges", from)
+	}
+	g.conditionalEdges[from] = conditionalEdge{route: route, targets: append([]string(nil), targets...)}
+	g.edges[from] = append(g.edges[from], targets...)
 	return nil
-}
-
-type conditionalBridge struct {
-	route   func(ctx context.Context, output string) string
-	targets []string
-	graph   *Graph
-}
-
-func (cb *conditionalBridge) Run(ctx context.Context, input string) (string, error) {
-	target := cb.route(ctx, input)
-	for _, t := range cb.targets {
-		if t == target {
-			return t, nil
-		}
-	}
-	return "", agentcore.NewNodeError("conditional edge: no matching target", nil, "conditional", target)
 }
 
 // CompileOptions configures graph compilation.
 type CompileOptions struct {
 	EntryNode string
 	MaxSteps  int64
+	Tracer    agentcore.Tracer
 	// StateFn, if set, is called at the start of each Run to create a
 	// GraphState that is shared across all nodes via context. Use
 	// GetGraphState(ctx) inside node implementations to access it.
@@ -127,6 +129,7 @@ type CompiledGraph struct {
 	RevEdges    map[string][]string
 	StateFn     GenStateFn
 	StreamNodes map[string]agentcore.StreamStep
+	Tracer      agentcore.Tracer
 }
 
 func (g *Graph) Compile(opts CompileOptions) (*CompiledGraph, error) {
@@ -180,6 +183,7 @@ func (g *Graph) Compile(opts CompileOptions) (*CompiledGraph, error) {
 		RevEdges:    revEdges,
 		StateFn:     opts.StateFn,
 		StreamNodes: streamNodes,
+		Tracer:      opts.Tracer,
 	}, nil
 }
 
@@ -216,6 +220,8 @@ func topoSort(nodeNames map[string]struct{}, edges map[string][]string, inDegree
 
 // Run executes the compiled graph.
 func (cg *CompiledGraph) Run(ctx context.Context, input string) (string, error) {
+	ctx, span, _ := agentcore.StartComponentRun(ctx, cg.Tracer, "graph", cg.Entry)
+	defer span.End()
 	if cg.StateFn != nil {
 		state := cg.StateFn(ctx)
 		if state != nil {
@@ -266,8 +272,13 @@ func (cg *CompiledGraph) Run(ctx context.Context, input string) (string, error) 
 			wg.Add(1)
 			go func(nodeName, nodeIn string) {
 				defer wg.Done()
+				nodeCtx, span, _ := agentcore.StartComponentRun(ctx, cg.Tracer, "graph_node", nodeName)
+				defer span.End()
 				step := cg.getNode(nodeName)
-				out, err := step.Run(ctx, nodeIn)
+				out, err := step.Run(nodeCtx, nodeIn)
+				if err != nil {
+					span.RecordError(err)
+				}
 				mu.Lock()
 				results[nodeName] = out
 				errs[nodeName] = err
@@ -284,13 +295,30 @@ func (cg *CompiledGraph) Run(ctx context.Context, input string) (string, error) 
 		}
 		for name, out := range results {
 			outputs[name] = out
-			for _, to := range cg.graph.edges[name] {
-				outputs[to] = ""
+			if err := cg.graph.activateSuccessors(ctx, name, out, outputs); err != nil {
+				return "", err
 			}
 		}
 	}
 
 	return FindTerminalOutput(allNodes(cg.graph.nodes, cg.StreamNodes), cg.graph.edges, outputs), nil
+}
+
+func (g *Graph) activateSuccessors(ctx context.Context, name, output string, outputs map[string]string) error {
+	if conditional, ok := g.conditionalEdges[name]; ok {
+		target := conditional.route(ctx, output)
+		for _, candidate := range conditional.targets {
+			if candidate == target {
+				outputs[target] = ""
+				return nil
+			}
+		}
+		return agentcore.NewNodeError("conditional edge: no matching target", nil, "conditional", name, target)
+	}
+	for _, target := range g.edges[name] {
+		outputs[target] = ""
+	}
+	return nil
 }
 
 var _ Step = (*CompiledGraph)(nil)
