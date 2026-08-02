@@ -246,3 +246,61 @@ func TestViewportRowToAbsoluteNoIndicatorWhenFollowingTail(t *testing.T) {
 		t.Fatalf("row 0 should map to content line %d; got %d", start, got)
 	}
 }
+
+func TestLatestMessageSelectionAfterGroupedTools(t *testing.T) {
+	h := NewChatHistory()
+	h.Append(ChatMessage{Role: RoleUser, Text: "run checks"})
+	h.Append(ChatMessage{Role: RoleTool, Text: "first tool result", Collapsed: true})
+	h.Append(ChatMessage{Role: RoleTool, Text: "second tool result", Collapsed: true})
+	h.Append(ChatMessage{Role: RoleAssistant, Text: "latest answer is selectable"})
+	h.SetMaxRows(100)
+	_ = h.Render(80)
+
+	if len(h.cachedMsgRanges) != 3 {
+		t.Fatalf("message ranges = %d, want 3 after grouping two tools", len(h.cachedMsgRanges))
+	}
+	latest := h.cachedMsgRanges[len(h.cachedMsgRanges)-1]
+	if latest.msgIndex != 3 {
+		t.Fatalf("latest range message index = %d, want 3", latest.msgIndex)
+	}
+	row := int64(latest.startLine)
+	h.Update(core.MouseMsg{Action: core.MousePress, Button: 0, Row: row, Col: 0})
+	h.Update(core.MouseMsg{Action: core.MouseMotion, Button: 0, Row: row, Col: 6})
+	h.Update(core.MouseMsg{Action: core.MouseRelease, Button: 0, Row: row, Col: 6})
+
+	if selected := h.GetSelectedText(); selected == "" {
+		t.Fatal("latest assistant message was not selectable after grouped tools")
+	}
+	if h.messages[2].Collapsed != true {
+		t.Fatal("selecting latest assistant toggled an earlier tool message")
+	}
+}
+
+func TestToggleHitTestingUsesMessageIndexAfterGroupedTools(t *testing.T) {
+	h := NewChatHistory()
+	h.Append(ChatMessage{Role: RoleUser, Text: "run checks"})
+	h.Append(ChatMessage{Role: RoleTool, Text: "first tool result", Collapsed: true})
+	h.Append(ChatMessage{Role: RoleTool, Text: "second tool result", Collapsed: true})
+	h.Append(ChatMessage{Role: RoleAssistant, Text: "plain answer"})
+	h.Append(ChatMessage{Role: RoleAssistant, Text: "diff answer", Meta: "diff"})
+	h.SetMaxRows(100)
+	_ = h.Render(80)
+
+	if len(h.cachedMsgRanges) != 4 {
+		t.Fatalf("message ranges = %d, want 4", len(h.cachedMsgRanges))
+	}
+	if !h.tryToggleThinkingAtLineLocked(int64(h.cachedMsgRanges[1].startLine)) {
+		t.Fatal("tool group header did not toggle")
+	}
+	plainRange := h.cachedMsgRanges[2]
+	if h.tryToggleThinkingAtLineLocked(int64(plainRange.startLine)) {
+		t.Fatal("plain assistant message unexpectedly toggled")
+	}
+	diffRange := h.cachedMsgRanges[3]
+	if !h.tryToggleThinkingAtLineLocked(int64(diffRange.startLine)) {
+		t.Fatal("diff assistant message did not toggle")
+	}
+	if !h.messages[4].Collapsed {
+		t.Fatal("diff toggle changed the wrong message")
+	}
+}

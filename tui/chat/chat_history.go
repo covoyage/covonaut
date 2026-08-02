@@ -778,25 +778,29 @@ func (h *ChatHistory) expandToolGroup(msgRangeIdx int) {
 
 func (h *ChatHistory) tryToggleThinkingAtLineLocked(absLine int64) bool {
 	// Find which message contains this line
-	msgIdx := -1
+	rangeIdx := -1
 	for i, r := range h.cachedMsgRanges {
 		if absLine >= int64(r.startLine) && absLine < int64(r.endLine) {
-			msgIdx = i
+			rangeIdx = i
 			break
 		}
 	}
-	if msgIdx < 0 || msgIdx >= len(h.cachedMsgRanges) {
+	if rangeIdx < 0 || rangeIdx >= len(h.cachedMsgRanges) {
 		return false
 	}
+	msgRange := &h.cachedMsgRanges[rangeIdx]
 
 	// Check if it's a tool group
-	if r := &h.cachedMsgRanges[msgIdx]; r.toolGroup {
-		h.expandToolGroup(msgIdx)
+	if msgRange.toolGroup {
+		h.expandToolGroup(rangeIdx)
 		h.dirty = true
 		return true
 	}
 
-	msg := &h.messages[msgIdx]
+	if msgRange.msgIndex < 0 || msgRange.msgIndex >= len(h.messages) {
+		return false
+	}
+	msg := &h.messages[msgRange.msgIndex]
 	if msg.Role == RoleTool && msg.Collapsed {
 		msg.Collapsed = false
 		return true
@@ -818,7 +822,7 @@ func (h *ChatHistory) tryToggleThinkingAtLineLocked(absLine int64) bool {
 	}
 
 	// Calculate line offset within the message
-	msgStart := h.cachedMsgRanges[msgIdx].startLine
+	msgStart := msgRange.startLine
 	lineOffset := absLine - int64(msgStart)
 
 	// Track line positions to find which thinking segment contains this line
