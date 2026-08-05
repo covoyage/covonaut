@@ -142,7 +142,7 @@ func TestDeepSeek_ReasonerDisablesSystemPrompt(t *testing.T) {
 	}
 }
 
-// Qwen (Tongyi Qianwen) is Chat Completions-compatible.
+// This provider is compatible with the Chat Completions protocol.
 func TestQwen_ChatCompletes(t *testing.T) {
 	var gotPath string
 
@@ -177,7 +177,7 @@ func TestQwen_ChatCompletes(t *testing.T) {
 	}
 }
 
-// DeepSeek streaming works and emits thinking blocks.
+// Reasoning-model streaming emits thinking blocks.
 func TestDeepSeek_StreamReturnsThinkingBlock(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -212,7 +212,7 @@ func TestDeepSeek_StreamReturnsThinkingBlock(t *testing.T) {
 	}
 }
 
-// Qwen streaming works.
+// Compatible streaming responses are decoded correctly.
 func TestQwen_Stream(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -280,7 +280,7 @@ func TestMoonshot_ChatCompletes(t *testing.T) {
 	}
 }
 
-// Qwen (DashScope) error format: {"code":"...","message":"..."}
+// A top-level provider error format: {"code":"...","message":"..."}
 func TestQwen_ErrorFormat(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

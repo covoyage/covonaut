@@ -53,9 +53,8 @@ type Config struct {
 	DisableSystemPrompt bool
 }
 
-// Provider implements agentcore.Provider for the Chat Completions
-// protocol, which is also used by DeepSeek, Qwen, Moonshot, Groq, Together,
-// Mistral, and dozens of other vendors. See doc.go for the full list.
+// Provider implements agentcore.Provider for the widely adopted Chat
+// Completions protocol. See doc.go for compatibility requirements.
 type Provider struct {
 	config Config
 	client *http.Client
@@ -620,10 +619,10 @@ func (p *Provider) doHTTP(ctx context.Context, body any, extra map[string]any) (
 }
 
 // formatError attempts to extract a structured error message from API error
-// responses. Handles multiple vendor formats:
+// responses. Handles common envelope and top-level formats:
 //
-//	{"error": {"message": "..."}}           — OpenAI / DeepSeek / Moonshot / Groq
-//	{"code": "...", "message": "..."}       — Qwen (DashScope)
+// {"error": {"message": "..."}}
+// {"code": "...", "message": "..."}
 //
 // Falls back to the raw body if no structured format is detected.
 func formatError(body []byte) string {

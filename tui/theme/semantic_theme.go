@@ -52,7 +52,7 @@ type SemanticTheme struct {
 	ProgressBar   string `json:"progressBar"`   // optional
 }
 
-// DefaultSemanticDark uses Claude Code's warm dark palette.
+// DefaultSemanticDark uses a warm dark palette.
 func DefaultSemanticDark() *SemanticTheme {
 	return &SemanticTheme{
 		Name: "dark",

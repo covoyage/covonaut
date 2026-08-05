@@ -1,7 +1,6 @@
-// Package copilot implements the GitHub Copilot API provider.
+// Package copilot implements an OAuth-authenticated chat API provider.
 //
-// GitHub Copilot exposes an OpenAI-compatible chat completions endpoint
-// authenticated via GitHub OAuth token.
+// It uses a compatible chat completions endpoint and resolves an OAuth token.
 package copilot
 
 import (
@@ -16,13 +15,13 @@ import (
 
 const defaultBaseURL = "https://api.githubcopilot.com"
 
-// Config holds GitHub Copilot configuration.
+// Config holds provider configuration.
 type Config struct {
-	Token   string // GitHub OAuth token; auto-detected if empty
+	Token   string // OAuth token; auto-detected if empty
 	BaseURL string // optional override
 }
 
-// resolveToken attempts to get a GitHub token from config, env, or gh CLI.
+// resolveToken attempts to get a token from config, environment, or a CLI helper.
 func resolveToken(cfg Config) (string, error) {
 	if cfg.Token != "" {
 		return cfg.Token, nil
@@ -39,7 +38,7 @@ func resolveToken(cfg Config) (string, error) {
 	return "", fmt.Errorf("copilot: no GitHub token; set GITHUB_TOKEN or run 'gh auth login'")
 }
 
-// New creates a GitHub Copilot provider.
+// New creates an authenticated provider.
 func New(cfg Config) (agentcore.Provider, error) {
 	token, err := resolveToken(cfg)
 	if err != nil {

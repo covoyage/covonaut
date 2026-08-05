@@ -45,8 +45,8 @@ func copyNative(text string) error {
 }
 
 // copyOSC52 writes text to clipboard using the OSC 52 terminal escape sequence.
-// Supported terminals: iTerm2, Terminal.app (macOS 13.4+), Kitty, WezTerm, Ghostty,
-// Alacritty, VS Code, Cursor, foot, tmux (with allow-passthrough on), and many others.
+// It works in terminals that implement OSC 52 clipboard writes; multiplexers may
+// require escape-sequence passthrough to be enabled.
 func copyOSC52(text string) error {
 	// OSC 52 format: ESC ] 52 ; c ; <base64> BEL (or ST)
 	// 'c' = clipboard selection

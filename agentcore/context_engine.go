@@ -39,7 +39,7 @@ type ContextEngine interface {
 	ShouldCompact(msgs []Message, toolDefs []ToolDefinition, contextWindow int64) bool
 
 	// Compress compacts the message list and returns the new message list.
-	// focusTopic is optional for guided compression (like Claude Code's /compact <topic>).
+	// focusTopic is optional for guided topic-focused compression.
 	Compress(ctx context.Context, msgs []Message, focusTopic string) ([]Message, int64, error)
 
 	// GetToolSchemas returns optional tool definitions the engine exposes
