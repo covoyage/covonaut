@@ -4,12 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/covoyage/covonaut/agentcore"
@@ -121,14 +119,9 @@ func (d *DefaultProcessOperations) nextID() string {
 }
 
 func (d *DefaultProcessOperations) Spawn(command string, cwd string) (*ProcessEntry, error) {
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/sh"
-	}
-
-	cmd := exec.Command(shell, "-c", command)
+	cmd := newShellCommand(command)
 	cmd.Dir = cwd
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	configureProcessGroup(cmd)
 
 	// Create output capture.
 	output := &outputBuffer{maxBytes: 200 * 1024} // 200KB rolling buffer
@@ -179,9 +172,7 @@ func (d *DefaultProcessOperations) Spawn(command string, cwd string) (*ProcessEn
 }
 
 func (d *DefaultProcessOperations) Kill(pid int) error {
-	// Try process group first, then direct kill.
-	syscall.Kill(-pid, syscall.SIGKILL)
-	return syscall.Kill(pid, syscall.SIGKILL)
+	return terminateProcessTree(pid)
 }
 
 func (d *DefaultProcessOperations) Poll(entry *ProcessEntry) (string, int, []byte) {

@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"sync"
-	"syscall"
 	"time"
 	"unicode"
 
@@ -24,13 +23,9 @@ type BashOperations interface {
 type DefaultBashOperations struct{}
 
 func (d DefaultBashOperations) Exec(command string, cwd string, env map[string]string, timeoutSecs *int, onData func(data []byte)) (int, error) {
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/sh"
-	}
-
-	cmd := exec.Command(shell, "-c", command)
+	cmd := newShellCommand(command)
 	cmd.Dir = cwd
+	configureProcessGroup(cmd)
 	if env != nil {
 		cmd.Env = os.Environ()
 		for k, v := range env {
@@ -56,7 +51,9 @@ func (d DefaultBashOperations) Exec(command string, cwd string, env map[string]s
 	if timeoutSecs != nil && *timeoutSecs > 0 {
 		timer = time.AfterFunc(time.Duration(*timeoutSecs)*time.Second, func() {
 			if cmd.Process != nil {
-				killProcessTree(cmd.Process.Pid)
+				if err := terminateProcessTree(cmd.Process.Pid); err != nil {
+					onData([]byte("process termination warning: " + err.Error() + "\n"))
+				}
 			}
 		})
 	}
@@ -93,13 +90,6 @@ func (d DefaultBashOperations) Exec(command string, cwd string, env map[string]s
 		return -1, err
 	}
 	return 0, nil
-}
-
-func killProcessTree(pid int) {
-	// Try to kill the process group.
-	syscall.Kill(-pid, syscall.SIGKILL)
-	// Fallback: kill the process itself.
-	syscall.Kill(pid, syscall.SIGKILL)
 }
 
 func stripAnsi(text string) string {

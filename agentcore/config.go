@@ -9,7 +9,7 @@ import (
 // ModelConfig groups LLM model selection and generation parameters.
 type ModelConfig struct {
 	Name        string   // optional: identifies this agent in events and handoff logs
-	Model       string   // model identifier (e.g. "gpt-4o-mini")
+	Model       string   // model identifier (e.g. "gpt-5.6")
 	Provider    Provider // LLM provider implementation
 	Temperature float64  // sampling temperature; 0 = deterministic
 	MaxTokens   int64    // max tokens in response; 0 = provider default

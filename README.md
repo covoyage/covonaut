@@ -120,7 +120,7 @@ if err != nil {
 
 agent := agentcore.New(agentcore.Config{
     Name:       "assistant",
-    Model:      "gpt-4o-mini",
+    Model:      "gpt-5.6",
     Provider:   provider,
     Extensions: []agentcore.Extension{ext},
 })
@@ -431,7 +431,7 @@ All providers accept the same high-level request shape.
 
 ```go
 agent := agentcore.New(agentcore.Config{
-    Model:    "gpt-4o-mini",
+    Model:    "gpt-5.6",
     Provider: chatcompat.New(chatcompat.Config{APIKey: os.Getenv("OPENAI_API_KEY")}),
     ResponseFormat: agentcore.NewJSONSchemaResponseFormat("answer", map[string]any{
         "type": "object",

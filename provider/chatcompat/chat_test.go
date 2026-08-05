@@ -112,7 +112,7 @@ func TestProviderComplete_SendsStructuredOutputRequest(t *testing.T) {
 	})
 
 	resp, err := provider.Complete(context.Background(), &agentcore.ProviderRequest{
-		Model: "gpt-4o-mini",
+		Model: "gpt-5.6",
 		Messages: []agentcore.Message{
 			{Role: agentcore.RoleUser, Content: "return json"},
 		},
@@ -181,7 +181,7 @@ func TestProviderComplete_SendsImageBlocksAsMultipartContent(t *testing.T) {
 	})
 
 	_, err := provider.Complete(context.Background(), &agentcore.ProviderRequest{
-		Model: "gpt-4o-mini",
+		Model: "gpt-5.6",
 		Messages: []agentcore.Message{
 			{
 				Role:    agentcore.RoleUser,
@@ -253,7 +253,7 @@ func TestProviderComplete_PreservesToolCallBlocks(t *testing.T) {
 	})
 
 	resp, err := provider.Complete(context.Background(), &agentcore.ProviderRequest{
-		Model:    "gpt-4o-mini",
+		Model:    "gpt-5.6",
 		Messages: []agentcore.Message{{Role: agentcore.RoleUser, Content: "call a tool"}},
 	})
 	if err != nil {

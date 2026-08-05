@@ -12,6 +12,7 @@ import (
 
 // SkillItem represents a skill in the skill center.
 type SkillItem struct {
+	ID         string
 	Name       string
 	State      string
 	Provenance string
@@ -66,10 +67,10 @@ func DefaultSkillCenterTheme() SkillCenterTheme {
 // NewSkillCenter creates a new skill center panel.
 func NewSkillCenter() *SkillCenter {
 	km := terminal.NewKeybindingsManager(map[string]terminal.KeybindingDef{
-		"skill.up":      {DefaultKeys: []string{"up", "ctrl+p"}},
-		"skill.down":    {DefaultKeys: []string{"down", "ctrl+n"}},
-		"skill.select":  {DefaultKeys: []string{"enter"}},
-		"skill.close":   {DefaultKeys: []string{"esc"}},
+		"skill.up":     {DefaultKeys: []string{"up", "ctrl+p"}},
+		"skill.down":   {DefaultKeys: []string{"down", "ctrl+n"}},
+		"skill.select": {DefaultKeys: []string{"enter"}},
+		"skill.close":  {DefaultKeys: []string{"esc"}},
 	})
 	return &SkillCenter{
 		theme: DefaultSkillCenterTheme(),

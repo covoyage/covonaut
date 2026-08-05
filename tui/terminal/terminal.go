@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/signal"
 	"sync"
 	"sync/atomic"
-	"syscall"
+
+	"golang.org/x/term"
 )
 
 // ---------------------------------------------------------------------------
@@ -53,18 +53,18 @@ type Terminal interface {
 }
 
 // ---------------------------------------------------------------------------
-// ProcessTerminal — real stdin/stdout on a UNIX tty.
+// ProcessTerminal — real stdin/stdout on a terminal device.
 // ---------------------------------------------------------------------------
 
-// ProcessTerminal drives the current process's stdin/stdout. Zero external
-// dependencies: termios and window-size queries are issued via syscall.
+// ProcessTerminal drives the current process's stdin/stdout.
 type ProcessTerminal struct {
-	in  *os.File
-	out *os.File
+	in       *os.File
+	out      *os.File
+	readFile *os.File
 
 	mu            sync.Mutex
 	started       bool
-	savedState    *termios
+	savedState    *term.State
 	savedValid    bool
 	onInput       func([]byte)
 	onResize      func()
@@ -72,6 +72,7 @@ type ProcessTerminal struct {
 	readDone      chan struct{}
 	resizeSig     chan os.Signal
 	resizeDone    chan struct{}
+	stopResize    func()
 	signalStopped bool
 	kittyKbdOn    bool
 
@@ -145,22 +146,26 @@ func (t *ProcessTerminal) Start(onInput func(data []byte), onResize func()) erro
 		return nil
 	}
 
-	saved, err := getTermios(t.in.Fd())
+	saved, err := term.MakeRaw(int(t.in.Fd()))
 	if err != nil {
 		t.mu.Unlock()
-		return fmt.Errorf("tui: get termios: %w", err)
+		return fmt.Errorf("tui: enter raw mode: %w", err)
 	}
-	raw := makeRaw(saved)
-	if err := setTermios(t.in.Fd(), &raw); err != nil {
-		t.mu.Unlock()
-		return fmt.Errorf("tui: set termios: %w", err)
-	}
-	t.savedState = &saved
+	t.savedState = saved
 	t.savedValid = true
+	readFile, err := duplicateInput(t.in)
+	if err != nil {
+		_ = term.Restore(int(t.in.Fd()), saved)
+		t.savedState = nil
+		t.savedValid = false
+		t.mu.Unlock()
+		return fmt.Errorf("tui: duplicate input: %w", err)
+	}
+	t.readFile = readFile
 
-	if cols, rows, err := getWinsize(t.out.Fd()); err == nil {
-		atomic.StoreInt64(&t.cols, cols)
-		atomic.StoreInt64(&t.rows, rows)
+	if cols, rows, err := term.GetSize(int(t.out.Fd())); err == nil {
+		atomic.StoreInt64(&t.cols, int64(cols))
+		atomic.StoreInt64(&t.rows, int64(rows))
 	} else {
 		atomic.StoreInt64(&t.cols, 80)
 		atomic.StoreInt64(&t.rows, 24)
@@ -172,7 +177,7 @@ func (t *ProcessTerminal) Start(onInput func(data []byte), onResize func()) erro
 	t.readDone = make(chan struct{})
 	t.resizeSig = make(chan os.Signal, 1)
 	t.resizeDone = make(chan struct{})
-	signal.Notify(t.resizeSig, syscall.SIGWINCH)
+	t.stopResize = startResizeNotifications(t.resizeSig)
 	t.signalStopped = false
 	t.started = true
 
@@ -200,12 +205,17 @@ func (t *ProcessTerminal) Stop() error {
 	}
 	t.started = false
 	close(t.stopRead)
+	readFile := t.readFile
+	t.readFile = nil
 	if !t.signalStopped {
 		// Stop signal delivery first, then close the channel so the
 		// resizeLoop's `for range` exits. Closing before signal.Stop would
 		// risk a send-on-closed-channel panic if a SIGWINCH arrived in
 		// between (signal.Notify would still be registered).
-		signal.Stop(t.resizeSig)
+		if t.stopResize != nil {
+			t.stopResize()
+			t.stopResize = nil
+		}
 		close(t.resizeSig)
 		t.signalStopped = true
 	}
@@ -218,8 +228,12 @@ func (t *ProcessTerminal) Stop() error {
 	kittyKbdOn := t.kittyKbdOn
 	t.kittyKbdOn = false
 	t.mu.Unlock()
+	if readFile != nil {
+		_ = cancelRead(readFile)
+		_ = readFile.Close()
+	}
 
-	// Wait for the read loop to notice VMIN/VTIME timeout.
+	// Closing the private input handle interrupts any pending read.
 	<-t.readDone
 	// Wait for the resize loop to observe the closed resizeSig and exit.
 	<-t.resizeDone
@@ -232,7 +246,7 @@ func (t *ProcessTerminal) Stop() error {
 	_, _ = t.out.WriteString("\x1b[?25h") // ensure cursor is visible
 
 	if savedValid && saved != nil {
-		_ = setTermios(t.in.Fd(), saved)
+		_ = term.Restore(int(t.in.Fd()), saved)
 	}
 	return nil
 }
@@ -306,7 +320,12 @@ func (t *ProcessTerminal) PopKittyKeyboard() {
 
 func (t *ProcessTerminal) readLoop() {
 	defer close(t.readDone)
-	fd := int(t.in.Fd())
+	t.mu.Lock()
+	readFile := t.readFile
+	t.mu.Unlock()
+	if readFile == nil {
+		return
+	}
 	buf := make([]byte, 4096)
 	for {
 		select {
@@ -314,16 +333,13 @@ func (t *ProcessTerminal) readLoop() {
 			return
 		default:
 		}
-		n, err := syscall.Read(fd, buf)
+		n, err := readFile.Read(buf)
 		if n > 0 && t.onInput != nil {
 			cp := make([]byte, n)
 			copy(cp, buf[:n])
 			t.onInput(cp)
 		}
 		if err != nil {
-			if err == syscall.EINTR || err == syscall.EAGAIN {
-				continue
-			}
 			return
 		}
 	}
@@ -332,21 +348,22 @@ func (t *ProcessTerminal) readLoop() {
 func (t *ProcessTerminal) resizeLoop() {
 	defer close(t.resizeDone)
 	for range t.resizeSig {
-		cols, rows, err := getWinsize(t.out.Fd())
-		if err == nil {
-			atomic.StoreInt64(&t.cols, cols)
-			atomic.StoreInt64(&t.rows, rows)
-		}
-		if t.onResize != nil {
+		cols, rows, err := term.GetSize(int(t.out.Fd()))
+		if err == nil && t.updateSize(int64(cols), int64(rows)) && t.onResize != nil {
 			t.onResize()
 		}
 	}
 }
 
+func (t *ProcessTerminal) updateSize(cols, rows int64) bool {
+	oldCols := atomic.SwapInt64(&t.cols, cols)
+	oldRows := atomic.SwapInt64(&t.rows, rows)
+	return oldCols != cols || oldRows != rows
+}
+
 // IsTerminal reports whether fd refers to a terminal device.
 func IsTerminal(fd uintptr) bool {
-	_, err := getTermios(fd)
-	return err == nil
+	return term.IsTerminal(int(fd))
 }
 
 // shouldEnableKittyKbdLocked evaluates the kitty keyboard mode against the

@@ -3,7 +3,6 @@ package session
 import (
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -21,7 +20,7 @@ func TestFlushAllDoesNotTruncateBeforeLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+	if err := lockSessionFile(lockFile); err != nil {
 		t.Fatal(err)
 	}
 
@@ -36,7 +35,7 @@ func TestFlushAllDoesNotTruncateBeforeLock(t *testing.T) {
 		t.Fatalf("file changed before lock acquisition: got %q want %q", got, original)
 	}
 
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN); err != nil {
+	if err := unlockSessionFile(lockFile); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-done; err != nil {

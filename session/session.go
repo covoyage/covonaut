@@ -11,7 +11,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/covoyage/covonaut/agentcore"
@@ -541,10 +540,10 @@ func (m *Manager) withFileLock(fn func() error) error {
 		return fmt.Errorf("open session lock: %w", err)
 	}
 	defer lockFile.Close()
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+	if err := lockSessionFile(lockFile); err != nil {
 		return fmt.Errorf("lock session file: %w", err)
 	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer unlockSessionFile(lockFile)
 	return fn()
 }
 

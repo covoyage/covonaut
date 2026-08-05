@@ -19,7 +19,7 @@ type SemanticTheme struct {
 	System        string `json:"system"` // system / info lines (optional)
 	ThinkingText  string `json:"thinkingText"`
 	UserMessage   string `json:"userMessageText"` // if empty, derive from Accent + bold
-	AssistantText string `json:"assistantText"`   // extension: not in pi JSON; optional
+	AssistantText string `json:"assistantText"`   // optional extension field
 
 	SelectedBg    string `json:"selectedBg"`
 	UserMessageBg string `json:"userMessageBg"`
@@ -105,7 +105,7 @@ func DefaultSemanticDark() *SemanticTheme {
 	}
 }
 
-// DefaultSemanticLight is a readable light palette (not identical to pi light.json).
+// DefaultSemanticLight is an independently designed readable light palette.
 func DefaultSemanticLight() *SemanticTheme {
 	return &SemanticTheme{
 		Name: "light",

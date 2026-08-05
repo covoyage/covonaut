@@ -16,18 +16,18 @@ import (
 	"github.com/covoyage/covonaut/agentcore"
 	"github.com/covoyage/covonaut/pkg/util"
 	"github.com/covoyage/covonaut/provider/anthropic"
-	"github.com/covoyage/covonaut/provider/gemini"
 	"github.com/covoyage/covonaut/provider/chatcompat"
+	"github.com/covoyage/covonaut/provider/gemini"
 	"github.com/covoyage/covonaut/session"
 	"github.com/covoyage/covonaut/skill"
 	agentstore "github.com/covoyage/covonaut/store"
+	"github.com/covoyage/covonaut/tui"
+	"github.com/covoyage/covonaut/tui/agentadapter"
+	"github.com/covoyage/covonaut/tui/chat"
+	"github.com/covoyage/covonaut/tui/component"
 	core "github.com/covoyage/covonaut/tui/core"
 	"github.com/covoyage/covonaut/tui/terminal"
 	"github.com/covoyage/covonaut/tui/theme"
-	"github.com/covoyage/covonaut/tui/component"
-	"github.com/covoyage/covonaut/tui/chat"
-	"github.com/covoyage/covonaut/tui"
-	"github.com/covoyage/covonaut/tui/agentadapter"
 )
 
 type threadStore interface {
@@ -127,7 +127,7 @@ func main() {
 			AvailableSkills: availableSkills,
 			SelectedSkills:  selectedSkills,
 		},
-		Store:       store,
+		Store: store,
 		RetryConfig: &agentcore.RetryConfig{
 			MaxRetries:  3,
 			BaseDelayMs: 1000,
@@ -618,7 +618,7 @@ func defaultModel() string {
 	case "gemini":
 		return "gemini-2.5-flash"
 	default:
-		return "gpt-4o-mini"
+		return "gpt-5.6"
 	}
 }
 

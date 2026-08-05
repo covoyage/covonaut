@@ -150,9 +150,9 @@ func TestCompressorEngineCheckFeasibility(t *testing.T) {
 
 	// With compression model and adequate context
 	engine2 := NewCompressorEngine(ContextEngineConfig{
-		CompressionModel: "gpt-4o-mini",
+		CompressionModel:    "gpt-5.6",
 		CompressionProvider: &stubProvider{},
-		ContextWindow: 100000,
+		ContextWindow:       100000,
 	})
 	if warn := engine2.CheckFeasibility(100000); warn != "" {
 		t.Fatalf("unexpected warning: %s", warn)
@@ -160,9 +160,9 @@ func TestCompressorEngineCheckFeasibility(t *testing.T) {
 
 	// Compression model too small
 	engine3 := NewCompressorEngine(ContextEngineConfig{
-		CompressionModel: "gpt-4o-mini",
+		CompressionModel:    "gpt-5.6",
 		CompressionProvider: &stubProvider{},
-		ContextWindow: 10000,
+		ContextWindow:       10000,
 	})
 	if warn := engine3.CheckFeasibility(100000); warn == "" {
 		t.Fatal("expected warning for small compression context")
