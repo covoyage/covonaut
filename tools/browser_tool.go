@@ -437,20 +437,10 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 					snapshot, err = session.camofoxClient.Click(session.sessionID, ref)
 				case BackendLightpanda:
 					timeoutCtx, cancel := context.WithTimeout(session.ctx, cfg.CommandTimeout)
-					xpath, lookupErr := session.refMapper.Get(ref)
-					if lookupErr {
-						var jsXpath string
-						js := fmt.Sprintf(`window.__covoRefMap && window.__covoRefMap[%q] || null`, ref)
-						if err := chromedp.Run(timeoutCtx, chromedp.Evaluate(js, &jsXpath)); err == nil && jsXpath != "" {
-							xpath = jsXpath
-							session.refMapper.Set(ref, xpath)
-						} else {
-							cancel()
-							if session.refMapper.Count() == 0 {
-								return nil, fmt.Errorf("ref %s not found. Page state is unknown. Call browser (action=snapshot) first", ref)
-							}
-							return nil, fmt.Errorf("ref %s not found in current page state. Call browser (action=snapshot) to refresh", ref)
-						}
+					xpath, resolveErr := resolveRefXPath(timeoutCtx, session.refMapper, ref)
+					if resolveErr != nil {
+						cancel()
+						return nil, resolveErr
 					}
 					if err := chromedp.Run(timeoutCtx, chromedp.Click(xpath, chromedp.BySearch)); err != nil {
 						cancel()
@@ -461,20 +451,10 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 					snapshot, err = generateSnapshot(session.ctx, false, session.refMapper)
 				case BackendLocal, BackendCDP, BackendBrowserbase, BackendBrowserUse, BackendFirecrawl, BackendAgentBrowser:
 					timeoutCtx, cancel := context.WithTimeout(session.ctx, cfg.CommandTimeout)
-					xpath, lookupErr := session.refMapper.Get(ref)
-					if lookupErr {
-						var jsXpath string
-						js := fmt.Sprintf(`window.__covoRefMap && window.__covoRefMap[%q] || null`, ref)
-						if err := chromedp.Run(timeoutCtx, chromedp.Evaluate(js, &jsXpath)); err == nil && jsXpath != "" {
-							xpath = jsXpath
-							session.refMapper.Set(ref, xpath)
-						} else {
-							cancel()
-							if session.refMapper.Count() == 0 {
-								return nil, fmt.Errorf("ref %s not found. Page state is unknown. Call browser (action=snapshot) first", ref)
-							}
-							return nil, fmt.Errorf("ref %s not found in current page state. Call browser (action=snapshot) to refresh", ref)
-						}
+					xpath, resolveErr := resolveRefXPath(timeoutCtx, session.refMapper, ref)
+					if resolveErr != nil {
+						cancel()
+						return nil, resolveErr
 					}
 					if err := chromedp.Run(timeoutCtx, chromedp.Click(xpath, chromedp.BySearch)); err != nil {
 						cancel()
@@ -518,20 +498,10 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 					resultMsg, err = session.camofoxClient.Type(session.sessionID, ref, input.Text)
 				case BackendLightpanda:
 					timeoutCtx, cancel := context.WithTimeout(session.ctx, cfg.CommandTimeout)
-					xpath, lookupErr := session.refMapper.Get(ref)
-					if lookupErr {
-						var jsXpath string
-						js := fmt.Sprintf(`window.__covoRefMap && window.__covoRefMap[%q] || null`, ref)
-						if err := chromedp.Run(timeoutCtx, chromedp.Evaluate(js, &jsXpath)); err == nil && jsXpath != "" {
-							xpath = jsXpath
-							session.refMapper.Set(ref, xpath)
-						} else {
-							cancel()
-							if session.refMapper.Count() == 0 {
-								return nil, fmt.Errorf("ref %s not found. Page state is unknown. Call browser (action=snapshot) first", ref)
-							}
-							return nil, fmt.Errorf("ref %s not found in current page state. Call browser (action=snapshot) to refresh", ref)
-						}
+					xpath, resolveErr := resolveRefXPath(timeoutCtx, session.refMapper, ref)
+					if resolveErr != nil {
+						cancel()
+						return nil, resolveErr
 					}
 					if err := chromedp.Run(timeoutCtx,
 						chromedp.Clear(xpath, chromedp.BySearch),
@@ -544,20 +514,10 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 					resultMsg = fmt.Sprintf("Typed \"%s\" into %s", input.Text, ref)
 				case BackendLocal, BackendCDP, BackendBrowserbase, BackendBrowserUse, BackendFirecrawl, BackendAgentBrowser:
 					timeoutCtx, cancel := context.WithTimeout(session.ctx, cfg.CommandTimeout)
-					xpath, lookupErr := session.refMapper.Get(ref)
-					if lookupErr {
-						var jsXpath string
-						js := fmt.Sprintf(`window.__covoRefMap && window.__covoRefMap[%q] || null`, ref)
-						if err := chromedp.Run(timeoutCtx, chromedp.Evaluate(js, &jsXpath)); err == nil && jsXpath != "" {
-							xpath = jsXpath
-							session.refMapper.Set(ref, xpath)
-						} else {
-							cancel()
-							if session.refMapper.Count() == 0 {
-								return nil, fmt.Errorf("ref %s not found. Page state is unknown. Call browser (action=snapshot) first", ref)
-							}
-							return nil, fmt.Errorf("ref %s not found in current page state. Call browser (action=snapshot) to refresh", ref)
-						}
+					xpath, resolveErr := resolveRefXPath(timeoutCtx, session.refMapper, ref)
+					if resolveErr != nil {
+						cancel()
+						return nil, resolveErr
 					}
 					if err := chromedp.Run(timeoutCtx,
 						chromedp.Clear(xpath, chromedp.BySearch),

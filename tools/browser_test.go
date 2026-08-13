@@ -81,3 +81,49 @@ func TestBrowserManagerActiveSessionTracksHybridLocal(t *testing.T) {
 		t.Fatalf("expected active hybrid local session, got %#v ok=%v", session, ok)
 	}
 }
+
+func TestResolveRefXPathUsesCachedSelector(t *testing.T) {
+	rm := NewRefMapper()
+	rm.Set("@e5", `//*[@id="login"]`)
+
+	xpath, err := resolveRefXPath(context.Background(), rm, "@e5")
+	if err != nil {
+		t.Fatalf("cached ref should resolve, got error: %v", err)
+	}
+	if xpath != `//*[@id="login"]` {
+		t.Fatalf("unexpected xpath %q", xpath)
+	}
+}
+
+func TestResolveRefXPathNeverReturnsEmptySelector(t *testing.T) {
+	// A miss must surface an actionable error instead of an empty selector, which
+	// chromedp would otherwise match against an arbitrary node.
+	for name, rm := range map[string]*RefMapper{
+		"empty map":  NewRefMapper(),
+		"nil mapper": nil,
+	} {
+		xpath, err := resolveRefXPath(context.Background(), rm, "@e35")
+		if err == nil {
+			t.Fatalf("%s: expected error for unknown ref, got xpath %q", name, xpath)
+		}
+		if xpath != "" {
+			t.Fatalf("%s: expected empty xpath alongside error, got %q", name, xpath)
+		}
+		if !strings.Contains(err.Error(), "@e35") {
+			t.Fatalf("%s: error should name the ref, got %v", name, err)
+		}
+	}
+
+	populated := NewRefMapper()
+	populated.Set("@e1", "//button")
+	xpath, err := resolveRefXPath(context.Background(), populated, "@e35")
+	if err == nil {
+		t.Fatalf("expected error for stale ref, got xpath %q", xpath)
+	}
+	if xpath != "" {
+		t.Fatalf("expected empty xpath alongside error, got %q", xpath)
+	}
+	if !strings.Contains(err.Error(), "refresh") {
+		t.Fatalf("stale ref error should suggest a refresh, got %v", err)
+	}
+}

@@ -48,6 +48,31 @@ func (rm *RefMapper) Count() int {
 	return len(rm.refs)
 }
 
+// resolveRefXPath maps a snapshot ref such as "@e5" to its XPath, falling back to
+// the in-page __covoRefMap when the local cache misses. It never returns an empty
+// XPath with a nil error, so callers cannot pass "" to a chromedp selector.
+func resolveRefXPath(ctx context.Context, refMapper *RefMapper, ref string) (string, error) {
+	if refMapper == nil {
+		return "", fmt.Errorf("ref %s not found. Page state is unknown. Call browser (action=snapshot) first", ref)
+	}
+
+	if xpath, ok := refMapper.Get(ref); ok && xpath != "" {
+		return xpath, nil
+	}
+
+	var jsXpath string
+	js := fmt.Sprintf(`window.__covoRefMap && window.__covoRefMap[%q] || null`, ref)
+	if err := chromedp.Run(ctx, chromedp.Evaluate(js, &jsXpath)); err == nil && jsXpath != "" {
+		refMapper.Set(ref, jsXpath)
+		return jsXpath, nil
+	}
+
+	if refMapper.Count() == 0 {
+		return "", fmt.Errorf("ref %s not found. Page state is unknown. Call browser (action=snapshot) first", ref)
+	}
+	return "", fmt.Errorf("ref %s not found in current page state. Call browser (action=snapshot) to refresh", ref)
+}
+
 type snapshotResult struct {
 	Text   string            `json:"text"`
 	RefMap map[string]string `json:"refMap"`
