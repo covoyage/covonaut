@@ -133,6 +133,9 @@ func NewReadTool(cwd string, cfg *ReadToolConfig) *agentcore.Tool {
 				if start < 0 {
 					start = 0
 				}
+				if start > len(lines) {
+					start = len(lines)
+				}
 				end := start + limit
 				if end > len(lines) {
 					end = len(lines)

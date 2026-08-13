@@ -21,12 +21,12 @@ type mockFileInfo struct {
 	modTime time.Time
 }
 
-func (m *mockFileInfo) Name() string      { return m.name }
-func (m *mockFileInfo) Size() int64       { return m.size }
-func (m *mockFileInfo) Mode() os.FileMode { return m.mode }
+func (m *mockFileInfo) Name() string       { return m.name }
+func (m *mockFileInfo) Size() int64        { return m.size }
+func (m *mockFileInfo) Mode() os.FileMode  { return m.mode }
 func (m *mockFileInfo) ModTime() time.Time { return m.modTime }
 func (m *mockFileInfo) IsDir() bool        { return m.isDir }
-func (m *mockFileInfo) Sys() any          { return nil }
+func (m *mockFileInfo) Sys() any           { return nil }
 
 // --- mock operations ---
 
@@ -51,7 +51,7 @@ type mockReadOps struct {
 	statFunc     func(path string) (os.FileInfo, error)
 }
 
-func (m *mockReadOps) ReadFile(path string) ([]byte, error) { return m.readFileFunc(path) }
+func (m *mockReadOps) ReadFile(path string) ([]byte, error)  { return m.readFileFunc(path) }
 func (m *mockReadOps) Stat(path string) (os.FileInfo, error) { return m.statFunc(path) }
 
 type mockEditOps struct {
@@ -60,9 +60,11 @@ type mockEditOps struct {
 	accessFunc    func(path string) error
 }
 
-func (m *mockEditOps) ReadFile(path string) ([]byte, error)    { return m.readFileFunc(path) }
-func (m *mockEditOps) WriteFile(path string, content []byte) error { return m.writeFileFunc(path, content) }
-func (m *mockEditOps) Access(path string) error                 { return m.accessFunc(path) }
+func (m *mockEditOps) ReadFile(path string) ([]byte, error) { return m.readFileFunc(path) }
+func (m *mockEditOps) WriteFile(path string, content []byte) error {
+	return m.writeFileFunc(path, content)
+}
+func (m *mockEditOps) Access(path string) error { return m.accessFunc(path) }
 
 type mockLsOps struct {
 	existsFunc  func(path string) bool
@@ -70,9 +72,9 @@ type mockLsOps struct {
 	readDirFunc func(path string) ([]os.DirEntry, error)
 }
 
-func (m *mockLsOps) Exists(path string) bool                      { return m.existsFunc(path) }
-func (m *mockLsOps) Stat(path string) (os.FileInfo, error)        { return m.statFunc(path) }
-func (m *mockLsOps) ReadDir(path string) ([]os.DirEntry, error)   { return m.readDirFunc(path) }
+func (m *mockLsOps) Exists(path string) bool                    { return m.existsFunc(path) }
+func (m *mockLsOps) Stat(path string) (os.FileInfo, error)      { return m.statFunc(path) }
+func (m *mockLsOps) ReadDir(path string) ([]os.DirEntry, error) { return m.readDirFunc(path) }
 
 type mockGrepOps struct {
 	isDirectoryFunc func(path string) (bool, error)
@@ -87,7 +89,7 @@ type mockFindOps struct {
 	globFunc   func(pattern string, cwd string, ignore []string, limit int) ([]string, error)
 }
 
-func (m *mockFindOps) Exists(path string) bool                                          { return m.existsFunc(path) }
+func (m *mockFindOps) Exists(path string) bool { return m.existsFunc(path) }
 func (m *mockFindOps) Glob(pattern string, cwd string, ignore []string, limit int) ([]string, error) {
 	return m.globFunc(pattern, cwd, ignore, limit)
 }
@@ -261,6 +263,28 @@ func TestReadToolWithOffsetLimit(t *testing.T) {
 	}
 }
 
+func TestReadToolWithOffsetBeyondEndOfFile(t *testing.T) {
+	tool := NewReadTool("/tmp", &ReadToolConfig{
+		Operations: &mockReadOps{
+			readFileFunc: func(path string) ([]byte, error) {
+				return []byte("line1\nline2\nline3\n"), nil
+			},
+			statFunc: func(path string) (os.FileInfo, error) {
+				return &mockFileInfo{size: 18}, nil
+			},
+		},
+	})
+	limit := 10
+	offset := 1000
+	tr, err := callTool(t, tool, ReadToolInput{Path: "test.txt", Offset: &offset, Limit: &limit})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if tr.Content != "" {
+		t.Fatalf("content = %q, want empty", tr.Content)
+	}
+}
+
 func TestReadToolFileNotFound(t *testing.T) {
 	tool := NewReadTool("/tmp", &ReadToolConfig{
 		Operations: &mockReadOps{
@@ -351,9 +375,9 @@ type mockDirEntry struct {
 }
 
 func (m *mockDirEntry) Name() string               { return m.name }
-func (m *mockDirEntry) IsDir() bool                 { return m.isDir }
-func (m *mockDirEntry) Type() os.FileMode           { return 0 }
-func (m *mockDirEntry) Info() (os.FileInfo, error)  { return nil, nil }
+func (m *mockDirEntry) IsDir() bool                { return m.isDir }
+func (m *mockDirEntry) Type() os.FileMode          { return 0 }
+func (m *mockDirEntry) Info() (os.FileInfo, error) { return nil, nil }
 
 func TestLsToolBasic(t *testing.T) {
 	tool := NewLsTool("/tmp", &LsToolConfig{

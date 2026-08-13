@@ -286,7 +286,14 @@ func (e *Executor) executeSerial(ctx context.Context, calls []ToolCall, state *A
 		if cb != nil && cb.OnStart != nil {
 			cb.OnStart(tc)
 		}
-		results[i] = e.Execute(ctx, tc, state)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					results[i] = ToolResult{ToolName: tc.Name, Result: fmt.Sprintf("panic: %v", r)}
+				}
+			}()
+			results[i] = e.Execute(ctx, tc, state)
+		}()
 		if cb != nil && cb.OnEnd != nil {
 			cb.OnEnd(results[i])
 		}
