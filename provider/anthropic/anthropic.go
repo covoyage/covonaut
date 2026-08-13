@@ -26,6 +26,10 @@ type Config struct {
 	BaseURL string
 	Version string       // API version header, defaults to "2023-06-01"
 	Client  *http.Client // Optional: custom HTTP client, defaults to http.Client with 5m timeout
+
+	// ExtraHeaders are additional HTTP headers merged into every request.
+	// Keys override defaults when overlapping (except Content-Type).
+	ExtraHeaders map[string]string
 }
 
 // Provider implements agentcore.Provider for the Anthropic Messages API.
@@ -590,6 +594,9 @@ func (p *Provider) doHTTP(ctx context.Context, body any) (*http.Response, error)
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("x-api-key", p.config.APIKey)
 	httpReq.Header.Set("anthropic-version", p.config.Version)
+	for k, v := range p.config.ExtraHeaders {
+		httpReq.Header.Set(k, v)
+	}
 
 	return p.client.Do(httpReq)
 }

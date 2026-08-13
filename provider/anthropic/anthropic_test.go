@@ -322,3 +322,48 @@ func TestProviderStream_EmitsThinkingBlocks(t *testing.T) {
 		t.Fatalf("tool args = %q", args)
 	}
 }
+
+func TestProviderComplete_MergesExtraHeaders(t *testing.T) {
+	var gotHeaders http.Header
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"msg_123",
+			"content":[{"type":"text","text":"ok"}],
+			"stop_reason":"end_turn",
+			"usage":{"input_tokens":4,"output_tokens":3}
+		}`))
+	}))
+	defer srv.Close()
+
+	provider := New(Config{
+		APIKey:  "test-key",
+		BaseURL: srv.URL,
+		Client:  srv.Client(),
+		ExtraHeaders: map[string]string{
+			"User-Agent": "covo-agent/0.0.1",
+			"X-App-Name": "covo-agent",
+			"x-api-key":  "overridden", // ExtraHeaders take precedence over defaults
+		},
+	})
+
+	_, err := provider.Complete(context.Background(), &agentcore.ProviderRequest{
+		Model:    "claude-sonnet",
+		Messages: []agentcore.Message{{Role: agentcore.RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if gotHeaders.Get("User-Agent") != "covo-agent/0.0.1" {
+		t.Fatalf("User-Agent = %q", gotHeaders.Get("User-Agent"))
+	}
+	if gotHeaders.Get("X-App-Name") != "covo-agent" {
+		t.Fatalf("X-App-Name = %q", gotHeaders.Get("X-App-Name"))
+	}
+	if gotHeaders.Get("x-api-key") != "overridden" {
+		t.Fatalf("x-api-key = %q (ExtraHeaders should override defaults)", gotHeaders.Get("x-api-key"))
+	}
+}

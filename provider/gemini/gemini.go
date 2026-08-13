@@ -27,6 +27,10 @@ type Config struct {
 	// "x-goog-api-key: <key>". Required for GCP Vertex AI endpoints which
 	// expect an OAuth access token in the Authorization header.
 	UseBearerAuth bool
+
+	// ExtraHeaders are additional HTTP headers merged into every request.
+	// Keys override defaults when overlapping (except Content-Type).
+	ExtraHeaders map[string]string
 }
 
 // Provider implements agentcore.Provider for the Gemini native REST API.
@@ -587,6 +591,9 @@ func (p *Provider) doHTTP(ctx context.Context, url string, body any) (*http.Resp
 		httpReq.Header.Set("Authorization", "Bearer "+p.config.APIKey)
 	} else {
 		httpReq.Header.Set("x-goog-api-key", p.config.APIKey)
+	}
+	for k, v := range p.config.ExtraHeaders {
+		httpReq.Header.Set(k, v)
 	}
 
 	return p.client.Do(httpReq)

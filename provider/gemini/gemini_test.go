@@ -300,3 +300,39 @@ func TestProviderStream_EmitsThinkingBlocks(t *testing.T) {
 		t.Fatalf("tool args = %q", args)
 	}
 }
+
+func TestProviderComplete_MergesExtraHeaders(t *testing.T) {
+	var gotHeaders http.Header
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"candidates":[{"content":{"parts":[{"text":"ok"}]}}],
+			"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":3,"totalTokenCount":7}
+		}`))
+	}))
+	defer srv.Close()
+
+	provider := New(Config{
+		APIKey:  "test-key",
+		BaseURL: srv.URL,
+		Model:   "gemini-2.5-flash",
+		Client:  srv.Client(),
+		ExtraHeaders: map[string]string{
+			"User-Agent": "covo-agent/0.0.1",
+		},
+	})
+
+	_, err := provider.Complete(context.Background(), &agentcore.ProviderRequest{
+		Model:    "gemini-2.5-flash",
+		Messages: []agentcore.Message{{Role: agentcore.RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if gotHeaders.Get("User-Agent") != "covo-agent/0.0.1" {
+		t.Fatalf("User-Agent = %q", gotHeaders.Get("User-Agent"))
+	}
+}
