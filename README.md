@@ -144,6 +144,29 @@ cfg := agentcore.Config{
 }
 ```
 
+### Observability
+
+Distributed tracing via a backend-agnostic `Tracer` interface (OpenTelemetry
+adapter included), and runtime metrics via the complementary `Metrics`
+interface. Set both on `agentcore.Config`; each is optional and nil-safe.
+
+```go
+cfg := agentcore.Config{
+    ModelConfig: ...,
+    Tracer:      agentcore.NewOtelTracer(tp.Tracer("my-agent")),
+    Metrics:     agentcore.NewOtelMetrics(mp.Meter("my-agent")),
+}
+```
+
+`Tracer` emits correlated `agent`/`model`/`tool` spans (with `run.id` /
+`component` attributes) for every run path. `Metrics` records GenAI-standard
+token usage and duration for every LLM call, plus `agentcore.errors` counts by
+component (`model`/`tool`/`agent`) — tool errors are injected into the executor
+chain and agent-run failures are recorded automatically, so hosts get error
+telemetry with no extra wiring. Wrap `Config.Provider` with
+`agentcore.NewModelMetricsMiddleware(cfg.Metrics)` to count the model layer
+(mid-stream terminal errors, e.g. repetition loops, are counted too).
+
 ### Events
 
 Type-safe event bus for real-time observability.

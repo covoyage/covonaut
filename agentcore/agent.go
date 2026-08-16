@@ -50,6 +50,7 @@ type Config struct {
 
 	Handoffs []HandoffConfig // optional: sub-agents reachable via handoff
 	Tracer   Tracer          // optional: distributed tracing
+	Metrics  Metrics         // optional: runtime metrics (token usage, errors)
 
 	// LLM-level retry with exponential backoff.
 	// Context overflow errors trigger compaction instead of retry.
@@ -137,6 +138,7 @@ func New(cfg Config) *Agent {
 		ArgumentRepairFunc: cfg.ArgumentRepairFunc,
 	}
 	execCfg.Middleware = append([]Middleware{TracingMiddleware(cfg.Tracer)}, execCfg.Middleware...)
+	execCfg.Middleware = append(execCfg.Middleware, MetricsMiddleware(cfg.Metrics))
 
 	engineReg := NewEngineRegistry()
 
@@ -222,6 +224,7 @@ func (a *Agent) rebuildExecutor() {
 		unknownHandler = DynamicUnknownToolHandler(a.registry)
 	}
 	middleware := append([]Middleware{TracingMiddleware(cfg.Tracer)}, cfg.Middleware...)
+	middleware = append(middleware, MetricsMiddleware(cfg.Metrics))
 	a.executor = NewExecutor(a.registry, ExecutorConfig{
 		Mode:               cfg.ExecutionMode,
 		Concurrency:        cfg.Concurrency,
@@ -567,6 +570,7 @@ func (a *Agent) Run(ctx context.Context, input string) (string, error) {
 	if err != nil {
 		span.RecordError(err)
 	}
+	a.recordAgentError(ctx, err)
 	return output, err
 }
 
@@ -591,6 +595,7 @@ func (a *Agent) Continue(ctx context.Context) (string, error) {
 	if err != nil {
 		span.RecordError(err)
 	}
+	a.recordAgentError(ctx, err)
 	return output, err
 }
 
@@ -629,6 +634,7 @@ func (a *Agent) Resume(ctx context.Context) (string, error) {
 	output, err := a.runLoop(ctx)
 	if err != nil {
 		span.RecordError(err)
+		a.recordAgentError(ctx, err)
 		return "", WrapNodeError(err, "resume")
 	}
 	return output, nil
@@ -1349,12 +1355,15 @@ func (a *Agent) callProvider(ctx context.Context, req *ProviderRequest, target M
 	if target.Model != "" {
 		targetReq.Model = target.Model
 	}
-	ctx, span, _ := StartComponentRun(ctx, a.tracer(), "model", targetReq.Model,
+	startAttrs := []SpanAttribute{
 		Attr("model", targetReq.Model),
 		Attr("target", target.Name),
 		Attr("streaming", a.config.Streaming),
 		Attr("tool_count", len(targetReq.Tools)),
-	)
+	}
+	// OpenTelemetry GenAI semantic convention attributes (request side).
+	startAttrs = append(startAttrs, modelRequestAttrs(&targetReq)...)
+	ctx, span, _ := StartComponentRun(ctx, a.tracer(), "model", targetReq.Model, startAttrs...)
 	defer span.End()
 
 	var resp *ProviderResponse
@@ -1366,6 +1375,10 @@ func (a *Agent) callProvider(ctx context.Context, req *ProviderRequest, target M
 	}
 	if err != nil {
 		span.RecordError(err)
+	}
+	if resp != nil {
+		attrs := modelResponseAttrs(&targetReq, &resp.Usage, resp.FinishReason, resp.Content, genAIPromptFromMessages(targetReq.Messages))
+		span.SetAttributes(attrs...)
 	}
 	return resp, err
 }
@@ -1677,4 +1690,17 @@ func (a *Agent) tracer() Tracer {
 		return a.config.Tracer
 	}
 	return noopTracer{}
+}
+
+func (a *Agent) metrics() Metrics {
+	if a.config.Metrics != nil {
+		return a.config.Metrics
+	}
+	return noopMetrics{}
+}
+
+func (a *Agent) recordAgentError(ctx context.Context, err error) {
+	if err != nil {
+		a.metrics().RecordError(ctx, "agent", err)
+	}
 }
