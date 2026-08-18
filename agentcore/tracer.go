@@ -101,12 +101,36 @@ func (noopSpan) RecordError(_ error)                   {}
 func (noopSpan) AddEvent(_ string, _ ...SpanAttribute) {}
 
 // TracingMiddleware creates an Executor middleware that wraps each tool call in a trace span.
+// Input (tool arguments) and output (result content) are recorded as span attributes
+// so observability backends can inspect what was passed to and returned by each tool.
+//
+// Multi-backend compatibility: different LLM observability platforms use different
+// attribute names for input/output. We write all known conventions so data appears
+// regardless of which backend is active:
+//   - langfuse.observation.input/output  (Langfuse)
+//   - langsmith.input/output             (LangSmith)
+//   - input.value/output.value           (OpenInference / MLflow)
+//   - tool.input/output                  (generic fallback for Jaeger, Tempo, etc.)
+//
+// Additionally, observation type/kind attributes ensure tool calls are correctly
+// classified (not as LLM generations):
+//   - langfuse.observation.type = "span"       (Langfuse)
+//   - langsmith.span.kind = "tool"             (LangSmith)
 func TracingMiddleware(tracer Tracer) Middleware {
 	return func(next ExecuteFunc) ExecuteFunc {
 		return func(ctx context.Context, tc ToolCall) (string, error) {
+			input := truncateToolData(string(tc.Arguments), 4096)
 			ctx, span, _ := StartComponentRun(ctx, tracer, "tool", tc.Name,
 				Attr("tool.name", tc.Name),
 				Attr("tool.call_id", tc.ID),
+				// Input/output — multi-backend
+				Attr("langfuse.observation.input", input),
+				Attr("langsmith.input", input),
+				Attr("input.value", input),
+				Attr("tool.input", input),
+				// Observation type — classify as span/tool, not generation
+				Attr("langfuse.observation.type", "span"),
+				Attr("langsmith.span.kind", "tool"),
 			)
 			defer span.End()
 
@@ -114,8 +138,26 @@ func TracingMiddleware(tracer Tracer) Middleware {
 			if err != nil {
 				span.RecordError(err)
 			}
-			span.SetAttributes(Attr("tool.result_size", len(result)))
+			output := truncateToolData(result, 4096)
+			span.SetAttributes(
+				// Output — multi-backend
+				Attr("langfuse.observation.output", output),
+				Attr("langsmith.output", output),
+				Attr("output.value", output),
+				Attr("tool.output", output),
+				Attr("tool.result_size", len(result)),
+			)
 			return result, err
 		}
 	}
+}
+
+// truncateToolData truncates tool input/output to maxLen characters,
+// appending "..." if truncated. Prevents oversized span attributes.
+func truncateToolData(s string, maxLen int) string {
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	return string(runes[:maxLen]) + "..."
 }
