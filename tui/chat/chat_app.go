@@ -84,6 +84,13 @@ type ChatAppConfig struct {
 	OnInterrupt  func()
 	OnImagePaste func() // called when an image paste is detected (clipboard image, empty text)
 
+	// OnGhostRequest is called when the editor content changes and an inline
+	// completion should be fetched. The callback receives the full editor
+	// content and must call cb(completionText) asynchronously (or with "" to
+	// clear). The editor shows the completion as dimmed ghost text after the
+	// cursor; Tab accepts it.
+	OnGhostRequest func(prompt string, cb func(string))
+
 	Host AppHost
 }
 
@@ -233,6 +240,15 @@ func newChatApp(cfg ChatAppConfig) *ChatApp {
 				chatApp.ac.Refresh(value, int64(len(value)))
 			}
 			chatApp.host.RequestRender()
+		}
+		// Trigger ghost text request
+		if chatApp.cfg.OnGhostRequest != nil && value != "" {
+			chatApp.cfg.OnGhostRequest(value, func(completion string) {
+				chatApp.editor.SetGhost(completion)
+				chatApp.host.RequestRender()
+			})
+		} else {
+			chatApp.editor.ClearGhost()
 		}
 	})
 	editor.OnSubmit(func(value string) {
@@ -1098,20 +1114,33 @@ func (l *chatLayout) Update(msg core.Msg) core.Cmd {
 						}
 						return nil
 					}
-				case "escape":
-					if l.ac != nil && l.ac.Active() {
-						l.ac.Hide()
-						// File browser: ESC navigates up one level.
-						value := l.app.editor.GetValue()
-						if (strings.HasPrefix(value, "@file:") || strings.HasPrefix(value, "@folder:")) &&
-							len(value) > len("@file:") {
-							newValue := popLastPathSegment(value)
-							l.app.editor.SetValue(newValue)
-							l.app.skipRefresh = false
-							l.ac.Refresh(newValue, int64(len(newValue)))
-						}
-						return nil
+			case "escape":
+				if l.ac != nil && l.ac.Active() {
+					l.ac.Hide()
+					// File browser: ESC navigates up one level.
+					value := l.app.editor.GetValue()
+					if (strings.HasPrefix(value, "@file:") || strings.HasPrefix(value, "@folder:")) &&
+						len(value) > len("@file:") {
+						newValue := popLastPathSegment(value)
+						l.app.editor.SetValue(newValue)
+						l.app.skipRefresh = false
+						l.ac.Refresh(newValue, int64(len(newValue)))
 					}
+					return nil
+				}
+				// ESC also clears ghost text
+				if l.app.editor.GhostText() != "" {
+					l.app.editor.ClearGhost()
+					l.app.host.RequestRender()
+					return nil
+				}
+			case "tab":
+				// Tab accepts ghost text when autocomplete is not active
+				if l.app.editor.GhostText() != "" {
+					l.app.editor.AcceptGhost()
+					l.app.host.RequestRender()
+					return nil
+				}
 				case "pageUp":
 					l.history.ScrollBy(-5)
 				case "pageDown":
@@ -1147,6 +1176,16 @@ func (l *chatLayout) Update(msg core.Msg) core.Cmd {
 	if l.ac != nil && l.ac.Active() {
 		switch msg.(type) {
 		case core.KeyMsg:
+			// Tab while autocomplete is active: if there's ghost text, accept
+			// it instead of applying the autocomplete suggestion.
+			for _, k := range terminal.ParseKeys(msg.(core.KeyMsg).Data) {
+				name := strings.ToLower(k.Name)
+				if name == "tab" && l.app.editor.GhostText() != "" {
+					l.app.editor.AcceptGhost()
+					l.app.host.RequestRender()
+					return nil
+				}
+			}
 			l.ac.Update(msg)
 		}
 	}

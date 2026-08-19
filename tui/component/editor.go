@@ -80,6 +80,11 @@ type Editor struct {
 	inputHistoryMax   int64
 	inputHistoryDraft string // buffer saved when entering history browse mode
 
+	// Ghost text — inline completion preview (Copilot-style).
+	ghostText   string // the suggested completion text
+	ghostCol    int64  // rune offset in the current line where ghost starts (cursor position at request time)
+	ghostRow    int64  // hard row index where the ghost applies
+
 	onSubmit func(value string)
 	onChange func(value string)
 	onCancel func()
@@ -197,12 +202,60 @@ func (e *Editor) SetValue(s string) {
 	e.allSelected = false
 	e.selActive = false
 	e.selDragging = false
+	e.ghostText = ""
 	fn := e.onChange
 	val := e.valueLocked()
 	e.mu.Unlock()
 	if fn != nil {
 		fn(val)
 	}
+}
+
+// SetGhost sets the inline completion ghost text. The text is displayed as a
+// dimmed suffix after the cursor on the current line. Call with "" to clear.
+func (e *Editor) SetGhost(text string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if text == "" {
+		e.ghostText = ""
+		return
+	}
+	e.ghostText = text
+	e.ghostRow = e.row
+	e.ghostCol = e.col
+}
+
+// ClearGhost removes the current ghost text.
+func (e *Editor) ClearGhost() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.ghostText = ""
+}
+
+// AcceptGhost inserts the ghost text into the buffer at the cursor position.
+// Returns true if ghost was accepted.
+func (e *Editor) AcceptGhost() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.ghostText == "" {
+		return false
+	}
+	e.pushSnapshotLocked()
+	e.insertStringLocked(e.ghostText)
+	e.ghostText = ""
+	fn := e.onChange
+	v := e.valueLocked()
+	if fn != nil {
+		fn(v)
+	}
+	return true
+}
+
+// GhostText returns the current ghost text (empty if none).
+func (e *Editor) GhostText() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.ghostText
 }
 
 // GetValue returns the current buffer as a string.
@@ -573,6 +626,24 @@ func (e *Editor) Render(width int64) []string {
 		body := core.PadToWidth(bodyText, innerW)
 		if int64(idx) == cursorV {
 			body = core.InsertMarker(body, cursorCol)
+			// Append ghost text (inline completion preview) as dimmed text
+			// after the cursor, only on the first segment of the cursor row.
+			if e.ghostText != "" && v.hardRow == e.ghostRow && v.isFirstSeg {
+				ghostRunes := []rune(e.ghostText)
+				// Truncate ghost to fit remaining width
+				usedCells := core.CellWidthOfRunes(e.lines[e.row], 0, e.col)
+				remaining := innerW - usedCells
+				if remaining > 0 && int64(len(ghostRunes)) > 0 {
+					ghostDisplay := core.TruncateToWidth(e.ghostText, remaining, "")
+					ghostStyled := theme.CurrentPalette().Dim.Render(ghostDisplay)
+					// Insert ghost after cursor marker
+					markerIdx := strings.Index(body, core.CURSOR_MARKER)
+					if markerIdx >= 0 {
+						markerEnd := markerIdx + len(core.CURSOR_MARKER)
+						body = body[:markerEnd] + ghostStyled + body[markerEnd:]
+					}
+				}
+			}
 		}
 		line := pad + promptFn(prompt) + body
 		out = append(out, core.PadToWidth(line, width))
@@ -666,66 +737,87 @@ func (e *Editor) processKeys(data string) {
 		raw := k.Raw
 		switch {
 		case km.Matches(raw, "tui.input.newLine"):
+			e.ghostText = ""
 			e.insertRune('\n')
 		case km.Matches(raw, "tui.input.submit"):
+			e.ghostText = ""
 			e.submit()
 		case km.Matches(raw, "tui.editor.selectAll"):
 			e.SelectAll()
 		case km.Matches(raw, "tui.editor.cursorLeft"):
+			e.ghostText = ""
 			e.moveCursor(0, -1)
 		case km.Matches(raw, "tui.editor.cursorRight"):
+			e.ghostText = ""
 			e.moveCursor(0, 1)
 		case km.Matches(raw, "tui.editor.cursorUp"):
+			e.ghostText = ""
 			if e.focused && e.row == 0 && e.historyPrev() {
 			} else {
 				e.moveCursor(-1, 0)
 			}
 		case km.Matches(raw, "tui.editor.cursorDown"):
+			e.ghostText = ""
 			if e.focused && e.row >= int64(len(e.lines)-1) && e.historyNext() {
 			} else {
 				e.moveCursor(1, 0)
 			}
 		case km.Matches(raw, "tui.editor.cursorWordLeft"):
+			e.ghostText = ""
 			e.moveWord(-1)
 		case km.Matches(raw, "tui.editor.cursorWordRight"):
+			e.ghostText = ""
 			e.moveWord(1)
 		case km.Matches(raw, "tui.editor.cursorLineStart"):
 			e.mu.Lock()
+			e.ghostText = ""
 			e.allSelected = false
 			e.clearMouseSelectionLocked()
 			e.col = 0
 			e.mu.Unlock()
 		case km.Matches(raw, "tui.editor.cursorLineEnd"):
 			e.mu.Lock()
+			e.ghostText = ""
 			e.allSelected = false
 			e.clearMouseSelectionLocked()
 			e.col = int64(len(e.lines[e.row]))
 			e.mu.Unlock()
 		case km.Matches(raw, "tui.editor.deleteCharBackward"):
+			e.ghostText = ""
 			e.deleteBackward()
 		case km.Matches(raw, "tui.editor.deleteCharForward"):
+			e.ghostText = ""
 			e.deleteForward()
 		case km.Matches(raw, "tui.editor.deleteWordBackward"):
+			e.ghostText = ""
 			e.deleteWordBackward()
 		case km.Matches(raw, "tui.editor.deleteWordForward"):
+			e.ghostText = ""
 			e.deleteWordForward()
 		case km.Matches(raw, "tui.editor.deleteToLineStart"):
+			e.ghostText = ""
 			e.deleteToLineStart()
 		case km.Matches(raw, "tui.editor.deleteToLineEnd"):
+			e.ghostText = ""
 			e.deleteToLineEnd()
 		case km.Matches(raw, "tui.editor.yank"):
+			e.ghostText = ""
 			e.yank()
 		case km.Matches(raw, "tui.editor.yankPop"):
+			e.ghostText = ""
 			e.yankPop()
 		case km.Matches(raw, "tui.editor.undo"):
+			e.ghostText = ""
 			e.undo()
 		case km.Matches(raw, "ctrl+shift+z"), km.Matches(raw, "ctrl+y"):
+			e.ghostText = ""
 			e.redo()
 		default:
 			if k.Rune == '\n' || k.Rune == '\r' {
 				continue
 			}
 			if k.IsPrintable() {
+				e.ghostText = ""
 				e.insertRune(k.Rune)
 			}
 		}
