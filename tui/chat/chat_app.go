@@ -771,12 +771,10 @@ func (a *ChatApp) onTurnStart(e ChatEvent) {
 }
 
 func (a *ChatApp) onTurnEnd(e ChatEvent) {
-	// Collapse consecutive tool messages now that the turn is complete.
 	// (Token-usage display, if enabled, is owned by the StatusBar via its
 	// own event subscription; this hook no longer forwards raw numbers to
 	// a config callback. Consumers needing the numbers should subscribe to
 	// ChatEventTurnEnd directly.)
-	a.history.CollapseConsecutiveTools()
 }
 
 func (a *ChatApp) onCompactionStart(e ChatEvent) {

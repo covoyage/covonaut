@@ -253,6 +253,10 @@ func TestLatestMessageSelectionAfterGroupedTools(t *testing.T) {
 	h.Append(ChatMessage{Role: RoleTool, Text: "first tool result", Collapsed: true})
 	h.Append(ChatMessage{Role: RoleTool, Text: "second tool result", Collapsed: true})
 	h.Append(ChatMessage{Role: RoleAssistant, Text: "latest answer is selectable"})
+	// Explicitly collapse the tool group
+	h.mu.Lock()
+	h.expandedGroups[1] = false
+	h.mu.Unlock()
 	h.SetMaxRows(100)
 	_ = h.Render(80)
 
@@ -283,6 +287,10 @@ func TestToggleHitTestingUsesMessageIndexAfterGroupedTools(t *testing.T) {
 	h.Append(ChatMessage{Role: RoleTool, Text: "second tool result", Collapsed: true})
 	h.Append(ChatMessage{Role: RoleAssistant, Text: "plain answer"})
 	h.Append(ChatMessage{Role: RoleAssistant, Text: "diff answer", Meta: "diff"})
+	// Explicitly collapse the tool group
+	h.mu.Lock()
+	h.expandedGroups[1] = false
+	h.mu.Unlock()
 	h.SetMaxRows(100)
 	_ = h.Render(80)
 

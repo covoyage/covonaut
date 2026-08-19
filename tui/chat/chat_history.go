@@ -111,9 +111,10 @@ type msgRange struct {
 	startLine int
 	endLine   int
 	msgIndex  int
-	toolGroup bool // true if this is a collapsed tool group
-	groupFrom int  // first message index in the group
-	groupTo   int  // last message index in the group
+	toolGroup    bool // true if this is a collapsed tool group
+	groupFrom    int  // first message index in the group
+	groupTo      int  // last message index in the group
+	groupHeader  bool // true if this is the header line of an expanded tool group
 }
 
 type selectionPos struct {
@@ -252,11 +253,11 @@ func (h *ChatHistory) CollapseConsecutiveTools() {
 		return
 	}
 	// Ensure expandedGroups map exists and mark this group as collapsed
-	// by removing the key (default is false/collapsed).
+	// by setting the key to false (default is now expanded).
 	if h.expandedGroups == nil {
 		h.expandedGroups = make(map[int]bool)
 	}
-	delete(h.expandedGroups, runStart)
+	h.expandedGroups[runStart] = false
 	h.dirty = true
 }
 
@@ -767,10 +768,13 @@ func (h *ChatHistory) expandToolGroup(msgRangeIdx int) {
 	}
 	r := h.cachedMsgRanges[msgRangeIdx]
 	if r.toolGroup {
-		if h.expandedGroups[r.msgIndex] {
-			delete(h.expandedGroups, r.msgIndex)
+		expanded, ok := h.expandedGroups[r.msgIndex]
+		if !ok || expanded {
+			// 默认展开或已展开 → 折叠
+			h.expandedGroups[r.msgIndex] = false
 		} else {
-			h.expandedGroups[r.msgIndex] = true
+			// 已折叠 → 展开（删除 key 恢复默认展开）
+			delete(h.expandedGroups, r.msgIndex)
 		}
 	}
 	h.dirty = true
@@ -790,7 +794,13 @@ func (h *ChatHistory) tryToggleThinkingAtLineLocked(absLine int64) bool {
 	}
 	msgRange := &h.cachedMsgRanges[rangeIdx]
 
-	// Check if it's a tool group
+	// Click on expanded group header → collapse the group
+	if msgRange.groupHeader {
+		h.expandToolGroup(rangeIdx)
+		h.dirty = true
+		return true
+	}
+	// Click on collapsed group → expand the group
 	if msgRange.toolGroup {
 		h.expandToolGroup(rangeIdx)
 		h.dirty = true
@@ -1019,20 +1029,30 @@ func (h *ChatHistory) renderAll(width int64) []string {
 					}
 				}
 
-				if h.expandedGroups[i] {
+				expanded, ok := h.expandedGroups[i]
+				if !ok {
+					expanded = true // 默认展开
+				}
+				if expanded {
 					start := len(out)
 					summary := fmt.Sprintf("[-] %d tools · %d msgs", toolCount, sysCount)
 					if sysCount == 0 {
 						summary = fmt.Sprintf("[-] %d tools", toolCount)
 					}
 					out = append(out, core.PadToWidth(bar+theme.DimStyle.Render(summary), width))
-					for j := i; j <= groupEnd; j++ {
-						out = append(out, h.renderMessage(h.messages[j], theme, width)...)
-					}
+					// Header range — clicking this collapses the group
 					ranges = append(ranges, msgRange{
 						startLine: start, endLine: len(out), msgIndex: i,
 						toolGroup: true, groupFrom: i, groupTo: groupEnd,
+						groupHeader: true,
 					})
+					for j := i; j <= groupEnd; j++ {
+						start := len(out)
+						out = append(out, h.renderMessage(h.messages[j], theme, width)...)
+						ranges = append(ranges, msgRange{
+							startLine: start, endLine: len(out), msgIndex: j,
+						})
+					}
 				} else {
 					start := len(out)
 					summary := fmt.Sprintf("[+] %d tools · %d msgs", toolCount, sysCount)
