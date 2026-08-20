@@ -236,8 +236,8 @@ func (e *Editor) ClearGhost() {
 // Returns true if ghost was accepted.
 func (e *Editor) AcceptGhost() bool {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if e.ghostText == "" {
+		e.mu.Unlock()
 		return false
 	}
 	e.pushSnapshotLocked()
@@ -245,6 +245,7 @@ func (e *Editor) AcceptGhost() bool {
 	e.ghostText = ""
 	fn := e.onChange
 	v := e.valueLocked()
+	e.mu.Unlock()
 	if fn != nil {
 		fn(v)
 	}
