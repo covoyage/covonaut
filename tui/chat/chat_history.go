@@ -38,14 +38,25 @@ const (
 
 // ChatMessage is one item in the chat transcript.
 type ChatMessage struct {
-	ID       string        // optional — non-empty enables in-place updates.
-	Role     ChatRole      // governs default styling & prefix.
-	Text     string        // raw source (markdown for assistant, plain for others).
-	Pending  bool          // the message is still streaming; a cursor may be shown.
-	Meta     string        // e.g. tool name, duration.
-	At       time.Time     // emission time (for display).
-	Duration time.Duration // optional — displayed after Meta.
-	Collapsed bool         // when true, tool output shows summary; click to expand.
+	ID        string        // optional — non-empty enables in-place updates.
+	Role      ChatRole      // governs default styling & prefix.
+	Text      string        // raw source (markdown for assistant, plain for others).
+	Pending   bool          // the message is still streaming; a cursor may be shown.
+	Meta      string        // e.g. tool name, duration.
+	At        time.Time     // emission time (for display).
+	Duration  time.Duration // optional — displayed after Meta.
+	Collapsed bool          // when true, tool output shows summary; click to expand.
+
+	// ArgPreview is the distilled primary argument of a tool call, shown
+	// dimmed after the tool name (e.g. "bash(grep -rn TODO)"). Stored
+	// un-truncated; the renderer fits it to the terminal width.
+	ArgPreview string
+	// Detail holds the full tool result body, shown on click or in verbose
+	// mode (ctrl+r); the head always shows the status line.
+	Detail string
+	// DetailVisible marks a tool message whose result body is expanded
+	// (toggled by clicking the tool row).
+	DetailVisible bool
 
 	// Thinking blocks (structured content).
 	ThinkingSegments []ThinkingSegment
@@ -108,13 +119,13 @@ func DefaultChatHistoryTheme() ChatHistoryTheme {
 // ChatHistory is a Component that renders ChatMessages inside a scrollable
 // viewport.
 type msgRange struct {
-	startLine int
-	endLine   int
-	msgIndex  int
-	toolGroup    bool // true if this is a collapsed tool group
-	groupFrom    int  // first message index in the group
-	groupTo      int  // last message index in the group
-	groupHeader  bool // true if this is the header line of an expanded tool group
+	startLine   int
+	endLine     int
+	msgIndex    int
+	toolGroup   bool // true if this is a collapsed tool group
+	groupFrom   int  // first message index in the group
+	groupTo     int  // last message index in the group
+	groupHeader bool // true if this is the header line of an expanded tool group
 }
 
 type selectionPos struct {
@@ -133,11 +144,13 @@ type ChatHistory struct {
 	reasoningRenderer ReasoningRenderer
 
 	// render cache keyed on width + invalidation counter.
-	cachedWidth    int64
-	cachedAll      []string
+	cachedWidth     int64
+	cachedAll       []string
 	cachedMsgRanges []msgRange
-	dirty          bool
-	expandedGroups map[int]bool // group message indices that are expanded
+	dirty           bool
+	expandedGroups  map[int]bool // group message indices that are expanded
+	verbose         bool         // global verbose mode: expand everything, show full tool output
+	limits          DisplayLimits
 
 	// optional invalidate callback (usually TUI.RequestRender).
 	onInvalidate func()
@@ -155,7 +168,7 @@ type ChatHistory struct {
 	// gesture (press-motion-release) is suppressed. This prevents accidental text
 	// selection when the user switches from two-finger scroll to single-finger
 	// slide on a trackpad.
-	lastWheelAt    time.Time
+	lastWheelAt     time.Time
 	suppressGesture bool
 }
 
@@ -164,10 +177,11 @@ type ChatHistory struct {
 // SetReasoningRenderer to enable it.
 func NewChatHistory() *ChatHistory {
 	return &ChatHistory{
-		theme:            DefaultChatHistoryTheme(),
-		follow:           true,
-		dirty:            true,
-		expandedGroups:   make(map[int]bool),
+		theme:             DefaultChatHistoryTheme(),
+		follow:            true,
+		dirty:             true,
+		expandedGroups:    make(map[int]bool),
+		limits:            DisplayLimits{}.withDefaults(),
 		reasoningRenderer: HiddenReasoningRenderer{},
 	}
 }
@@ -227,6 +241,32 @@ func (h *ChatHistory) SetMaxRowsDirect(n int64) {
 	h.mu.Lock()
 	h.maxRows = n
 	h.mu.Unlock()
+}
+
+// SetDisplayLimits updates the transcript rendering caps (zero values fall
+// back to library defaults).
+func (h *ChatHistory) SetDisplayLimits(l DisplayLimits) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.limits = l.withDefaults()
+	h.dirty = true
+}
+
+// ToggleVerbose flips the global verbose mode (expand all collapsed tool
+// blocks and reveal full stored output). Returns the new state.
+func (h *ChatHistory) ToggleVerbose() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.verbose = !h.verbose
+	h.dirty = true
+	return h.verbose
+}
+
+// Verbose reports the current verbose mode.
+func (h *ChatHistory) Verbose() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.verbose
 }
 
 // CollapseConsecutiveTools collapses consecutive tool/system messages
@@ -538,6 +578,54 @@ func (h *ChatHistory) Render(width int64) []string {
 }
 
 // Invalidate drops the render cache.
+// toolArgPart renders the "(primary-argument)" suffix for a tool head,
+// truncated to whatever fits the remaining line width. used is the visible
+// width the head already occupies around the argument. In verbose mode the
+// argument is shown un-truncated (WrapAnsi wraps it).
+func (h *ChatHistory) toolArgPart(m ChatMessage, used, width int64, theme ChatHistoryTheme) string {
+	if m.ArgPreview == "" {
+		return ""
+	}
+	if h.verbose {
+		return " " + theme.DimStyle.Render("("+m.ArgPreview+")")
+	}
+	avail := width - used - 3 // " (" prefix + ")" suffix
+	if avail < 12 {
+		return "" // too narrow to be readable — drop the argument
+	}
+	arg := core.TruncateToWidth(m.ArgPreview, avail-1, "…")
+	return " " + theme.DimStyle.Render("("+arg+")")
+}
+
+// tryToggleToolDetailAtLineLocked expands/collapses the result body of the
+// tool message under the clicked line, or toggles a tool-group header.
+// Returns true when the click was consumed.
+func (h *ChatHistory) tryToggleToolDetailAtLineLocked(absLine int64) bool {
+	for _, r := range h.cachedMsgRanges {
+		if absLine < int64(r.startLine) || absLine >= int64(r.endLine) {
+			continue
+		}
+		if r.msgIndex < 0 || r.msgIndex >= len(h.messages) {
+			return false
+		}
+		if r.toolGroup && r.groupHeader {
+			cur, ok := h.expandedGroups[r.msgIndex]
+			if !ok {
+				cur = true
+			}
+			h.expandedGroups[r.msgIndex] = !cur
+			return true
+		}
+		m := &h.messages[r.msgIndex]
+		if m.Role != RoleTool || strings.TrimSpace(m.Detail) == "" {
+			return false
+		}
+		m.DetailVisible = !m.DetailVisible
+		return true
+	}
+	return false
+}
+
 func (h *ChatHistory) Invalidate() {
 	h.mu.Lock()
 	h.dirty = true
@@ -637,6 +725,16 @@ func (h *ChatHistory) handleMouse(m core.MouseMsg) {
 			return
 		}
 		if h.tryToggleThinkingAtLineLocked(absLine) {
+			h.dirty = true
+			needInvalidate = true
+			h.mu.Unlock()
+			h.invalidate()
+			return
+		}
+		// Click on a tool row: expand/collapse its stored result body;
+		// click on a tool-group header: collapse/expand the whole group.
+		// Consumed clicks do not start a text selection.
+		if h.tryToggleToolDetailAtLineLocked(absLine) {
 			h.dirty = true
 			needInvalidate = true
 			h.mu.Unlock()
@@ -1033,6 +1131,9 @@ func (h *ChatHistory) renderAll(width int64) []string {
 				if !ok {
 					expanded = true // 默认展开
 				}
+				if h.verbose {
+					expanded = true
+				}
 				if expanded {
 					start := len(out)
 					summary := fmt.Sprintf("[-] %d tools · %d msgs", toolCount, sysCount)
@@ -1304,16 +1405,31 @@ func (h *ChatHistory) renderMessage(m ChatMessage, theme ChatHistoryTheme, width
 			barColor = theme.ErrorStyle
 		}
 		bar := barColor.Render("▌")
-		if m.Collapsed {
-			summary := m.Text
-			if len(summary) > 120 {
-				summary = summary[:117] + "..."
+
+		detailShown := m.DetailVisible || h.verbose
+		argUsed := func() int64 {
+			used := int64(1) + 1 + core.VisibleWidth(theme.ToolPrefix+m.Meta) + 1
+			if detailShown {
+				used += core.VisibleWidth(m.Text) + core.VisibleWidth(meta)
+			} else {
+				used += 5 /* "[+] " */ + 1 + core.VisibleWidth(core.TruncateToWidth(m.Text, h.limits.ToolStatusMaxWidth, "..."))
 			}
-			head := bar + " [+] " + theme.ToolStyle.Render(theme.ToolPrefix+m.Meta) + " " + theme.DimStyle.Render(summary)
+			return used
+		}
+		argPart := h.toolArgPart(m, argUsed(), width, theme)
+
+		if m.Collapsed && !h.verbose && !m.DetailVisible {
+			summary := core.TruncateToWidth(m.Text, h.limits.ToolStatusMaxWidth, "...")
+			head := bar + " [+] " + theme.ToolStyle.Render(theme.ToolPrefix+m.Meta) + argPart + " " + theme.DimStyle.Render(summary)
 			return core.WrapAnsi(head, width)
 		}
-		head := bar + " " + theme.ToolStyle.Render(theme.ToolPrefix+m.Meta) + " " + m.Text + meta
+		head := bar + " " + theme.ToolStyle.Render(theme.ToolPrefix+m.Meta) + argPart + " " + m.Text + meta
 		lines := core.WrapAnsi(head, width)
+		if detailShown && strings.TrimSpace(m.Detail) != "" {
+			for _, dl := range strings.Split(strings.TrimRight(m.Detail, "\n"), "\n") {
+				lines = append(lines, core.WrapAnsi(theme.DimStyle.Render("  "+dl), width)...)
+			}
+		}
 		return lines
 	case RoleError:
 		bar := theme.ErrorStyle.Render("▌ ")

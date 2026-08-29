@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/covoyage/covonaut/tui/component"
@@ -84,6 +85,11 @@ type ChatAppConfig struct {
 	OnInterrupt  func()
 	OnImagePaste func() // called when an image paste is detected (clipboard image, empty text)
 
+	// OnHistoryJump is called when the user presses ESC twice quickly on an
+	// empty, idle editor (no agent turn running). Callers typically open a
+	// history / rewind navigation dialog. Nil disables the gesture.
+	OnHistoryJump func()
+
 	// OnGhostRequest is called when the editor content changes and an inline
 	// completion should be fetched. The callback receives the full editor
 	// content and must call cb(completionText) asynchronously (or with "" to
@@ -91,14 +97,58 @@ type ChatAppConfig struct {
 	// cursor; Tab accepts it.
 	OnGhostRequest func(prompt string, cb func(string))
 
+	// Limits caps transcript rendering/storage sizes. Zero values fall back
+	// to defaults; embedders (covo-agent) use it to tune the transcript for
+	// their own UX without touching library internals.
+	Limits DisplayLimits
+
 	Host AppHost
 }
 
+// DisplayLimits caps transcript rendering and storage sizes.
+type DisplayLimits struct {
+	// ToolArgMaxRunes caps the primary tool argument stored for inline
+	// display (default 2000 runes).
+	ToolArgMaxRunes int
+	// ToolResultMaxLines caps the full tool result body stored for
+	// click/verbose expansion (default 400 lines).
+	ToolResultMaxLines int
+	// ToolResultMaxBytes caps the stored result body before lines (default
+	// 32 KiB).
+	ToolResultMaxBytes int
+	// ToolStatusMaxWidth caps the collapsed tool status head width in cells
+	// (default 120).
+	ToolStatusMaxWidth int64
+}
+
+// withDefaults fills zero fields with the library defaults.
+func (l DisplayLimits) withDefaults() DisplayLimits {
+	if l.ToolArgMaxRunes <= 0 {
+		l.ToolArgMaxRunes = 2000
+	}
+	if l.ToolResultMaxLines <= 0 {
+		l.ToolResultMaxLines = 400
+	}
+	if l.ToolResultMaxBytes <= 0 {
+		l.ToolResultMaxBytes = 32 << 10
+	}
+	if l.ToolStatusMaxWidth <= 0 {
+		l.ToolStatusMaxWidth = 120
+	}
+	return l
+}
+
+// ghostGeneration guards against stale ghost completions: every editor
+// change (including the submit-time clear) bumps it, and a completion whose
+// generation no longer matches is discarded instead of displayed.
+var ghostGeneration atomic.Int64
+
 type chatModel struct {
-	StreamID    string
-	AttemptID   string
-	ActiveTools map[string]time.Time
-	Running     bool
+	StreamID       string
+	AttemptID      string
+	ActiveTools    map[string]time.Time
+	ActiveToolArgs map[string]string
+	Running        bool
 }
 
 type ChatApp struct {
@@ -109,10 +159,15 @@ type ChatApp struct {
 	editor    *component.Editor
 	loader    *component.Loader
 	layout    *chatLayout
-	header    *component.TruncatedText
 	statusBar *component.StatusBar
 	ac        *component.Autocomplete
 	km        *terminal.KeybindingsManager
+
+	limits DisplayLimits
+
+	// lastEscIdle records the previous ESC press on an empty, idle editor so
+	// a second press within the window triggers OnHistoryJump.
+	lastEscIdle time.Time
 
 	mu    sync.Mutex
 	model chatModel
@@ -151,6 +206,7 @@ func newChatApp(cfg ChatAppConfig) *ChatApp {
 	km := terminal.NewKeybindingsManager(terminal.DefaultKeybindings())
 
 	history := NewChatHistory()
+	history.SetDisplayLimits(cfg.Limits)
 	if cfg.Theme != nil {
 		history.SetTheme(*cfg.Theme)
 	}
@@ -181,14 +237,12 @@ func newChatApp(cfg ChatAppConfig) *ChatApp {
 		loader:    loader,
 		statusBar: statusBar,
 		km:        km,
-		model:     chatModel{ActiveTools: make(map[string]time.Time)},
+		limits:    cfg.Limits.withDefaults(),
+		model: chatModel{
+			ActiveTools:    make(map[string]time.Time),
+			ActiveToolArgs: make(map[string]string),
+		},
 	}
-
-	var header *component.TruncatedText
-	if cfg.Title != "" {
-		header = component.NewTruncatedText(theme.CurrentPalette().User.Render(cfg.Title))
-	}
-	chatApp.header = header
 
 	if len(cfg.Providers) > 0 {
 		chatApp.ac = component.NewAutocomplete(cfg.Providers...)
@@ -227,11 +281,11 @@ func newChatApp(cfg ChatAppConfig) *ChatApp {
 		statusBar: statusBar,
 		ac:        chatApp.ac,
 	}
-	if header != nil {
-		layout.header = header
-	}
 	chatApp.layout = layout
 
+	// Ghost generation guard: every editor change — including the clear on
+	// submit — invalidates in-flight ghost completions, so a suggestion
+	// fetched for a submitted draft can never land on the emptied box.
 	editor.OnChange(func(value string) {
 		if chatApp.ac != nil {
 			if chatApp.skipRefresh {
@@ -242,8 +296,12 @@ func newChatApp(cfg ChatAppConfig) *ChatApp {
 			chatApp.host.RequestRender()
 		}
 		// Trigger ghost text request
+		gen := ghostGeneration.Add(1)
 		if chatApp.cfg.OnGhostRequest != nil && value != "" {
 			chatApp.cfg.OnGhostRequest(value, func(completion string) {
+				if gen != ghostGeneration.Load() {
+					return // superseded by newer input or a submit
+				}
 				chatApp.editor.SetGhost(completion)
 				chatApp.host.RequestRender()
 			})
@@ -569,13 +627,15 @@ func (a *ChatApp) onToolStart(e ChatEvent) {
 	}
 	a.mu.Lock()
 	a.model.ActiveTools[tc.ToolCall.ID] = time.Now()
+	a.model.ActiveToolArgs[tc.ToolCall.ID] = tc.ToolCall.Arguments
 	a.finalizeStreamLocked()
 	a.mu.Unlock()
 	a.history.Append(ChatMessage{
-		ID:   "tool-" + tc.ToolCall.ID,
-		Role: RoleTool,
-		Meta: tc.ToolCall.Name,
-		Text: theme.CurrentPalette().Dim.Render("..."),
+		ID:         "tool-" + tc.ToolCall.ID,
+		Role:       RoleTool,
+		Meta:       tc.ToolCall.Name,
+		ArgPreview: ToolArgPreview(tc.ToolCall.Arguments, a.limits.ToolArgMaxRunes),
+		Text:       theme.CurrentPalette().Dim.Render("..."),
 	})
 }
 
@@ -586,6 +646,8 @@ func (a *ChatApp) onToolEnd(e ChatEvent) {
 	}
 	a.mu.Lock()
 	delete(a.model.ActiveTools, tc.ToolCallID)
+	args := a.model.ActiveToolArgs[tc.ToolCallID]
+	delete(a.model.ActiveToolArgs, tc.ToolCallID)
 	a.mu.Unlock()
 
 	status := theme.CurrentPalette().Success.Render(theme.SymbolCheck + " done")
@@ -601,18 +663,22 @@ func (a *ChatApp) onToolEnd(e ChatEvent) {
 		status = theme.CurrentPalette().Error.Render(theme.SymbolCross + " failed: " + errMsg)
 	}
 	toolID := "tool-" + tc.ToolCallID
-	collapsed := len(status) > 120
+	collapsed := core.VisibleWidth(status) > a.limits.ToolStatusMaxWidth
+	detail := a.toolResultDetail(tc.Result)
 	if !a.history.PatchMessage(toolID, func(m *ChatMessage) {
 		m.Text = status
 		m.Duration = dur
+		m.Detail = detail
 		m.Collapsed = collapsed
 	}) {
 		a.history.Append(ChatMessage{
-			Role:      RoleTool,
-			Meta:      tc.ToolName,
-			Text:      status,
-			Duration:  dur,
-			Collapsed: collapsed,
+			Role:       RoleTool,
+			Meta:       tc.ToolName,
+			ArgPreview: ToolArgPreview(args, a.limits.ToolArgMaxRunes),
+			Text:       status,
+			Duration:   dur,
+			Detail:     detail,
+			Collapsed:  collapsed,
 		})
 	}
 
@@ -909,17 +975,15 @@ type layoutHost interface {
 }
 
 type chatLayout struct {
-	host         layoutHost
-	app          *ChatApp
-	header       core.Component
-	history      *ChatHistory
-	loader       *component.Loader
-	editor       core.Component
-	statusBar    *component.StatusBar
-	footer       core.Component
-	ac           *component.Autocomplete
-	lastRows     int64
-	headerHeight int
+	host      layoutHost
+	app       *ChatApp
+	history   *ChatHistory
+	loader    *component.Loader
+	editor    core.Component
+	statusBar *component.StatusBar
+	footer    core.Component
+	ac        *component.Autocomplete
+	lastRows  int64
 	// editorTop is the absolute screen row of the editor's top border, as
 	// computed by the most recent Render call. Used to translate MouseMsg
 	// screen coordinates into the editor's own row space (see Update).
@@ -944,12 +1008,8 @@ func (l *chatLayout) Render(width int64) []string {
 	}
 
 	var out []string
-	var headerLines, loaderLines, editorLines, statusLines, footerLines, acLines []string
+	var loaderLines, editorLines, statusLines, footerLines, acLines []string
 
-	if l.header != nil {
-		headerLines = l.header.Render(width)
-	}
-	l.headerHeight = len(headerLines)
 	editorLines = l.editor.Render(width)
 	editorBorder := theme.CurrentPalette().Border.Render(strings.Repeat("─", int(width)))
 	editorLines = append(append([]string{editorBorder}, editorLines...), editorBorder)
@@ -966,17 +1026,34 @@ func (l *chatLayout) Render(width int64) []string {
 		acLines = l.ac.Render(width)
 	}
 
-	reserved := int64(len(headerLines) + len(editorLines) + len(loaderLines) + len(footerLines) + len(statusLines) + len(acLines))
+	reserved := int64(len(editorLines) + len(loaderLines) + len(footerLines) + len(statusLines) + len(acLines))
 	remaining := rows - reserved
 	if remaining < 1 {
-		remaining = 1
+		// Before clamping the history viewport, reclaim rows from the
+		// editor content: a frame taller than the terminal would scroll the
+		// screen and permanently desync the differential renderer. Both
+		// editor borders are kept; content rows are dropped from the middle.
+		overflow := 1 - remaining
+		shrinkable := int64(len(editorLines)) - 3 // top border + 1 content row + bottom border
+		if shrinkable > 0 {
+			if overflow > shrinkable {
+				overflow = shrinkable
+			}
+			end := len(editorLines) - 1
+			editorLines = append(editorLines[:end-int(overflow)], editorLines[end:]...)
+			reserved = int64(len(editorLines) + len(loaderLines) + len(footerLines) + len(statusLines) + len(acLines))
+			remaining = rows - reserved
+		}
+		if remaining < 1 {
+			remaining = 1
+		}
 	}
 
-	// Row order below is: header, history(remaining), ac, loader, editor(with
+	// Row order below is: history(remaining), ac, loader, editor(with
 	// top/bottom border), footer, statusBar. editorTop marks where the
 	// editor's top border row lands; the editor's own content starts one row
 	// after that.
-	l.editorTop = int64(len(headerLines)) + remaining + int64(len(acLines)) + int64(len(loaderLines))
+	l.editorTop = remaining + int64(len(acLines)) + int64(len(loaderLines))
 
 	var historyLines []string
 	if l.history != nil {
@@ -984,7 +1061,6 @@ func (l *chatLayout) Render(width int64) []string {
 		historyLines = l.history.Render(width)
 	}
 
-	out = append(out, headerLines...)
 	out = append(out, historyLines...)
 	for int64(len(historyLines)) < remaining {
 		out = append(out, strings.Repeat(" ", int(width)))
@@ -1076,7 +1152,6 @@ func (l *chatLayout) Update(msg core.Msg) core.Cmd {
 		switch m := msg.(type) {
 		case core.MouseMsg:
 			adjusted := m
-			adjusted.Row -= int64(l.headerHeight)
 			if adjusted.Row >= 0 {
 				l.history.Update(adjusted)
 			}
@@ -1114,33 +1189,62 @@ func (l *chatLayout) Update(msg core.Msg) core.Cmd {
 						}
 						return nil
 					}
-			case "escape":
-				if l.ac != nil && l.ac.Active() {
-					l.ac.Hide()
-					// File browser: ESC navigates up one level.
-					value := l.app.editor.GetValue()
-					if (strings.HasPrefix(value, "@file:") || strings.HasPrefix(value, "@folder:")) &&
-						len(value) > len("@file:") {
-						newValue := popLastPathSegment(value)
-						l.app.editor.SetValue(newValue)
-						l.app.skipRefresh = false
-						l.ac.Refresh(newValue, int64(len(newValue)))
+				case "escape":
+					if l.ac != nil && l.ac.Active() {
+						l.ac.Hide()
+						// File browser: ESC navigates up one level.
+						value := l.app.editor.GetValue()
+						if (strings.HasPrefix(value, "@file:") || strings.HasPrefix(value, "@folder:")) &&
+							len(value) > len("@file:") {
+							newValue := popLastPathSegment(value)
+							l.app.editor.SetValue(newValue)
+							l.app.skipRefresh = false
+							l.ac.Refresh(newValue, int64(len(newValue)))
+						}
+						return nil
+					}
+					// ESC while the agent is running interrupts the current turn
+					// (and drops any stale ghost preview).
+					if l.app.isRunning() && l.app.cfg.OnInterrupt != nil {
+						if l.app.editor.GhostText() != "" {
+							l.app.editor.ClearGhost()
+						}
+						if l.app.cfg.OnInterrupt != nil {
+							l.app.cfg.OnInterrupt()
+						}
+						return nil
+					}
+					// ESC also clears ghost text
+					if l.app.editor.GhostText() != "" {
+						l.app.editor.ClearGhost()
+						l.app.host.RequestRender()
+						return nil
+					}
+					// ESC with editor content clears the input line.
+					if l.app.editor.GetValue() != "" {
+						l.app.editor.SetValue("")
+						l.app.host.RequestRender()
+						return nil
+					}
+					// ESC on an empty, idle editor: a second press within the
+					// window opens the history jump dialog.
+					if l.app.cfg.OnHistoryJump != nil {
+						now := time.Now()
+						if now.Sub(l.app.lastEscIdle) < 500*time.Millisecond {
+							l.app.lastEscIdle = time.Time{}
+							l.app.cfg.OnHistoryJump()
+							return nil
+						}
+						l.app.lastEscIdle = now
 					}
 					return nil
-				}
-				// ESC also clears ghost text
-				if l.app.editor.GhostText() != "" {
-					l.app.editor.ClearGhost()
-					l.app.host.RequestRender()
-					return nil
-				}
-			case "tab":
-				// Tab accepts ghost text when autocomplete is not active
-				if l.app.editor.GhostText() != "" {
-					l.app.editor.AcceptGhost()
-					l.app.host.RequestRender()
-					return nil
-				}
+				case "tab":
+					// Tab accepts ghost text when autocomplete is not active
+					if l.app.editor.GhostText() != "" {
+						l.app.editor.AcceptGhost()
+						l.app.host.RequestRender()
+						return nil
+					}
 				case "pageUp":
 					l.history.ScrollBy(-5)
 				case "pageDown":
@@ -1193,10 +1297,7 @@ func (l *chatLayout) Update(msg core.Msg) core.Cmd {
 }
 
 func (l *chatLayout) recalcMaxRows(width, height int64) {
-	var headerH, loaderH, editorH, footerH, statusH, acH int64
-	if l.header != nil {
-		headerH = int64(len(l.header.Render(width)))
-	}
+	var loaderH, editorH, footerH, statusH, acH int64
 	if l.editor != nil {
 		editorH = int64(len(l.editor.Render(width))) + 2
 	}
@@ -1212,7 +1313,7 @@ func (l *chatLayout) recalcMaxRows(width, height int64) {
 	if l.ac != nil && l.ac.Active() {
 		acH = int64(len(l.ac.Render(width)))
 	}
-	reserved := headerH + editorH + loaderH + footerH + statusH + acH
+	reserved := editorH + loaderH + footerH + statusH + acH
 	remaining := height - reserved
 	if remaining < 1 {
 		remaining = 1
@@ -1232,4 +1333,21 @@ func popLastPathSegment(value string) string {
 		return value
 	}
 	return trimmed[:idx+1]
+}
+
+// toolResultDetail caps a full tool result for verbose display: at most
+// Limits.ToolResultMaxLines lines and ToolResultMaxBytes bytes, with a
+// truncation marker.
+func (a *ChatApp) toolResultDetail(result string) string {
+	if result == "" {
+		return ""
+	}
+	if len(result) > a.limits.ToolResultMaxBytes {
+		result = result[:a.limits.ToolResultMaxBytes] + "\n… (truncated)"
+	}
+	lines := strings.Split(result, "\n")
+	if len(lines) > a.limits.ToolResultMaxLines {
+		lines = append(lines[:a.limits.ToolResultMaxLines], fmt.Sprintf("… (+%d more lines)", len(lines)-a.limits.ToolResultMaxLines))
+	}
+	return strings.Join(lines, "\n")
 }

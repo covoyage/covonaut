@@ -63,3 +63,63 @@ func TestSliceByColumn(t *testing.T) {
 		t.Errorf("SliceByColumn cjk = %q, want %q", got, "文a")
 	}
 }
+
+func TestAmbiguousWidthMode(t *testing.T) {
+	SetAmbiguousWide(AmbiguousWide())
+	defer SetAmbiguousWide(false)
+
+	SetAmbiguousWide(false)
+	for _, r := range []rune{'—', '→', '★', '·', '℃', '±'} {
+		if got := RuneWidth(r); got != 1 {
+			t.Fatalf("narrow mode: RuneWidth(%q) = %d, want 1", r, got)
+		}
+	}
+
+	SetAmbiguousWide(true)
+	for _, r := range []rune{'—', '→', '★', '·', '℃', '±'} {
+		if got := RuneWidth(r); got != 2 {
+			t.Fatalf("wide mode: RuneWidth(%q) = %d, want 2", r, got)
+		}
+	}
+
+	// Non-ambiguous runes are mode-independent.
+	SetAmbiguousWide(true)
+	if got := RuneWidth('a'); got != 1 {
+		t.Fatalf("wide mode: RuneWidth('a') = %d, want 1", got)
+	}
+	if got := RuneWidth('中'); got != 2 {
+		t.Fatalf("wide mode: RuneWidth('中') = %d, want 2", got)
+	}
+	SetAmbiguousWide(false)
+	if got := RuneWidth('中'); got != 2 {
+		t.Fatalf("narrow mode: RuneWidth('中') = %d, want 2", got)
+	}
+
+	// VisibleWidth and truncation follow the mode.
+	SetAmbiguousWide(true)
+	const s = "a→b"
+	if got := VisibleWidth(s); got != 4 {
+		t.Fatalf("wide mode: VisibleWidth(%q) = %d, want 4", s, got)
+	}
+	if got := TruncateToWidth(s, 3, ""); got != "a→" {
+		t.Fatalf("wide mode: TruncateToWidth(%q, 3) = %q, want %q", s, got, "a→")
+	}
+}
+
+func TestDetectAmbiguousWideFromEnv(t *testing.T) {
+	t.Setenv("LC_ALL", "")
+	t.Setenv("LC_CTYPE", "")
+	t.Setenv("LANG", "en_US.UTF-8")
+	if DetectAmbiguousWideFromEnv() {
+		t.Fatalf("en locale should be narrow")
+	}
+	t.Setenv("LANG", "zh_CN.UTF-8")
+	if !DetectAmbiguousWideFromEnv() {
+		t.Fatalf("zh locale should be wide")
+	}
+	t.Setenv("LC_ALL", "ja_JP.UTF-8")
+	t.Setenv("LANG", "en_US.UTF-8")
+	if !DetectAmbiguousWideFromEnv() {
+		t.Fatalf("LC_ALL should take precedence over LANG")
+	}
+}

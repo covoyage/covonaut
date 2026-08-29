@@ -49,7 +49,7 @@ func Index(skills []Skill) string {
 	sort.Slice(visible, func(i, j int) bool { return visible[i].Name < visible[j].Name })
 	var b strings.Builder
 	b.WriteString("The following skills provide specialized instructions for specific tasks.\n")
-	b.WriteString("When a task matches one of these descriptions, respond with /skill:<name> followed by optional arguments to load that skill for the next turn.\n")
+	b.WriteString("When a task matches one of these descriptions, load the skill by calling the `skill` tool with its name, then follow the returned instructions.\n")
 	b.WriteString("When a skill references a relative path, resolve it against the skill directory (the parent directory of SKILL.md).\n\n")
 	b.WriteString("<available_skills>\n")
 	for _, item := range visible {

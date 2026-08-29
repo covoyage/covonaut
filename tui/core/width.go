@@ -1,8 +1,12 @@
 package core
 
 import (
+	"os"
 	"strings"
+	"sync/atomic"
 	"unicode/utf8"
+
+	textwidth "golang.org/x/text/width"
 )
 
 // ---------------------------------------------------------------------------
@@ -13,6 +17,7 @@ import (
 //   - Control characters (width 0)
 //   - Combining marks (width 0)
 //   - East-Asian Wide / Fullwidth (width 2)
+//   - East-Asian Ambiguous (width 1 or 2, per SetAmbiguousWide)
 //   - Emoji basic ranges (width 2)
 //   - Variation selectors / ZWJ (width 0)
 //   - ANSI CSI/OSC escape sequences (width 0, transparently stripped)
@@ -21,6 +26,39 @@ import (
 // terminal UI. When in doubt, it errs on the side of width 1 to avoid
 // truncating too aggressively.
 // ---------------------------------------------------------------------------
+
+// ambiguousWide controls how East-Asian Ambiguous characters (—, →, ★, ℃,
+// ·, …) are measured. Terminals render these as 1 cell (narrow) or 2 cells
+// (wide) depending on their locale: CJK-capable terminals following a
+// zh/ja/ko locale draw them wide. Width measurement must agree with the
+// terminal, or every affected row loses/gains a cell and the layout drifts.
+// Default: narrow.
+var ambiguousWide atomic.Bool
+
+// SetAmbiguousWide selects how East-Asian Ambiguous characters are measured:
+// wide (2 cells, CJK-locale terminals) or narrow (1 cell, default).
+func SetAmbiguousWide(wide bool) { ambiguousWide.Store(wide) }
+
+// AmbiguousWide reports the current ambiguous-width mode.
+func AmbiguousWide() bool { return ambiguousWide.Load() }
+
+// DetectAmbiguousWideFromEnv infers the ambiguous-width mode from the locale
+// environment (LC_ALL > LC_CTYPE > LANG), mirroring how terminals choose
+// their own ambiguous-width rendering: zh/ja/ko locales draw ambiguous
+// characters wide, other locales narrow. Used by callers that want "auto"
+// behavior instead of a hard-coded mode.
+func DetectAmbiguousWideFromEnv() bool {
+	for _, key := range []string{"LC_ALL", "LC_CTYPE", "LANG"} {
+		value := strings.ToLower(os.Getenv(key))
+		if value == "" {
+			continue
+		}
+		return strings.Contains(value, "zh") ||
+			strings.Contains(value, "ja") ||
+			strings.Contains(value, "ko")
+	}
+	return false
+}
 
 // RuneWidth returns the cell width of a single rune (0, 1, or 2).
 func RuneWidth(r rune) int64 {
@@ -34,6 +72,9 @@ func RuneWidth(r rune) int64 {
 		return 0
 	}
 	if isWide(r) {
+		return 2
+	}
+	if ambiguousWide.Load() && textwidth.LookupRune(r).Kind() == textwidth.EastAsianAmbiguous {
 		return 2
 	}
 	return 1

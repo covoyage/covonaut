@@ -133,6 +133,10 @@ func WithMouse(mode string) TUIOption {
 }
 
 // TUI is the top-level differential renderer.
+// fullRepaintInterval bounds how long a differential-render desync can
+// survive before the next frame forces a full repaint.
+const fullRepaintInterval = 3 * time.Second
+
 type TUI struct {
 	term    terminal.Terminal
 	stdin   *terminal.StdinBuffer
@@ -148,6 +152,7 @@ type TUI struct {
 	prevFrame       []core.Row
 	prevWidth       int64
 	firstFrame      bool
+	lastFullPaint   time.Time
 	started         bool
 
 	// outMu guards terminal-output state (altScreenOn, mouseMode) that can be
@@ -229,6 +234,7 @@ func NewTUIWithOptions(term terminal.Terminal, opts ...TUIOption) *TUI {
 // doneCh is already closed. Callers that need a fresh TUI should construct
 // a new one.
 func (t *TUI) Start() error {
+	teeInit()
 	t.mu.Lock()
 	if t.started {
 		t.mu.Unlock()
@@ -302,6 +308,7 @@ func (t *TUI) Start() error {
 // The error (if any) comes from the underlying terminal's Stop; it is no
 // longer swallowed so callers can surface terminal-restoration failures.
 func (t *TUI) Stop() error {
+	defer teeClose()
 	// Always close the stdin buffer, even if Start was never called or
 	// failed. The buffer starts its flushLoop in its constructor, so it
 	// must be explicitly closed regardless of TUI started state.
@@ -564,9 +571,11 @@ func (t *TUI) eventLoop() {
 			t.stdin.FlushEsc()
 		}
 		if atomic.SwapInt64(&t.renderRequested, 0) == 0 {
+			t.maybeProbeCursor()
 			continue
 		}
 		t.renderFrame()
+		t.maybeProbeCursor()
 	}
 }
 
@@ -761,6 +770,14 @@ func (t *TUI) renderFrame() {
 	first := t.firstFrame
 	t.mu.Unlock()
 
+	// Bounded staleness: no matter how careful the differential path is,
+	// out-of-band writes or terminal quirks can desync the screen from the
+	// model. Force a full repaint periodically so such artifacts self-heal
+	// within this interval instead of persisting for the whole session.
+	if !first && time.Since(t.lastFullPaint) > fullRepaintInterval {
+		first = true
+	}
+
 	// Render children to strings, then parse each line into a cell Row.
 	// Parsing happens here (not in components) so component authors keep the
 	// simple []string API and the engine owns the cell model.
@@ -781,6 +798,14 @@ func (t *TUI) renderFrame() {
 		termRows = int64(len(rows))
 	}
 	rows = composeOverlays(rows, overlays, cols, termRows)
+	if termRows > 0 && int64(len(rows)) > termRows {
+		// Never emit a frame taller than the terminal: the surplus rows
+		// would scroll the screen and permanently desync the differential
+		// renderer from the real terminal state (ghost rows, mid-line
+		// splices in the footer). Clip the tail; the layout is expected to
+		// shrink components to fit, this is the last line of defense.
+		rows = rows[:termRows]
+	}
 
 	// Locate the IME cursor marker across all rows. ParseLine already strips
 	// CURSOR_MARKER and records its column on the Row; here we just find the
@@ -812,7 +837,12 @@ func (t *TUI) renderFrame() {
 	// silently dropped at the right margin instead of wrapping.
 	buf.WriteString("\x1b[?7l")
 
-	if first || prevW != cols {
+	// Row-count changes (loader appearing/disappearing, panels opening)
+	// shift every subsequent row; repaint those frames fully so the
+	// terminal state can never drift from the model across transitions.
+	frameMode, frameDiffs, frameMaxDiffRow := "full", 0, int64(0)
+	if first || prevW != cols || len(rows) != len(prev) {
+		t.lastFullPaint = time.Now()
 		// Full repaint: write every row from top to bottom.
 		buf.WriteString("\x1b[?25l")
 		buf.WriteString("\x1b[H")
@@ -830,7 +860,12 @@ func (t *TUI) renderFrame() {
 		// Differential repaint: emit only rows that changed at the cell level.
 		buf.WriteString("\x1b[?25l")
 		diff := core.DiffRows(prev, rows)
+		frameMode = "diff"
+		frameDiffs = len(diff)
 		for _, d := range diff {
+			if d.Row+1 > frameMaxDiffRow {
+				frameMaxDiffRow = d.Row + 1
+			}
 			fmt.Fprintf(&buf, "\x1b[%d;1H", d.Row+1)
 			buf.WriteString("\x1b[2K")
 			buf.WriteString(core.SerializeRow(d.Content))
@@ -856,6 +891,7 @@ func (t *TUI) renderFrame() {
 		buf.WriteString("\x1b[?2026l")
 	}
 
+	t.teeFrame(frameMode, len(rows), termRows, frameDiffs, frameMaxDiffRow, buf.Bytes())
 	_, _ = t.term.Write(buf.Bytes())
 
 	t.mu.Lock()
@@ -876,6 +912,12 @@ func (t *TUI) DisableMouse() { t.disableMouse() }
 // ---------------------------------------------------------------------------
 
 func (t *TUI) onTerminalInput(data []byte) {
+	if rest, handled := interceptDSRReply(data); handled {
+		data = rest
+		if len(data) == 0 {
+			return
+		}
+	}
 	t.stdin.Feed(data)
 }
 
