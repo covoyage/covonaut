@@ -1,36 +1,27 @@
 package component
 
 import (
-	"fmt"
-	"regexp"
+	"net/url"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/covoyage/covonaut/tui/core"
 	apitheme "github.com/covoyage/covonaut/tui/theme"
 )
 
+// RenderMarkdown parses source and renders it to width-padded terminal lines.
+func RenderMarkdown(src string, width int64, theme MarkdownTheme) []string {
+	return renderMarkdown(src, width, mergeMarkdownTheme(theme))
+}
+
 // ---------------------------------------------------------------------------
 // Markdown — a block-level markdown renderer component.
 //
-// Supported block types:
-//   - ATX headings (# … ######).
-//   - Fenced code blocks (``` / ~~~) with optional language label.
-//   - Blockquotes (> ...).
-//   - Bulleted lists (*, -, +) with nesting.
-//   - Numbered lists (1. 2. 3.).
-//   - Horizontal rule (---, ***, ___).
-//   - Pipe tables.
-//   - Paragraphs (word-wrapped).
-//
-// Supported inline styles:
-//   - **bold** / __bold__
-//   - *italic* / _italic_
-//   - `code`
-//   - ~~strike~~
-//   - [label](url)
-//
-// The goal is readable terminal rendering; not a spec-compliant parser.
+// Parsing is CommonMark + GFM (tables, task lists, strikethrough, autolinks),
+// plus footnotes, definition lists, and GitHub-style alerts.
+// The parse tree is projected into a terminal-oriented block tree; rendering,
+// syntax highlighting, mermaid fences, and images stay here.
 // ---------------------------------------------------------------------------
 
 // MarkdownTheme overrides the ANSI styling of rendered elements.
@@ -39,6 +30,7 @@ type MarkdownTheme struct {
 	EmphasisFn   func(string) string    // italic
 	StrongFn     func(string) string    // bold
 	StrikeFn     func(string) string
+	MarkFn       func(string) string // ==highlight==
 	CodeInlineFn func(string) string
 	CodeBlockFn  func(string) string
 	CodeFenceFn  func(string) string // language label line
@@ -60,6 +52,21 @@ type MarkdownTheme struct {
 	// code style. It is a caller-provided preference — the library default
 	// keeps highlighting on.
 	DisableSyntax bool
+	// MathFn styles inline/block math after the Unicode rewrite.
+	MathFn func(string) string
+	// HighlightFence, when set, highlights a fenced body for `lang` and
+	// returns ANSI text (newlines preserved). Empty string falls back to
+	// the built-in tokenizer.
+	HighlightFence func(source, lang string) string
+	// FenceRenderer, when set, may fully replace a fenced block (e.g.
+	// mermaid). Return nil to fall through to the default highlighter.
+	FenceRenderer func(lang, source string, width int64) []string
+	// ImageRenderer, when set, renders `![alt](url)` as terminal lines.
+	// Return nil to fall through to a labelled OSC8 link.
+	ImageRenderer func(alt, url string, width int64) []string
+	// SkipIncomplete hides unclosed fences/math (headless streaming).
+	// The interactive TUI leaves this false so partial blocks still show.
+	SkipIncomplete bool
 }
 
 // syntaxThemeFromMarkdown bridges a MarkdownTheme into a SyntaxTheme so
@@ -144,359 +151,6 @@ func (m *Markdown) Update(msg core.Msg) core.Cmd {
 }
 
 // ---------------------------------------------------------------------------
-// Parser / renderer
-// ---------------------------------------------------------------------------
-
-var (
-	reHeading  = regexp.MustCompile(`^(#{1,6})\s+(.*)$`)
-	reFence    = regexp.MustCompile(`^(` + "```" + `|~~~)\s*(\S*)\s*$`)
-	reHR       = regexp.MustCompile(`^\s*(-{3,}|\*{3,}|_{3,})\s*$`)
-	reBullet   = regexp.MustCompile(`^(\s*)([\-*+])\s+(.*)$`)
-	reOrdered  = regexp.MustCompile(`^(\s*)(\d+)\.\s+(.*)$`)
-	reQuote    = regexp.MustCompile(`^>\s?(.*)$`)
-	reTableSep = regexp.MustCompile(`^\s*\|?(\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?\s*$`)
-
-	reInlineBold   = regexp.MustCompile(`\*\*([^*]+)\*\*|__([^_]+)__`)
-	reInlineItalic = regexp.MustCompile(`\*([^*\s][^*]*[^*\s]|[^*\s])\*|_([^_\s][^_]*[^_\s]|[^_\s])_`)
-	reInlineCode   = regexp.MustCompile("`([^`]+)`")
-	reInlineStrike = regexp.MustCompile(`~~([^~]+)~~`)
-	reInlineLink   = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
-)
-
-func renderMarkdown(src string, width int64, theme MarkdownTheme) []string {
-	lines := strings.Split(src, "\n")
-	var out []string
-	i := 0
-	for i < len(lines) {
-		ln := lines[i]
-
-		// Fenced code block
-		if fm := reFence.FindStringSubmatch(ln); fm != nil {
-			fence := fm[1]
-			lang := fm[2]
-			if lang != "" {
-				out = append(out, theme.CodeFenceFn(core.PadToWidth("  "+lang, width)))
-			}
-			i++
-			var codeLines []string
-			for i < len(lines) && !strings.HasPrefix(strings.TrimSpace(lines[i]), fence) {
-				codeLines = append(codeLines, lines[i])
-				i++
-			}
-			if i < len(lines) {
-				i++ // consume closing fence
-			}
-
-			// If a language is specified and a highlighter exists, run it
-			// over the whole block so multi-line block comments/strings
-			// resolve correctly.
-			var rendered []string
-			if lang == "diff" {
-				rendered = make([]string, len(codeLines))
-				// Token-level highlighting of content lines: the file
-				// language is inferred from the +++/--- header extension.
-				// Disabled (or unknown languages) keep the plain full-line
-				// diff coloring.
-				hlContent := func(line string) string { return theme.CodeBlockFn(line) }
-				if !theme.DisableSyntax {
-					if fileLang := diffFileLanguage(codeLines); fileLang != "" {
-						if LookupLanguage(fileLang) != nil {
-							st := syntaxThemeFromMarkdown(theme)
-							hlContent = func(line string) string {
-								out := Highlight(line, fileLang, st)
-								if len(out) == 0 {
-									return theme.CodeBlockFn(line)
-								}
-								return out[0]
-							}
-						}
-					}
-				}
-				var oldLine, newLine int
-				for k, cl := range codeLines {
-					switch {
-					case strings.HasPrefix(cl, "@@ "):
-						// Parse hunk header to extract line numbers.
-						rendered[k] = apitheme.CurrentPalette().Accent.Render(theme.CodeBlockFn(cl))
-						if _, err := fmt.Sscanf(cl, "@@ -%d", &oldLine); err == nil {
-							newLine = oldLine
-							if idx := strings.Index(cl, "+"); idx > 0 {
-								if _, err2 := fmt.Sscanf(cl[idx:], "+%d", &newLine); err2 != nil {
-									newLine = oldLine
-								}
-							}
-						}
-					case strings.HasPrefix(cl, "+++ ") || strings.HasPrefix(cl, "--- "):
-						rendered[k] = theme.CodeBlockFn(cl)
-					case strings.HasPrefix(cl, "+") && !strings.HasPrefix(cl, "++"):
-						rendered[k] = apitheme.CurrentPalette().Success.Render(fmt.Sprintf("%4d +", newLine)) + hlContent(strings.TrimPrefix(cl, "+"))
-						newLine++
-					case strings.HasPrefix(cl, "-") && !strings.HasPrefix(cl, "--"):
-						rendered[k] = apitheme.CurrentPalette().Error.Render(fmt.Sprintf("%4d -", oldLine)) + hlContent(strings.TrimPrefix(cl, "-"))
-						oldLine++
-					default:
-						rendered[k] = fmt.Sprintf("      %s", hlContent(strings.TrimPrefix(cl, " ")))
-						oldLine++
-						newLine++
-					}
-				}
-			} else if spec := LookupLanguage(lang); spec != nil && !theme.DisableSyntax {
-				rendered = Highlight(strings.Join(codeLines, "\n"), lang, syntaxThemeFromMarkdown(theme))
-			} else {
-				rendered = make([]string, len(codeLines))
-				for k, cl := range codeLines {
-					rendered[k] = theme.CodeBlockFn(cl)
-				}
-			}
-			for _, cl := range rendered {
-				if cl == "" {
-					continue
-				}
-				out = append(out, core.PadToWidth("  "+cl, width))
-			}
-			continue
-		}
-
-		if reHR.MatchString(ln) {
-			out = append(out, theme.HRFn(core.PadToWidth(strings.Repeat("─", int(width)), width)))
-			i++
-			continue
-		}
-
-		if hm := reHeading.FindStringSubmatch(ln); hm != nil {
-			level := len(hm[1]) - 1
-			if level > 5 {
-				level = 5
-			}
-			text := renderInline(hm[2], theme)
-			fn := theme.HeadingFn[level]
-			wrapped := core.WrapAnsi(fn(text), width)
-			for _, w := range wrapped {
-				out = append(out, core.PadToWidth(w, width))
-			}
-			i++
-			continue
-		}
-
-		if qm := reQuote.FindStringSubmatch(ln); qm != nil {
-			body := qm[1]
-			text := renderInline(body, theme)
-			for _, w := range core.WrapAnsi(text, width-2) {
-				line := theme.QuoteFn("│ ") + w
-				out = append(out, core.PadToWidth(line, width))
-			}
-			i++
-			continue
-		}
-
-		// Detect a table: a header row followed by a separator row.
-		if strings.Contains(ln, "|") && i+1 < len(lines) && reTableSep.MatchString(lines[i+1]) {
-			end := i + 2
-			for end < len(lines) && strings.Contains(lines[end], "|") {
-				end++
-			}
-			rows := lines[i:end]
-			out = append(out, renderTable(rows, width, theme)...)
-			i = end
-			continue
-		}
-
-		if bm := reBullet.FindStringSubmatch(ln); bm != nil {
-			indent := len(bm[1])
-			text := renderInline(bm[3], theme)
-			bullet := theme.ListBulletFn("• ")
-			indentStr := strings.Repeat(" ", indent+2)
-			for k, w := range core.WrapAnsi(text, width-int64(indent)-3) {
-				prefix := indentStr
-				if k == 0 {
-					prefix = strings.Repeat(" ", indent) + bullet
-				}
-				out = append(out, core.PadToWidth(prefix+w, width))
-			}
-			i++
-			continue
-		}
-		if om := reOrdered.FindStringSubmatch(ln); om != nil {
-			indent := len(om[1])
-			num := om[2] + ". "
-			text := renderInline(om[3], theme)
-			indentStr := strings.Repeat(" ", indent+len(num))
-			for k, w := range core.WrapAnsi(text, width-int64(indent)-int64(len(num))) {
-				prefix := indentStr
-				if k == 0 {
-					prefix = strings.Repeat(" ", indent) + theme.ListBulletFn(num)
-				}
-				out = append(out, core.PadToWidth(prefix+w, width))
-			}
-			i++
-			continue
-		}
-
-		if strings.TrimSpace(ln) == "" {
-			out = append(out, core.PadToWidth("", width))
-			i++
-			continue
-		}
-
-		// Paragraph: join consecutive non-empty non-block lines.
-		para := []string{ln}
-		i++
-		for i < len(lines) && strings.TrimSpace(lines[i]) != "" &&
-			!reHeading.MatchString(lines[i]) &&
-			!reFence.MatchString(lines[i]) &&
-			!reHR.MatchString(lines[i]) &&
-			!reBullet.MatchString(lines[i]) &&
-			!reOrdered.MatchString(lines[i]) &&
-			!reQuote.MatchString(lines[i]) {
-			para = append(para, lines[i])
-			i++
-		}
-		joined := strings.Join(para, " ")
-		text := renderInline(joined, theme)
-		for _, w := range core.WrapAnsi(text, width) {
-			out = append(out, core.PadToWidth(w, width))
-		}
-	}
-	return out
-}
-
-// ---------------------------------------------------------------------------
-// Inline formatting
-// ---------------------------------------------------------------------------
-
-func renderInline(s string, t MarkdownTheme) string {
-	s = reInlineCode.ReplaceAllStringFunc(s, func(m string) string {
-		inner := strings.Trim(m, "`")
-		return t.CodeInlineFn(inner)
-	})
-	s = reInlineBold.ReplaceAllStringFunc(s, func(m string) string {
-		inner := strings.Trim(m, "*_")
-		return t.StrongFn(inner)
-	})
-	s = reInlineStrike.ReplaceAllStringFunc(s, func(m string) string {
-		inner := strings.Trim(m, "~")
-		return t.StrikeFn(inner)
-	})
-	s = reInlineItalic.ReplaceAllStringFunc(s, func(m string) string {
-		inner := strings.Trim(m, "*_")
-		return t.EmphasisFn(inner)
-	})
-	s = reInlineLink.ReplaceAllStringFunc(s, func(m string) string {
-		sub := reInlineLink.FindStringSubmatch(m)
-		if len(sub) < 3 {
-			return m
-		}
-		if t.LinkRendererFn != nil {
-			return t.LinkRendererFn(sub[1], sub[2])
-		}
-		return t.LinkLabelFn(sub[1]) + " " + t.LinkURLFn("("+sub[2]+")")
-	})
-	return s
-}
-
-// ---------------------------------------------------------------------------
-// Table rendering
-// ---------------------------------------------------------------------------
-
-func renderTable(rows []string, width int64, t MarkdownTheme) []string {
-	if len(rows) < 2 {
-		return nil
-	}
-	parse := func(r string) []string {
-		r = strings.TrimSpace(r)
-		r = strings.TrimPrefix(r, "|")
-		r = strings.TrimSuffix(r, "|")
-		parts := strings.Split(r, "|")
-		for i := range parts {
-			parts[i] = strings.TrimSpace(parts[i])
-		}
-		return parts
-	}
-	header := parse(rows[0])
-	body := make([][]string, 0, len(rows)-2)
-	for _, r := range rows[2:] {
-		body = append(body, parse(r))
-	}
-	cols := len(header)
-
-	// Column widths
-	colW := make([]int64, cols)
-	for i, h := range header {
-		colW[i] = core.VisibleWidth(h)
-	}
-	for _, r := range body {
-		for i := 0; i < cols && i < len(r); i++ {
-			if w := core.VisibleWidth(r[i]); w > colW[i] {
-				colW[i] = w
-			}
-		}
-	}
-	// Squeeze to fit viewport.
-	total := int64(cols)*3 + 1
-	for _, w := range colW {
-		total += w
-	}
-	if total > width {
-		excess := total - width
-		for excess > 0 {
-			idx := 0
-			for i := range colW {
-				if colW[i] > colW[idx] {
-					idx = i
-				}
-			}
-			if colW[idx] <= 3 {
-				break
-			}
-			colW[idx]--
-			excess--
-		}
-	}
-
-	sep := func() string {
-		var b strings.Builder
-		b.WriteString("+")
-		for _, w := range colW {
-			b.WriteString(strings.Repeat("-", int(w)+2))
-			b.WriteString("+")
-		}
-		return t.TableBorderFn(b.String())
-	}
-	row := func(cells []string, headerRow bool) string {
-		var b strings.Builder
-		b.WriteString(t.TableBorderFn("|"))
-		for i, w := range colW {
-			cell := ""
-			if i < len(cells) {
-				cell = cells[i]
-			}
-			if !headerRow {
-				cell = renderInline(cell, t)
-			}
-			padded := core.PadToWidth(core.TruncateToWidth(cell, w, "…"), w)
-			if headerRow {
-				padded = t.TableHeaderFn(padded)
-			}
-			b.WriteString(" ")
-			b.WriteString(padded)
-			b.WriteString(" ")
-			b.WriteString(t.TableBorderFn("|"))
-		}
-		return b.String()
-	}
-	out := []string{
-		core.PadToWidth(sep(), width),
-		core.PadToWidth(row(header, true), width),
-		core.PadToWidth(sep(), width),
-	}
-	for _, r := range body {
-		out = append(out, core.PadToWidth(row(r, false), width))
-	}
-	out = append(out, core.PadToWidth(sep(), width))
-	return out
-}
-
-// ---------------------------------------------------------------------------
 // Default theme
 // ---------------------------------------------------------------------------
 
@@ -506,30 +160,93 @@ func DefaultMarkdownTheme() MarkdownTheme { return defaultMarkdownTheme() }
 
 // OSC8LinkRenderer returns a LinkRendererFn that wraps links with OSC8
 // escape sequences, making them clickable in supported terminals
-// (iTerm2, Hyper, Windows Terminal, kitty, etc.). The label and URL
-// remain visible even on terminals that don't support OSC8.
+// (iTerm2, Hyper, Windows Terminal, kitty, etc.).
+// Named links show the label only; autolinks (label == URL) stay visible.
+// Network shares, automount paths, control/invisible characters, and
+// script/data schemes stay plain text.
 func OSC8LinkRenderer(labelFn, urlFn func(string) string) func(label, url string) string {
-	return func(label, url string) string {
-		styledLabel := labelFn(label)
-		styledURL := urlFn("(" + url + ")")
-		return "\x1b]8;;" + url + "\x1b\\" + styledLabel + " " + styledURL + "\x1b]8;;\x1b\\"
+	return func(label, rawURL string) string {
+		if rawURL == "" {
+			return labelFn(label)
+		}
+		text := label
+		if text == "" {
+			text = rawURL
+		}
+		inner := labelFn(text)
+		if urlFn != nil && text == rawURL {
+			inner = urlFn(text)
+		}
+		if !safeHyperlinkURL(rawURL) {
+			return inner
+		}
+		return "\x1b]8;;" + rawURL + "\x1b\\" + inner + "\x1b]8;;\x1b\\"
 	}
+}
+
+func safeHyperlinkURL(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	for _, r := range raw {
+		if r < 0x20 || r == 0x7f || unicode.Is(unicode.Cf, r) {
+			return false
+		}
+	}
+	if strings.HasPrefix(raw, `\\`) || strings.HasPrefix(raw, "//") {
+		return false
+	}
+	lower := strings.ToLower(raw)
+	if strings.HasPrefix(lower, "/net/") || strings.HasPrefix(lower, "/smb/") || strings.HasPrefix(lower, "/afs/") {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "smb", "afp", "nfs", "javascript", "vbscript", "data":
+		return false
+	case "file":
+		host := strings.ToLower(u.Hostname())
+		if host != "" && host != "localhost" && host != "127.0.0.1" && host != "::1" {
+			return false
+		}
+	}
+	return true
 }
 
 func defaultMarkdownTheme() MarkdownTheme {
 	p := apitheme.CurrentPalette()
 	sem := p.Semantic
 	mode := p.Mode
-	h := func(s string) string {
-		return apitheme.SemStyle(sem.MdHeading, mode).Bold().Render(s)
+	hColor := sem.MdHeading
+	textColor := sem.Text
+	if textColor == "" {
+		textColor = sem.AssistantText
 	}
+	if textColor == "" {
+		textColor = "#e0e0e0"
+	}
+	mutedColor := sem.Muted
+	if mutedColor == "" {
+		mutedColor = sem.Dim
+	}
+	h1 := apitheme.SemStyle(hColor, mode).Bold().Render
+	h2 := apitheme.SemStyle(apitheme.MixHex(hColor, textColor, 0.22), mode).Bold().Render
+	h3 := apitheme.SemStyle(apitheme.MixHex(hColor, textColor, 0.45), mode).Bold().Render
+	h4 := apitheme.SemStyle(apitheme.MixHex(hColor, mutedColor, 0.35), mode).Render
+	h5 := apitheme.SemStyle(apitheme.MixHex(hColor, mutedColor, 0.55), mode).Dim().Render
+	h6 := apitheme.SemStyle(apitheme.MixHex(hColor, mutedColor, 0.72), mode).Dim().Italic().Render
 	linkLabelFn := apitheme.SemStyle(sem.MdLink, mode).Underline().Render
 	linkURLFn := apitheme.SemStyle(sem.MdLinkUrl, mode).Render
+	mathFn := apitheme.SemStyle(sem.MdQuote, mode).Italic().Render
 	return MarkdownTheme{
-		HeadingFn:      [6]func(string) string{h, h, h, h, h, h},
+		HeadingFn:      [6]func(string) string{h1, h2, h3, h4, h5, h6},
 		EmphasisFn:     apitheme.NewStyle().Italic().Render,
 		StrongFn:       apitheme.NewStyle().Bold().Render,
 		StrikeFn:       apitheme.NewStyle().Strike().Render,
+		MarkFn:         apitheme.NewStyle().Reverse().Render,
 		CodeInlineFn:   apitheme.SemStyle(sem.MdCode, mode).Render,
 		CodeBlockFn:    apitheme.SemStyle(sem.MdCodeBlock, mode).Render,
 		CodeFenceFn:    apitheme.SemStyle(sem.MdCodeBlockBorder, mode).Render,
@@ -541,6 +258,8 @@ func defaultMarkdownTheme() MarkdownTheme {
 		ListBulletFn:   apitheme.SemStyle(sem.MdListBullet, mode).Render,
 		TableBorderFn:  apitheme.SemStyle(sem.MdCodeBlockBorder, mode).Render,
 		TableHeaderFn:  apitheme.NewStyle().Bold().Render,
+		MathFn:         mathFn,
+		ImageRenderer:  defaultImageRenderer,
 	}
 }
 
@@ -554,6 +273,9 @@ func mergeMarkdownTheme(t MarkdownTheme) MarkdownTheme {
 	}
 	if t.StrikeFn != nil {
 		d.StrikeFn = t.StrikeFn
+	}
+	if t.MarkFn != nil {
+		d.MarkFn = t.MarkFn
 	}
 	if t.CodeInlineFn != nil {
 		d.CodeInlineFn = t.CodeInlineFn
@@ -588,11 +310,63 @@ func mergeMarkdownTheme(t MarkdownTheme) MarkdownTheme {
 	if t.TableHeaderFn != nil {
 		d.TableHeaderFn = t.TableHeaderFn
 	}
+	if t.MathFn != nil {
+		d.MathFn = t.MathFn
+	}
+	if t.HighlightFence != nil {
+		d.HighlightFence = t.HighlightFence
+	}
+	if t.FenceRenderer != nil {
+		d.FenceRenderer = t.FenceRenderer
+	}
+	if t.ImageRenderer != nil {
+		d.ImageRenderer = t.ImageRenderer
+	}
 	for i, fn := range t.HeadingFn {
 		if fn != nil {
 			d.HeadingFn[i] = fn
 		}
 	}
 	d.DisableSyntax = t.DisableSyntax
+	d.SkipIncomplete = t.SkipIncomplete
+	if t.Syntax != nil {
+		d.Syntax = t.Syntax
+	}
 	return d
+}
+
+// defaultImageRenderer inlines local files / data URIs. Remote http(s) URLs
+// stay as labelled links — the renderer never fetches the network.
+func defaultImageRenderer(alt, url string, width int64) []string {
+	if url == "" {
+		return nil
+	}
+	lower := strings.ToLower(url)
+	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+		return nil
+	}
+	var (
+		img *Image
+		err error
+	)
+	switch {
+	case strings.HasPrefix(lower, "data:image/"):
+		img, err = imageFromDataURI(url)
+	case strings.HasPrefix(lower, "file://"):
+		img, err = NewImageFromFile(strings.TrimPrefix(url, "file://"))
+	default:
+		img, err = NewImageFromFile(url)
+	}
+	if err != nil || img == nil {
+		return nil
+	}
+	if width <= 0 {
+		width = 40
+	}
+	maxH := int64(12)
+	if width < 20 {
+		maxH = 6
+	}
+	img.SetMaxSize(width, maxH)
+	return img.Render(width)
 }

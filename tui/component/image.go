@@ -103,6 +103,31 @@ func NewImageFromFile(path string) (*Image, error) {
 	return NewImageFromBytes(data)
 }
 
+// imageFromDataURI decodes a data:image/...;base64,... URI.
+func imageFromDataURI(uri string) (*Image, error) {
+	const prefix = "data:image/"
+	if !strings.HasPrefix(strings.ToLower(uri), prefix) {
+		return nil, fmt.Errorf("tui: not a data:image URI")
+	}
+	comma := strings.IndexByte(uri, ',')
+	if comma < 0 {
+		return nil, fmt.Errorf("tui: malformed data URI")
+	}
+	meta := strings.ToLower(uri[:comma])
+	payload := uri[comma+1:]
+	var data []byte
+	if strings.Contains(meta, ";base64") {
+		decoded, err := base64.StdEncoding.DecodeString(payload)
+		if err != nil {
+			return nil, fmt.Errorf("tui: data URI base64: %w", err)
+		}
+		data = decoded
+	} else {
+		data = []byte(payload)
+	}
+	return NewImageFromBytes(data)
+}
+
 // SetMaxSize constrains the render to (maxW x maxH) cells. Zero = no limit.
 func (im *Image) SetMaxSize(maxW, maxH int64) {
 	im.mu.Lock()

@@ -40,7 +40,7 @@ const (
 type ChatMessage struct {
 	ID        string        // optional — non-empty enables in-place updates.
 	Role      ChatRole      // governs default styling & prefix.
-	Text      string        // raw source (markdown for assistant, plain for others).
+	Text      string        // markdown source for user and assistant bubbles.
 	Pending   bool          // the message is still streaming; a cursor may be shown.
 	Meta      string        // e.g. tool name, duration.
 	At        time.Time     // emission time (for display).
@@ -60,6 +60,10 @@ type ChatMessage struct {
 
 	// Thinking blocks (structured content).
 	ThinkingSegments []ThinkingSegment
+
+	// FooterChip is an optional dim summary under a completed assistant
+	// reply, e.g. "code · gpt-4.1 · 5.5s". Empty means no chip.
+	FooterChip string
 
 	// Internal: last delta dedup to suppress streaming repetition loops.
 	lastDelta string
@@ -347,6 +351,32 @@ func (h *ChatHistory) PatchMessage(id string, fn func(m *ChatMessage)) bool {
 	return false
 }
 
+// PatchLastAssistantReply patches the most recent assistant message that has
+// visible text. Used to attach a completion chip after a run; the chip stays
+// hidden until the message is no longer pending.
+func (h *ChatHistory) PatchLastAssistantReply(fn func(m *ChatMessage)) bool {
+	if fn == nil {
+		return false
+	}
+	h.mu.Lock()
+	for i := len(h.messages) - 1; i >= 0; i-- {
+		m := &h.messages[i]
+		if m.Role != RoleAssistant || m.Collapsed {
+			continue
+		}
+		if strings.TrimSpace(m.Text) == "" {
+			continue
+		}
+		fn(m)
+		h.dirty = true
+		h.mu.Unlock()
+		h.invalidate()
+		return true
+	}
+	h.mu.Unlock()
+	return false
+}
+
 // AppendDelta appends text to an existing assistant message, or creates a
 // new one if `id` is empty or unknown. Returns the effective message ID.
 func (h *ChatHistory) AppendDelta(id, delta string) string {
@@ -420,9 +450,40 @@ func (h *ChatHistory) AppendDeltaWithKind(id, delta, kind string) string {
 	return newID
 }
 
-// Finalize clears the Pending flag on the given id.
+// Finalize clears the Pending flag on the given id. An assistant bubble
+// with no text and no thinking is dropped so the streaming placeholder
+// does not linger after tools start.
 func (h *ChatHistory) Finalize(id string) {
-	h.PatchMessage(id, func(m *ChatMessage) { m.Pending = false })
+	if id == "" {
+		return
+	}
+	h.mu.Lock()
+	for i := range h.messages {
+		if h.messages[i].ID != id {
+			continue
+		}
+		m := &h.messages[i]
+		m.Pending = false
+		if m.Role == RoleAssistant && strings.TrimSpace(m.Text) == "" && !thinkingHasText(m.ThinkingSegments) {
+			h.messages = append(h.messages[:i], h.messages[i+1:]...)
+		}
+		h.dirty = true
+		h.selActive = false
+		h.selDragging = false
+		h.mu.Unlock()
+		h.invalidate()
+		return
+	}
+	h.mu.Unlock()
+}
+
+func thinkingHasText(segs []ThinkingSegment) bool {
+	for _, s := range segs {
+		if strings.TrimSpace(s.Text) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // RemoveMessage deletes the message identified by id, if present. Used to
@@ -1116,6 +1177,7 @@ func (h *ChatHistory) renderAll(width int64) []string {
 	theme := h.theme
 	var out []string
 	var ranges []msgRange
+	var lastRole ChatRole
 
 	if len(h.messages) == 0 {
 		// Empty history — show welcome
@@ -1202,26 +1264,31 @@ func (h *ChatHistory) renderAll(width int64) []string {
 					})
 				}
 				i = groupEnd
+				lastRole = RoleTool
 				continue
 			}
 		}
 
-		if i > 0 {
+		lines := trimBlankEdges(h.renderMessage(m, theme, width))
+		if len(lines) == 0 {
+			continue
+		}
+		if lastRole != 0 {
 			// Add spacing. Use a subtle separator between user/assistant turns.
-			prev := h.messages[i-1]
-			if (prev.Role == RoleUser && m.Role == RoleAssistant) ||
-				(prev.Role == RoleAssistant && m.Role == RoleUser) {
+			if (lastRole == RoleUser && m.Role == RoleAssistant) ||
+				(lastRole == RoleAssistant && m.Role == RoleUser) {
 				sep := theme.DimStyle.Render(strings.Repeat("─", int(width)))
 				out = append(out, "", sep, "")
-			} else if prev.Role == RoleTool || m.Role == RoleTool {
+			} else if lastRole == RoleTool || m.Role == RoleTool {
 				// Tools are compact — no extra blank line.
 			} else {
 				out = append(out, "", "")
 			}
 		}
 		start := len(out)
-		out = append(out, trimBlankEdges(h.renderMessage(m, theme, width))...)
+		out = append(out, lines...)
 		ranges = append(ranges, msgRange{startLine: start, endLine: len(out), msgIndex: i})
+		lastRole = m.Role
 	}
 	h.cachedMsgRanges = ranges
 
@@ -1365,8 +1432,25 @@ func (h *ChatHistory) renderMessage(m ChatMessage, theme ChatHistoryTheme, width
 	switch m.Role {
 	case RoleUser:
 		bar := theme.UserStyle.Render("▌ ")
-		body := bar + theme.UserStyle.Render(m.Text)
-		return core.WrapAnsi(body, width)
+		barW := core.VisibleWidth("▌ ")
+		innerW := width
+		if width > 0 {
+			innerW = width - barW
+			if innerW < 1 {
+				innerW = 1
+			}
+		}
+		md := component.NewMarkdown(m.Text)
+		md.SetTheme(theme.MarkdownTheme)
+		body := md.Render(innerW)
+		if len(body) == 0 {
+			return []string{core.PadToWidth(bar, width)}
+		}
+		out := make([]string, len(body))
+		for i, ln := range body {
+			out[i] = core.PadToWidth(bar+ln, width)
+		}
+		return out
 	case RoleAssistant:
 		// Collapsed assistant messages (e.g. collapsed diffs)
 		if m.Collapsed && m.Text != "" {
@@ -1399,7 +1483,11 @@ func (h *ChatHistory) renderMessage(m ChatMessage, theme ChatHistoryTheme, width
 		// Render text content
 		if m.Text != "" {
 			md := component.NewMarkdown(m.Text)
-			md.SetTheme(theme.MarkdownTheme)
+			mdTheme := theme.MarkdownTheme
+			if m.Pending {
+				mdTheme.SkipIncomplete = true
+			}
+			md.SetTheme(mdTheme)
 			lines := md.Render(width)
 			if m.Pending {
 				if len(lines) == 0 {
@@ -1418,8 +1506,14 @@ func (h *ChatHistory) renderMessage(m ChatMessage, theme ChatHistoryTheme, width
 			}
 		}
 
-		if len(allLines) == 0 {
+		if len(allLines) == 0 && m.Pending {
 			allLines = []string{theme.DimStyle.Render("…")}
+		}
+		if chip := strings.TrimSpace(m.FooterChip); chip != "" && !m.Pending {
+			if len(allLines) > 0 {
+				allLines = append(allLines, "")
+			}
+			allLines = append(allLines, theme.DimStyle.Render("  ▸ "+chip))
 		}
 		return allLines
 	case RoleSystem:

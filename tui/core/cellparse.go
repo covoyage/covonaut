@@ -24,13 +24,11 @@ import (
 //
 // Grapheme clusters (UAX #29) are handled at a pragmatic level:
 //   - Combining diacritical marks attach to the preceding base rune.
-//   - ZWJ-joined emoji sequences (e.g. 👨‍👩‍👧) are stored as separate cells
-//     per rune — the cell grid records the sum of individual rune widths
-//     even though the terminal renders the cluster as one glyph. This is a
-//     known approximation; the renderer accounts for it by emitting the
-//     runes back as-is. A full cluster segmenter would collapse these to a
-//     single 2-wide cell, but the work vs payoff is low for a TUI that
-//     rarely emits composed emoji.
+//   - Variation selectors travel with the base (U+FE0F emoji presentation
+//     upgrades a narrow BMP symbol such as ☁ to a 2-cell glyph ☁️).
+//   - ZWJ-joined emoji sequences (e.g. 👨‍👩‍👧) collapse to one 2-wide cell
+//     so the grid matches what the terminal paints. Extra runes in the
+//     cluster are stored as Combining so SerializeRow round-trips.
 // ---------------------------------------------------------------------------
 
 // ParseLine parses a rendered string into a Row.
@@ -92,32 +90,43 @@ func ParseLine(s string) Row {
 			i++
 			continue
 		}
-		rw := RuneWidth(r)
+		rw, n := nextCluster(s, i)
+		if n <= 0 {
+			i++
+			continue
+		}
+		combining := clusterCombining(s[i : i+n])
 		switch {
 		case rw == 0 && len(cells) > 0:
-			// Combining mark — attach to the previous cell. Don't attach to
-			// a continuation cell; attach to its primary (one to the left).
+			// Combining mark / VS with no visible base — attach to the
+			// previous primary cell.
 			idx := len(cells) - 1
 			for idx > 0 && cells[idx].IsContinuation() {
 				idx--
 			}
 			cells[idx].Combining = append(cells[idx].Combining, r)
+			cells[idx].Combining = append(cells[idx].Combining, combining...)
 		case rw == 2:
 			cells = append(cells, Cell{
-				Rune:  r,
-				Width: 2,
-				Style: style,
+				Rune:      r,
+				Combining: combining,
+				Width:     2,
+				Style:     style,
 			})
-			// Continuation placeholder.
 			cells = append(cells, Cell{Width: 0, Style: style})
-		default: // rw == 1
+		default:
+			w := int8(1)
+			if rw > 0 {
+				w = int8(rw)
+			}
 			cells = append(cells, Cell{
-				Rune:  r,
-				Width: 1,
-				Style: style,
+				Rune:      r,
+				Combining: combining,
+				Width:     w,
+				Style:     style,
 			})
 		}
-		i += size
+		i += n
 	}
 	return Row{Cells: cells, CursorCol: cursorCol}
 }
@@ -173,6 +182,18 @@ func isSGRSequence(s string, i, adv int) bool {
 		return false
 	}
 	return s[i+adv-1] == 'm'
+}
+
+// clusterCombining returns the trailing runes of a cluster after the base.
+func clusterCombining(cluster string) []rune {
+	if cluster == "" {
+		return nil
+	}
+	_, size := utf8.DecodeRuneInString(cluster)
+	if size >= len(cluster) {
+		return nil
+	}
+	return []rune(cluster[size:])
 }
 
 // visibleWidthOfCells sums the Width fields of the cells (continuations

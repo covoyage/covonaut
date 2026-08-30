@@ -27,6 +27,13 @@ func TestRGBTo256GrayscalePreference(t *testing.T) {
 	}
 }
 
+func TestMixHexMidpoint(t *testing.T) {
+	got := MixHex("#000000", "#ffffff", 0.5)
+	if got != "#7f7f7f" {
+		t.Fatalf("MixHex midpoint = %q", got)
+	}
+}
+
 func TestDetectColorModeAppleTerminal(t *testing.T) {
 	t.Setenv("COLORTERM", "")
 	t.Setenv("WT_SESSION", "")

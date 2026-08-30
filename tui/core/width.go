@@ -19,12 +19,15 @@ import (
 //   - East-Asian Wide / Fullwidth (width 2)
 //   - East-Asian Ambiguous (width 1 or 2, per SetAmbiguousWide)
 //   - Emoji basic ranges (width 2)
-//   - Variation selectors / ZWJ (width 0)
+//   - Emoji presentation sequences (base + U+FE0F) as one 2-cell cluster
+//   - Variation selectors / ZWJ (width 0; VS16 upgrades the cluster to width 2)
 //   - ANSI CSI/OSC escape sequences (width 0, transparently stripped)
 //
 // It is intentionally a *subset* of full Unicode UAX #11 — good enough for
 // terminal UI. When in doubt, it errs on the side of width 1 to avoid
-// truncating too aggressively.
+// truncating too aggressively. BMP symbols such as U+2601 (☁) are narrow
+// in isolation; terminals draw the emoji-presentation form (☁ + VS16 = ☁️)
+// two cells wide, so measurement must follow the cluster, not the base rune.
 // ---------------------------------------------------------------------------
 
 // ambiguousWide controls how East-Asian Ambiguous characters (—, →, ★, ℃,
@@ -74,10 +77,86 @@ func RuneWidth(r rune) int64 {
 	if isWide(r) {
 		return 2
 	}
-	if ambiguousWide.Load() && textwidth.LookupRune(r).Kind() == textwidth.EastAsianAmbiguous {
+	kind := textwidth.LookupRune(r).Kind()
+	// Dingbats / emoji such as ✅ (U+2705) and ❌ (U+274C) are East-Asian Wide
+	// but sit outside the hardcoded isWide ranges. Terminals draw them in 2
+	// cells; counting them as 1 shifts every subsequent table border.
+	if kind == textwidth.EastAsianWide || kind == textwidth.EastAsianFullwidth {
+		return 2
+	}
+	if ambiguousWide.Load() && kind == textwidth.EastAsianAmbiguous {
 		return 2
 	}
 	return 1
+}
+
+const (
+	runeZWJ  = 0x200D
+	runeVS15 = 0xFE0E // text presentation
+	runeVS16 = 0xFE0F // emoji presentation
+)
+
+// nextCluster returns the display width and byte length of the grapheme-like
+// cluster starting at s[i]. A cluster is a base rune plus trailing combining
+// marks, variation selectors, skin-tone modifiers, and ZWJ-joined runes.
+//
+// Terminals draw an emoji-presentation sequence (base + U+FE0F) two cells
+// wide even when the base rune itself is narrow (e.g. ☁ + VS16 = ☁️).
+// ZWJ sequences such as family emoji are one glyph of width 2.
+func nextCluster(s string, i int) (width int64, n int) {
+	if i >= len(s) {
+		return 0, 0
+	}
+	r, size := utf8.DecodeRuneInString(s[i:])
+	if r == utf8.RuneError && size <= 1 {
+		return 0, 1
+	}
+	pos := i + size
+	width = RuneWidth(r)
+	sawEmojiVS := false
+	sawTextVS := false
+	joined := false
+
+	for pos < len(s) {
+		nr, nsize := utf8.DecodeRuneInString(s[pos:])
+		if nr == utf8.RuneError && nsize <= 1 {
+			break
+		}
+		switch {
+		case nr == runeVS16:
+			sawEmojiVS = true
+			pos += nsize
+		case nr == runeVS15:
+			sawTextVS = true
+			pos += nsize
+		case nr == runeZWJ:
+			pos += nsize
+			if pos >= len(s) {
+				break
+			}
+			br, bsize := utf8.DecodeRuneInString(s[pos:])
+			if br == utf8.RuneError && bsize <= 1 {
+				break
+			}
+			pos += bsize
+			joined = true
+		case isZeroWidth(nr):
+			pos += nsize
+		default:
+			return finalizeClusterWidth(width, sawEmojiVS, sawTextVS, joined), pos - i
+		}
+	}
+	return finalizeClusterWidth(width, sawEmojiVS, sawTextVS, joined), pos - i
+}
+
+func finalizeClusterWidth(base int64, emojiVS, textVS, joined bool) int64 {
+	if joined || emojiVS {
+		return 2
+	}
+	if textVS {
+		return base
+	}
+	return base
 }
 
 func isZeroWidth(r rune) bool {
@@ -106,6 +185,12 @@ func isZeroWidth(r rune) bool {
 	case r >= 0x06EA && r <= 0x06ED:
 		return true
 	case r == 0x200B, r == 0x200C, r == 0x200D, r == 0x200E, r == 0x200F:
+		return true
+	case r >= 0x20D0 && r <= 0x20FF: // Combining marks for symbols (keycaps, etc.)
+		return true
+	case r >= 0x1F3FB && r <= 0x1F3FF: // Emoji Fitzpatrick skin-tone modifiers
+		return true
+	case r >= 0xE0020 && r <= 0xE007F: // Emoji tag sequences (flags)
 		return true
 	case r >= 0x202A && r <= 0x202E:
 		return true
@@ -181,12 +266,12 @@ func VisibleWidth(s string) int64 {
 				continue
 			}
 		}
-		r, size := utf8.DecodeRuneInString(s[i:])
-		if r == utf8.RuneError && size <= 1 {
+		rw, size := nextCluster(s, i)
+		if size <= 0 {
 			i++
 			continue
 		}
-		w += RuneWidth(r)
+		w += rw
 		i += size
 	}
 	return w
@@ -282,12 +367,11 @@ func TruncateToWidth(s string, maxWidth int64, ellipsis string) string {
 				continue
 			}
 		}
-		r, size := utf8.DecodeRuneInString(s[i:])
-		if r == utf8.RuneError && size <= 1 {
+		rw, size := nextCluster(s, i)
+		if size <= 0 {
 			i++
 			continue
 		}
-		rw := RuneWidth(r)
 		if used+rw > budget {
 			break
 		}
@@ -338,12 +422,11 @@ func SliceByColumn(s string, start, end int64) string {
 				continue
 			}
 		}
-		r, size := utf8.DecodeRuneInString(s[i:])
-		if r == utf8.RuneError && size <= 1 {
+		rw, size := nextCluster(s, i)
+		if size <= 0 {
 			i++
 			continue
 		}
-		rw := RuneWidth(r)
 		if col+rw > end {
 			break
 		}
@@ -420,7 +503,11 @@ func findBreakColumn(s string, width int64) int64 {
 			i++
 			continue
 		}
-		rw := RuneWidth(r)
+		rw, n := nextCluster(s, i)
+		if n <= 0 {
+			i++
+			continue
+		}
 		if col+rw > width {
 			if lastWS > 0 {
 				return lastWS
@@ -431,7 +518,7 @@ func findBreakColumn(s string, width int64) int64 {
 			lastWS = col + rw
 		}
 		col += rw
-		i += size
+		i += n
 	}
 	return col
 }

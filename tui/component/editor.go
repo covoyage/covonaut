@@ -81,13 +81,19 @@ type Editor struct {
 	inputHistoryDraft string // buffer saved when entering history browse mode
 
 	// Ghost text — inline completion preview (Copilot-style).
-	ghostText   string // the suggested completion text
-	ghostCol    int64  // rune offset in the current line where ghost starts (cursor position at request time)
-	ghostRow    int64  // hard row index where the ghost applies
+	ghostText string // the suggested completion text
+	ghostCol  int64  // rune offset in the current line where ghost starts (cursor position at request time)
+	ghostRow  int64  // hard row index where the ghost applies
 
 	onSubmit func(value string)
 	onChange func(value string)
 	onCancel func()
+
+	// Optional vim modal editing. When enabled, the editor starts in insert
+	// mode so typing still works; Esc enters normal mode (hjkl / i / a / x / dd).
+	vimEnabled bool
+	vimInsert  bool
+	vimPending string
 }
 
 type editorSnapshot struct {
@@ -154,6 +160,31 @@ func (e *Editor) SetPlaceholderFn(fn func(string) string) {
 	e.mu.Lock()
 	e.placeFn = fn
 	e.mu.Unlock()
+}
+
+// SetVimMode enables or disables vim-style modal editing.
+// When turning on, the editor starts in insert mode so the user can type immediately.
+func (e *Editor) SetVimMode(on bool) {
+	e.mu.Lock()
+	e.vimEnabled = on
+	e.vimInsert = true
+	e.vimPending = ""
+	e.mu.Unlock()
+}
+
+// VimMode reports whether vim-style modal editing is enabled.
+func (e *Editor) VimMode() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.vimEnabled
+}
+
+// VimInsertMode reports whether the editor is currently inserting text.
+// When vim mode is off this is always true.
+func (e *Editor) VimInsertMode() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return !e.vimEnabled || e.vimInsert
 }
 
 // SetMinRows / SetMaxRows control auto-growth of the component height.
@@ -743,6 +774,8 @@ func (e *Editor) processKeys(data string) {
 		case km.Matches(raw, "tui.input.submit"):
 			e.ghostText = ""
 			e.submit()
+		case e.handleVimKey(k):
+			e.ghostText = ""
 		case km.Matches(raw, "tui.editor.selectAll"):
 			e.SelectAll()
 		case km.Matches(raw, "tui.editor.cursorLeft"):
@@ -822,6 +855,166 @@ func (e *Editor) processKeys(data string) {
 				e.insertRune(k.Rune)
 			}
 		}
+	}
+}
+
+func (e *Editor) handleVimKey(k terminal.Key) bool {
+	e.mu.Lock()
+	enabled := e.vimEnabled
+	insert := e.vimInsert
+	e.mu.Unlock()
+	if !enabled {
+		return false
+	}
+	if k.Name == "escape" {
+		e.mu.Lock()
+		e.vimInsert = false
+		e.vimPending = ""
+		e.mu.Unlock()
+		return true
+	}
+	if insert {
+		return false
+	}
+	if k.Mods&^terminal.ModShift != 0 {
+		return true
+	}
+	name := k.Name
+	if name == "" && k.Rune != 0 {
+		name = string(k.Rune)
+	}
+
+	e.mu.Lock()
+	pending := e.vimPending
+	e.vimPending = ""
+	e.mu.Unlock()
+
+	if pending == "d" {
+		switch name {
+		case "d":
+			e.vimDeleteLine()
+		case "w":
+			e.deleteWordForward()
+		case "$":
+			e.deleteToLineEnd()
+		case "0":
+			e.deleteToLineStart()
+		}
+		return true
+	}
+
+	switch name {
+	case "h":
+		e.moveCursor(0, -1)
+	case "l":
+		e.moveCursor(0, 1)
+	case "j":
+		e.moveCursor(1, 0)
+	case "k":
+		e.moveCursor(-1, 0)
+	case "w":
+		e.moveWord(1)
+	case "b":
+		e.moveWord(-1)
+	case "0":
+		e.mu.Lock()
+		e.allSelected = false
+		e.clearMouseSelectionLocked()
+		e.col = 0
+		e.mu.Unlock()
+	case "$":
+		e.mu.Lock()
+		e.allSelected = false
+		e.clearMouseSelectionLocked()
+		e.col = int64(len(e.lines[e.row]))
+		e.mu.Unlock()
+	case "i":
+		e.mu.Lock()
+		e.vimInsert = true
+		e.mu.Unlock()
+	case "a":
+		e.moveCursor(0, 1)
+		e.mu.Lock()
+		e.vimInsert = true
+		e.mu.Unlock()
+	case "I":
+		e.mu.Lock()
+		e.allSelected = false
+		e.clearMouseSelectionLocked()
+		e.col = 0
+		e.vimInsert = true
+		e.mu.Unlock()
+	case "A":
+		e.mu.Lock()
+		e.allSelected = false
+		e.clearMouseSelectionLocked()
+		e.col = int64(len(e.lines[e.row]))
+		e.vimInsert = true
+		e.mu.Unlock()
+	case "x":
+		e.deleteForward()
+	case "d":
+		e.mu.Lock()
+		e.vimPending = "d"
+		e.mu.Unlock()
+	case "p":
+		e.yank()
+	case "u":
+		e.undo()
+	case "G":
+		e.mu.Lock()
+		e.allSelected = false
+		e.clearMouseSelectionLocked()
+		e.row = int64(len(e.lines) - 1)
+		e.col = int64(len(e.lines[e.row]))
+		e.mu.Unlock()
+	case "g":
+		e.mu.Lock()
+		if pending == "g" {
+			e.allSelected = false
+			e.clearMouseSelectionLocked()
+			e.row = 0
+			e.col = 0
+		} else {
+			e.vimPending = "g"
+		}
+		e.mu.Unlock()
+	}
+	return true
+}
+
+func (e *Editor) vimDeleteLine() {
+	e.mu.Lock()
+	e.clearMouseSelectionLocked()
+	e.pushSnapshotLocked()
+	if e.allSelected {
+		e.clearSelectionContentLocked()
+		fn := e.onChange
+		v := e.valueLocked()
+		e.mu.Unlock()
+		if fn != nil {
+			fn(v)
+		}
+		return
+	}
+	killed := string(e.lines[e.row])
+	if len(e.lines) == 1 {
+		e.lines = [][]rune{{}}
+		e.row = 0
+		e.col = 0
+	} else {
+		e.lines = append(e.lines[:e.row], e.lines[e.row+1:]...)
+		if e.row >= int64(len(e.lines)) {
+			e.row = int64(len(e.lines) - 1)
+		}
+		e.col = 0
+	}
+	e.pushKillRingLocked(killed + "\n")
+	fn := e.onChange
+	v := e.valueLocked()
+	e.mu.Unlock()
+	if fn != nil {
+		fn(v)
 	}
 }
 

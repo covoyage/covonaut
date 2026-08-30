@@ -46,6 +46,71 @@ func TestChatHistoryAppendDelta(t *testing.T) {
 	}
 }
 
+func TestChatHistoryEmptyAssistantPlaceholderGoneAfterFinalize(t *testing.T) {
+	h := NewChatHistory()
+	h.Append(ChatMessage{Role: RoleUser, Text: "青岛天气"})
+	id := h.AppendDeltaWithKind("", "hidden-thought", "thinking")
+	plain := core.StripAnsi(strings.Join(h.Render(40), "\n"))
+	if !strings.Contains(plain, "…") && !strings.Contains(plain, "...") {
+		t.Fatalf("pending empty assistant should show placeholder: %q", plain)
+	}
+	h.Finalize(id)
+	h.Append(ChatMessage{Role: RoleTool, Meta: "skill", Text: "done"})
+	h.Append(ChatMessage{Role: RoleTool, Meta: "web_fetch", Text: "done"})
+	plain = core.StripAnsi(strings.Join(h.Render(40), "\n"))
+	if strings.Contains(plain, "…") || strings.Contains(plain, "...") {
+		t.Fatalf("placeholder should disappear after tools: %q", plain)
+	}
+	if !strings.Contains(plain, "skill") || !strings.Contains(plain, "web_fetch") {
+		t.Fatalf("tools missing: %q", plain)
+	}
+}
+
+func TestChatHistoryAssistantFooterChip(t *testing.T) {
+	h := NewChatHistory()
+	h.Append(ChatMessage{Role: RoleUser, Text: "hello"})
+	id := h.Append(ChatMessage{Role: RoleAssistant, Text: "world", Pending: true, FooterChip: "code · gpt-4.1 · 5.5s"})
+
+	plain := core.StripAnsi(strings.Join(h.Render(40), "\n"))
+	if strings.Contains(plain, "▸") || strings.Contains(plain, "5.5s") {
+		t.Fatalf("chip should stay hidden while pending: %q", plain)
+	}
+
+	h.Finalize(id)
+	plain = core.StripAnsi(strings.Join(h.Render(40), "\n"))
+	if !strings.Contains(plain, "world") {
+		t.Fatalf("assistant text missing: %q", plain)
+	}
+	if !strings.Contains(plain, "▸ code · gpt-4.1 · 5.5s") {
+		t.Fatalf("completion chip missing: %q", plain)
+	}
+}
+
+func TestChatHistoryPatchLastAssistantReply(t *testing.T) {
+	h := NewChatHistory()
+	h.Append(ChatMessage{Role: RoleAssistant, Text: "first"})
+	h.Append(ChatMessage{Role: RoleTool, Meta: "bash", Text: "done"})
+	pendingID := h.Append(ChatMessage{Role: RoleAssistant, Text: "second", Pending: true})
+	if !h.PatchLastAssistantReply(func(m *ChatMessage) {
+		m.FooterChip = "code · gpt-4.1 · 1.2s"
+	}) {
+		t.Fatal("expected patch to succeed")
+	}
+	msgs := h.Messages()
+	if msgs[len(msgs)-1].FooterChip != "code · gpt-4.1 · 1.2s" {
+		t.Fatalf("patched wrong message: %+v", msgs)
+	}
+	plain := core.StripAnsi(strings.Join(h.Render(40), "\n"))
+	if strings.Contains(plain, "▸") {
+		t.Fatalf("chip should stay hidden while pending: %q", plain)
+	}
+	h.Finalize(pendingID)
+	plain = core.StripAnsi(strings.Join(h.Render(40), "\n"))
+	if !strings.Contains(plain, "▸ code · gpt-4.1 · 1.2s") {
+		t.Fatalf("chip missing after finalize: %q", plain)
+	}
+}
+
 func TestChatHistoryViewportClipping(t *testing.T) {
 	h := NewChatHistory()
 	for i := 0; i < 20; i++ {
@@ -103,6 +168,27 @@ func TestChatHistoryShortTranscriptFitsWidth(t *testing.T) {
 		if w := core.VisibleWidth(ln); w > width {
 			t.Fatalf("short transcript line wider than viewport: width=%d line=%q", w, ln)
 		}
+	}
+}
+
+func TestChatHistoryUserMarkdown(t *testing.T) {
+	h := NewChatHistory()
+	h.Append(ChatMessage{Role: RoleUser, Text: "see `foo.ts`:\n\n- first\n- second"})
+	plain := core.StripAnsi(strings.Join(h.Render(40), "\n"))
+	if !strings.Contains(plain, "foo.ts") {
+		t.Fatalf("inline code missing: %q", plain)
+	}
+	if strings.Contains(plain, "`foo.ts`") {
+		t.Fatalf("literal backticks leaked: %q", plain)
+	}
+	if !strings.Contains(plain, "first") || !strings.Contains(plain, "second") {
+		t.Fatalf("list items missing: %q", plain)
+	}
+	if strings.Contains(plain, "- first") {
+		t.Fatalf("literal list marker leaked: %q", plain)
+	}
+	if !strings.Contains(plain, "▌") {
+		t.Fatalf("user bar missing: %q", plain)
 	}
 }
 

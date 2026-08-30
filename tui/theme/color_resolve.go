@@ -72,6 +72,29 @@ func hexToRGB(hex string) (r, g, b int64, ok bool) {
 	return (n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff, true
 }
 
+// MixHex blends two #rrggbb colors. t=0 keeps a, t=1 yields b.
+// Non-hex inputs return a unchanged (trimmed).
+func MixHex(a, b string, t float64) string {
+	ar, ag, ab, aok := hexToRGB(a)
+	if !aok {
+		return strings.TrimSpace(a)
+	}
+	br, bg, bb, bok := hexToRGB(b)
+	if !bok {
+		return strings.TrimSpace(a)
+	}
+	if t < 0 {
+		t = 0
+	}
+	if t > 1 {
+		t = 1
+	}
+	mix := func(x, y int64) int64 {
+		return x + int64(float64(y-x)*t)
+	}
+	return fmt.Sprintf("#%02x%02x%02x", mix(ar, br), mix(ag, bg), mix(ab, bb))
+}
+
 var cubeValues = []int64{0, 95, 135, 175, 215, 255}
 
 func findClosestCubeIndex(value int64) int64 {

@@ -229,6 +229,18 @@ var extLanguageAliases = map[string]string{
 	".yml":    "yaml",
 	".rb":     "ruby",
 	".golang": "go",
+	".c":      "c",
+	".h":      "c",
+	".cpp":    "cpp",
+	".cc":     "cpp",
+	".cxx":    "cpp",
+	".hpp":    "cpp",
+	".java":   "java",
+	".sql":    "sql",
+	".html":   "html",
+	".htm":    "html",
+	".css":    "css",
+	".rs":     "rust",
 }
 
 // LanguageForFilename infers the language identifier for a filename via its
@@ -737,6 +749,13 @@ func builtinLanguages() []*LangSpec {
 		jsonSpec(),
 		yamlSpec(),
 		bashSpec(),
+		cSpec(),
+		cppSpec(),
+		javaSpec(),
+		sqlSpec(),
+		htmlSpec(),
+		cssSpec(),
+		rubySpec(),
 		plainSpec(),
 	}
 }
@@ -747,6 +766,14 @@ func asSet(words ...string) map[string]bool {
 		m[w] = true
 	}
 	return m
+}
+
+func cloneSet(m map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 func goSpec() *LangSpec {
@@ -819,7 +846,8 @@ func tsSpec() *LangSpec {
 	spec := jsSpec()
 	spec.Name = "typescript"
 	spec.Aliases = []string{"ts", "tsx"}
-	// TypeScript-specific keywords & types.
+	spec.Keywords = cloneSet(spec.Keywords)
+	spec.Types = cloneSet(spec.Types)
 	for _, k := range []string{
 		"abstract", "as", "declare", "interface", "is", "keyof", "namespace",
 		"readonly", "satisfies", "type", "unique", "unknown",
@@ -875,6 +903,136 @@ func yamlSpec() *LangSpec {
 		HashComment:              true,
 		StringDelims:             []string{`"`, `'`},
 		DisableFunctionHighlight: true,
+	}
+}
+
+func cSpec() *LangSpec {
+	return &LangSpec{
+		Name:    "c",
+		Aliases: []string{"h"},
+		Keywords: asSet(
+			"auto", "break", "case", "char", "const", "continue", "default", "do",
+			"double", "else", "enum", "extern", "float", "for", "goto", "if",
+			"inline", "int", "long", "register", "restrict", "return", "short",
+			"signed", "sizeof", "static", "struct", "switch", "typedef", "union",
+			"unsigned", "void", "volatile", "while", "_Bool", "_Complex",
+		),
+		Types: asSet(
+			"size_t", "ssize_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+			"int8_t", "int16_t", "int32_t", "int64_t", "bool", "FILE",
+		),
+		LineComment:  "//",
+		BlockComment: [2]string{"/*", "*/"},
+		StringDelims: []string{`"`, `'`},
+	}
+}
+
+func cppSpec() *LangSpec {
+	spec := cSpec()
+	spec.Name = "cpp"
+	spec.Keywords = cloneSet(spec.Keywords)
+	spec.Types = cloneSet(spec.Types)
+	spec.Aliases = []string{"c++", "cc", "cxx", "hpp", "hh"}
+	for _, k := range []string{
+		"class", "namespace", "template", "typename", "public", "private",
+		"protected", "virtual", "override", "final", "new", "delete", "this",
+		"try", "catch", "throw", "constexpr", "nullptr", "operator", "using",
+		"friend", "explicit", "mutable", "static_cast", "dynamic_cast",
+		"reinterpret_cast", "const_cast", "concept", "requires", "co_await",
+		"co_return", "co_yield", "true", "false",
+	} {
+		spec.Keywords[k] = true
+	}
+	for _, k := range []string{"string", "vector", "map", "set", "optional", "unique_ptr", "shared_ptr"} {
+		spec.Types[k] = true
+	}
+	return spec
+}
+
+func javaSpec() *LangSpec {
+	return &LangSpec{
+		Name:    "java",
+		Aliases: []string{"kt", "kotlin"},
+		Keywords: asSet(
+			"abstract", "assert", "boolean", "break", "byte", "case", "catch",
+			"char", "class", "const", "continue", "default", "do", "double",
+			"else", "enum", "extends", "final", "finally", "float", "for",
+			"goto", "if", "implements", "import", "instanceof", "int",
+			"interface", "long", "native", "new", "package", "private",
+			"protected", "public", "return", "short", "static", "strictfp",
+			"super", "switch", "synchronized", "this", "throw", "throws",
+			"transient", "try", "void", "volatile", "while", "true", "false",
+			"null", "var", "record", "sealed", "permits", "yield",
+		),
+		Types: asSet(
+			"String", "Integer", "Boolean", "Long", "Double", "Float", "Object",
+			"List", "Map", "Set", "Optional",
+		),
+		LineComment:  "//",
+		BlockComment: [2]string{"/*", "*/"},
+		StringDelims: []string{`"`, `'`, "`"},
+	}
+}
+
+func sqlSpec() *LangSpec {
+	return &LangSpec{
+		Name:    "sql",
+		Aliases: []string{"postgres", "mysql", "sqlite", "plsql"},
+		Keywords: asSet(
+			"SELECT", "FROM", "WHERE", "INSERT", "INTO", "VALUES", "UPDATE",
+			"SET", "DELETE", "CREATE", "TABLE", "DROP", "ALTER", "INDEX",
+			"JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "ON", "AS", "AND", "OR",
+			"NOT", "NULL", "TRUE", "FALSE", "ORDER", "BY", "GROUP", "HAVING",
+			"LIMIT", "OFFSET", "UNION", "ALL", "DISTINCT", "CASE", "WHEN",
+			"THEN", "ELSE", "END", "IN", "EXISTS", "BETWEEN", "LIKE", "IS",
+			"PRIMARY", "KEY", "FOREIGN", "REFERENCES", "CONSTRAINT", "DEFAULT",
+			"select", "from", "where", "insert", "into", "values", "update",
+			"set", "delete", "create", "table", "drop", "alter", "join", "and",
+			"or", "not", "null", "order", "by", "group", "having", "limit",
+		),
+		HashComment:              true,
+		LineComment:              "--",
+		BlockComment:             [2]string{"/*", "*/"},
+		StringDelims:             []string{`'`, `"`},
+		DisableFunctionHighlight: true,
+	}
+}
+
+func htmlSpec() *LangSpec {
+	return &LangSpec{
+		Name:                     "html",
+		Aliases:                  []string{"htm", "xml", "svg"},
+		Keywords:                 asSet("DOCTYPE", "html", "head", "body", "div", "span", "script", "style"),
+		BlockComment:             [2]string{"<!--", "-->"},
+		StringDelims:             []string{`"`, `'`},
+		DisableFunctionHighlight: true,
+	}
+}
+
+func cssSpec() *LangSpec {
+	return &LangSpec{
+		Name:                     "css",
+		Aliases:                  []string{"scss", "less"},
+		Keywords:                 asSet("important", "from", "to"),
+		BlockComment:             [2]string{"/*", "*/"},
+		StringDelims:             []string{`"`, `'`},
+		DisableFunctionHighlight: true,
+	}
+}
+
+func rubySpec() *LangSpec {
+	return &LangSpec{
+		Name:    "ruby",
+		Aliases: []string{"rb", "rake"},
+		Keywords: asSet(
+			"BEGIN", "END", "alias", "and", "begin", "break", "case", "class",
+			"def", "defined?", "do", "else", "elsif", "end", "ensure", "false",
+			"for", "if", "in", "module", "next", "nil", "not", "or", "redo",
+			"rescue", "retry", "return", "self", "super", "then", "true",
+			"undef", "unless", "until", "when", "while", "yield",
+		),
+		HashComment:  true,
+		StringDelims: []string{`"`, `'`},
 	}
 }
 

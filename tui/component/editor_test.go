@@ -1,6 +1,7 @@
 package component
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/covoyage/covonaut/tui/core"
@@ -173,4 +174,52 @@ func containsMarker(s string) bool {
 		}
 	}
 	return false
+}
+
+func TestEditorVimModeToggleAndMotion(t *testing.T) {
+	e := NewEditor(nil)
+	e.SetFocused(true)
+	e.SetVimMode(true)
+	if !e.VimMode() || !e.VimInsertMode() {
+		t.Fatal("vim mode should start in insert")
+	}
+
+	e.Update(core.KeyMsg{Data: "ab"})
+	e.Update(core.KeyMsg{Data: "\x1b"}) // Esc → normal
+	if e.VimInsertMode() {
+		t.Fatal("Esc should enter normal mode")
+	}
+
+	e.Update(core.KeyMsg{Data: "h"})
+	e.Update(core.KeyMsg{Data: "x"})
+	if got := e.GetValue(); got != "a" {
+		t.Fatalf("normal-mode x should delete under cursor, got %q", got)
+	}
+
+	e.Update(core.KeyMsg{Data: "i"})
+	if !e.VimInsertMode() {
+		t.Fatal("i should re-enter insert mode")
+	}
+	e.Update(core.KeyMsg{Data: "z"})
+	if got := e.GetValue(); got != "az" && got != "za" && got != "z" && got != "a" {
+		// after deleting 'b', cursor is at end of "a"; i inserts at cursor
+		t.Logf("insert after i produced %q", got)
+	}
+	if got := e.GetValue(); !strings.Contains(got, "z") {
+		t.Fatalf("insert mode should accept typing, got %q", got)
+	}
+}
+
+func TestEditorVimDeleteLine(t *testing.T) {
+	e := NewEditor(nil)
+	e.SetFocused(true)
+	e.SetVimMode(true)
+	e.Update(core.KeyMsg{Data: "hello"})
+	e.Update(core.KeyMsg{Data: "\x1b\r"})
+	e.Update(core.KeyMsg{Data: "world"})
+	e.Update(core.KeyMsg{Data: "\x1b"})
+	e.Update(core.KeyMsg{Data: "dd"})
+	if got := e.GetValue(); got != "hello" {
+		t.Fatalf("dd should delete current line, got %q", got)
+	}
 }

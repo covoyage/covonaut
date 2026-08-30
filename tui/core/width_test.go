@@ -14,6 +14,16 @@ func TestVisibleWidth(t *testing.T) {
 		{"\x1b[31mhello\x1b[0m", 5},
 		{"emoji: 🌍", 9}, // 7 ASCII + space=1 is already counted, emoji=2
 		{"\x1b]8;;http://a\x07link\x1b]8;;\x07", 4},
+		{"☁", 1},       // BMP weather cloud, text presentation
+		{"☁️", 2},      // U+2601 + VS16 — terminals paint 2 cells
+		{"☁\uFE0E", 1}, // VS15 keeps text presentation
+		{"☁️ 小雨", 7},   // 2 + space + 小(2) + 雨(2)
+		{"☁️ 阴", 5},    // 2 + space + 阴(2)
+		{"✅", 2},       // U+2705 WHITE HEAVY CHECK MARK (emoji presentation)
+		{"❌", 2},       // U+274C CROSS MARK
+		{"✨", 2},       // U+2728 SPARKLES
+		{"⭐", 2},       // U+2B50 WHITE MEDIUM STAR
+		{"✅ 核心体验", 11}, // 2 + space + 5 CJK/ASCII cells
 	}
 	for _, c := range cases {
 		got := VisibleWidth(c.in)
@@ -32,6 +42,9 @@ func TestTruncateToWidth(t *testing.T) {
 	}
 	if got := TruncateToWidth("short", 100, "…"); got != "short" {
 		t.Errorf("expected unchanged, got %q", got)
+	}
+	if got := TruncateToWidth("☁️ 小雨", 2, ""); got != "☁️" {
+		t.Errorf("emoji cluster truncate = %q, want %q", got, "☁️")
 	}
 }
 

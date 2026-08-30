@@ -94,6 +94,7 @@ func (s Style) Bold() Style      { s.attrs = append(s.attrs, Bold); return s }
 func (s Style) Dim() Style       { s.attrs = append(s.attrs, Dim); return s }
 func (s Style) Italic() Style    { s.attrs = append(s.attrs, Italic); return s }
 func (s Style) Underline() Style { s.attrs = append(s.attrs, Underline); return s }
+func (s Style) Reverse() Style   { s.attrs = append(s.attrs, Reverse); return s }
 func (s Style) Strike() Style    { s.attrs = append(s.attrs, Strike); return s }
 
 func (s Style) Render(text string) string {

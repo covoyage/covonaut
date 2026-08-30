@@ -200,6 +200,29 @@ func TestParseLineWideCharMixed(t *testing.T) {
 	}
 }
 
+func TestParseLineEmojiPresentation(t *testing.T) {
+	const cloud = "☁️" // U+2601 + U+FE0F
+	row := ParseLine(cloud)
+	if row.VisibleWidth() != 2 {
+		t.Fatalf("width = %d, want 2", row.VisibleWidth())
+	}
+	if len(row.Cells) != 2 {
+		t.Fatalf("cell count = %d, want 2 (primary + continuation)", len(row.Cells))
+	}
+	if row.Cells[0].Rune != 0x2601 || row.Cells[0].Width != 2 {
+		t.Fatalf("primary = %+v, want U+2601 width 2", row.Cells[0])
+	}
+	if len(row.Cells[0].Combining) != 1 || row.Cells[0].Combining[0] != 0xFE0F {
+		t.Fatalf("combining = %v, want [U+FE0F]", row.Cells[0].Combining)
+	}
+	if !row.Cells[1].IsContinuation() {
+		t.Fatalf("second cell = %+v, want continuation", row.Cells[1])
+	}
+	if got := SerializeRow(row); got != cloud {
+		t.Fatalf("serialize = %q, want %q", got, cloud)
+	}
+}
+
 func TestParseLineCombiningMark(t *testing.T) {
 	// "e" + combining acute (U+0301) → one cell, combining attached.
 	row := ParseLine("e\u0301")
