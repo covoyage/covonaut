@@ -370,15 +370,16 @@ func (s *Syntax) Invalidate() {
 func (s *Syntax) Update(msg core.Msg) core.Cmd { return nil }
 
 // Highlight tokenises `source` under `language` and returns one styled
-// string per source line. A nil / unknown language, or theme.DisableSyntax,
+// string per source line. theme.DisableSyntax returns the source lines
+// unstyled (no token colors and no TextFn wrap). A nil / unknown language
 // falls through to plain TextFn styling.
 func Highlight(source, language string, theme SyntaxTheme) []string {
 	theme = mergeSyntaxTheme(theme)
-	spec := LookupLanguage(language)
-	if theme.DisableSyntax {
-		spec = nil
-	}
 	rawLines := strings.Split(source, "\n")
+	if theme.DisableSyntax {
+		return rawLines
+	}
+	spec := LookupLanguage(language)
 	if spec == nil {
 		out := make([]string, len(rawLines))
 		for i, ln := range rawLines {
