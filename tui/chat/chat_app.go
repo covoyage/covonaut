@@ -690,9 +690,10 @@ func (a *ChatApp) onToolEnd(e ChatEvent) {
 			if filePath != "" {
 				switch {
 				case (tc.ToolName == "write_file" || tc.ToolName == "write") && fileContent != "":
-					// Write tool: show content preview.
+					// Write tool: show content preview, fenced with the
+					// file's language when known so it gets highlighted.
 					parts = append(parts, fmt.Sprintf("⌨  Wrote %d lines to %s", added, filePath))
-					parts = append(parts, formatContentPreview(fileContent, added))
+					parts = append(parts, fencedContentPreview(filePath, fileContent))
 				default:
 					summary := fmt.Sprintf("✏️ %s", filePath)
 					if added > 0 || removed > 0 {
@@ -785,22 +786,40 @@ func extractToolDiff(toolName, resultJSON string) (path, diff string, added, rem
 	return path, diff, added, removed, content
 }
 
-func formatContentPreview(content string, totalLines int64) string {
+// fencedContentPreview renders the first lines of written content. When the
+// file's language is known it emits a language-fenced block so the markdown
+// renderer highlights it; otherwise it falls back to the plain preview.
+func fencedContentPreview(filePath, content string) string {
 	const previewLines = 6
 	lines := strings.Split(content, "\n")
-	var b strings.Builder
-	for i, line := range lines {
-		if i >= previewLines {
-			break
-		}
-		b.WriteString("  ")
-		b.WriteString(line)
-		if i < len(lines)-1 {
-			b.WriteString("\n")
-		}
-	}
+	body := lines
+	trailer := ""
 	if int64(len(lines)) > previewLines {
-		b.WriteString(fmt.Sprintf("\n  ... +%d lines", int64(len(lines))-previewLines))
+		body = lines[:previewLines]
+		trailer = fmt.Sprintf("... +%d lines", int64(len(lines))-previewLines)
+	}
+	lang := component.LanguageForFilename(filePath)
+	if lang == "" {
+		// Plain preview with the legacy two-space indent.
+		var b strings.Builder
+		for i, line := range body {
+			b.WriteString("  ")
+			b.WriteString(line)
+			if i < len(body)-1 || trailer != "" {
+				b.WriteString("\n")
+			}
+		}
+		if trailer != "" {
+			b.WriteString("  " + trailer)
+		}
+		return b.String()
+	}
+	var b strings.Builder
+	b.WriteString("```" + lang + "\n")
+	b.WriteString(strings.Join(body, "\n"))
+	b.WriteString("\n```")
+	if trailer != "" {
+		b.WriteString("\n  " + trailer)
 	}
 	return b.String()
 }
@@ -1045,7 +1064,11 @@ func (l *chatLayout) Render(width int64) []string {
 			remaining = rows - reserved
 		}
 		if remaining < 1 {
-			remaining = 1
+			// Prefer keeping the footer/status chrome over forcing a
+			// history row that would make the frame taller than the
+			// terminal (that extra line scrolls the screen and leaves a
+			// duplicate status line with leftover chat text glued to it).
+			remaining = 0
 		}
 	}
 
@@ -1056,7 +1079,7 @@ func (l *chatLayout) Render(width int64) []string {
 	l.editorTop = remaining + int64(len(acLines)) + int64(len(loaderLines))
 
 	var historyLines []string
-	if l.history != nil {
+	if remaining > 0 && l.history != nil {
 		l.history.SetMaxRowsDirect(remaining)
 		historyLines = l.history.Render(width)
 	}
@@ -1071,6 +1094,11 @@ func (l *chatLayout) Render(width int64) []string {
 	out = append(out, editorLines...)
 	out = append(out, footerLines...)
 	out = append(out, statusLines...)
+	if int64(len(out)) > rows {
+		// Last-resort: drop history from the top so the footer/status bar
+		// stay on screen. The engine also clips, but it clips the tail.
+		out = out[int64(len(out))-rows:]
+	}
 	return out
 }
 

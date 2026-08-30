@@ -541,40 +541,75 @@ func (h *ChatHistory) Render(width int64) []string {
 	follow := h.follow
 	h.mu.Unlock()
 
-	if maxRows <= 0 || int64(len(all)) <= maxRows {
-		return all
-	}
-	end := int64(len(all)) - offset
-	if end > int64(len(all)) {
-		end = int64(len(all))
-	}
-	start := end - maxRows
-	if start < 0 {
-		start = 0
-		end = maxRows
-	}
-	visible := all[start:end]
-
-	// Add scroll indicator when not auto-following
-	if !follow && end < int64(len(all)) {
-		indicator := h.theme.DimStyle.Render(fmt.Sprintf("^ %d more lines — End to follow", int64(len(all))-end))
-		// Drop last visible line to keep within maxRows, prevent pushing
-		// status bar off-screen.
-		if int64(len(visible)) >= maxRows && len(visible) > 0 {
-			visible = visible[:len(visible)-1]
+	visible := all
+	if maxRows > 0 && int64(len(all)) > maxRows {
+		end := int64(len(all)) - offset
+		if end > int64(len(all)) {
+			end = int64(len(all))
 		}
-		visible = append([]string{indicator}, visible...)
+		start := end - maxRows
+		if start < 0 {
+			start = 0
+			end = maxRows
+		}
+		visible = all[start:end]
+
+		// Add scroll indicator when not auto-following
+		if !follow && end < int64(len(all)) {
+			indicator := h.theme.DimStyle.Render(fmt.Sprintf("^ %d more lines — End to follow", int64(len(all))-end))
+			// Drop last visible line to keep within maxRows, prevent pushing
+			// status bar off-screen.
+			if int64(len(visible)) >= maxRows && len(visible) > 0 {
+				visible = visible[:len(visible)-1]
+			}
+			visible = append([]string{indicator}, visible...)
+		}
 	}
 
 	// Pad every line to full width so the TUI diff engine's \x1b[2K
 	// never leaves a partial column that could bleed into the next line.
-	for i, ln := range visible {
-		if core.VisibleWidth(ln) < width {
-			visible[i] = core.PadToWidth(ln, width)
+	// Also clamp over-wide lines (streaming cursor, wide CJK) so a wrap
+	// cannot push the footer/status bar down. This runs on every path,
+	// including short transcripts that previously skipped the clamp.
+	return fitHistoryLines(visible, width)
+}
+
+func fitHistoryLines(lines []string, width int64) []string {
+	if width < 1 {
+		return lines
+	}
+	out := make([]string, len(lines))
+	copy(out, lines)
+	for i, ln := range out {
+		vw := core.VisibleWidth(ln)
+		if vw > width {
+			out[i] = core.TruncateToWidth(ln, width, "")
+		} else if vw < width {
+			out[i] = core.PadToWidth(ln, width)
 		}
 	}
+	return out
+}
 
-	return visible
+// appendStreamingCursor tacks a pending-stream cursor onto a rendered line
+// without letting the result exceed `width`. A full-width line plus cursor
+// would wrap on the terminal and scroll the footer/status chrome.
+func appendStreamingCursor(line, cursor string, width int64) string {
+	if width <= 0 {
+		return line + cursor
+	}
+	cw := core.VisibleWidth(cursor)
+	if cw <= 0 {
+		return line
+	}
+	if core.VisibleWidth(line)+cw > width {
+		remain := width - cw
+		if remain < 0 {
+			remain = 0
+		}
+		line = core.TruncateToWidth(line, remain, "")
+	}
+	return line + cursor
 }
 
 // Invalidate drops the render cache.
@@ -1370,8 +1405,7 @@ func (h *ChatHistory) renderMessage(m ChatMessage, theme ChatHistoryTheme, width
 				if len(lines) == 0 {
 					lines = []string{theme.DimStyle.Render("…")}
 				} else {
-					last := lines[len(lines)-1]
-					lines[len(lines)-1] = last + theme.UserStyle.Render("▊")
+					lines[len(lines)-1] = appendStreamingCursor(lines[len(lines)-1], theme.UserStyle.Render("▊"), width)
 				}
 			}
 			allLines = append(allLines, lines...)
@@ -1380,8 +1414,7 @@ func (h *ChatHistory) renderMessage(m ChatMessage, theme ChatHistoryTheme, width
 			if len(allLines) == 0 {
 				allLines = []string{theme.DimStyle.Render("…")}
 			} else {
-				last := allLines[len(allLines)-1]
-				allLines[len(allLines)-1] = last + theme.ThinkingStyle.Render("▊")
+				allLines[len(allLines)-1] = appendStreamingCursor(allLines[len(allLines)-1], theme.ThinkingStyle.Render("▊"), width)
 			}
 		}
 

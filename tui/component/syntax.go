@@ -1,6 +1,7 @@
 package component
 
 import (
+	"path/filepath"
 	"strings"
 	"sync"
 	"unicode"
@@ -88,6 +89,11 @@ type SyntaxTheme struct {
 	FunctionFn    func(string) string
 	OperatorFn    func(string) string
 	PunctuationFn func(string) string
+	// DisableSyntax skips token-level highlighting and renders with TextFn
+	// only. It is a caller-provided preference — the library default keeps
+	// highlighting on. Callers must pass this explicitly; the library never
+	// reads process environment variables.
+	DisableSyntax bool
 }
 
 // DefaultSyntaxTheme returns the built-in palette used when no theme is set.
@@ -208,6 +214,60 @@ func LookupLanguage(name string) *LangSpec {
 	return nil
 }
 
+// extLanguageAliases maps file extensions to language identifiers that differ
+// from the extension itself. Extensions matching a registered language name
+// directly (".go" → "go") need no entry.
+var extLanguageAliases = map[string]string{
+	".py":     "python",
+	".js":     "javascript",
+	".jsx":    "javascript",
+	".ts":     "typescript",
+	".tsx":    "typescript",
+	".sh":     "bash",
+	".bash":   "bash",
+	".zsh":    "bash",
+	".yml":    "yaml",
+	".rb":     "ruby",
+	".golang": "go",
+}
+
+// LanguageForFilename infers the language identifier for a filename via its
+// extension ("" when unknown or unregistered). Usable by callers that need
+// to emit a syntax-highlighted code fence.
+func LanguageForFilename(filename string) string {
+	ext := strings.ToLower(filepath.Ext(filename))
+	if lang, ok := extLanguageAliases[ext]; ok {
+		return lang
+	}
+	if lang := strings.TrimPrefix(ext, "."); lang != "" && LookupLanguage(lang) != nil {
+		return lang
+	}
+	return ""
+}
+
+// diffFileLanguage infers the source language of diff content lines from the
+// file named in the +++/--- headers, so a ```diff block can token-highlight
+// its +/- lines. Returns "" when no known language matches.
+func diffFileLanguage(lines []string) string {
+	for _, cl := range lines {
+		var name string
+		if strings.HasPrefix(cl, "+++ ") {
+			name = strings.TrimSpace(cl[4:])
+		} else if strings.HasPrefix(cl, "--- ") {
+			name = strings.TrimSpace(cl[4:])
+		} else {
+			continue
+		}
+		name = strings.TrimPrefix(name, "b/")
+		name = strings.TrimPrefix(name, "a/")
+		if name == "" || name == "/dev/null" {
+			return ""
+		}
+		return LanguageForFilename(name)
+	}
+	return ""
+}
+
 // ---------------------------------------------------------------------------
 // Syntax component
 // ---------------------------------------------------------------------------
@@ -258,6 +318,15 @@ func (s *Syntax) SetTheme(t SyntaxTheme) {
 	s.mu.Unlock()
 }
 
+// SetSyntaxHighlighting enables or disables token-level highlighting.
+// Enabled by default (matching DisableSyntax=false on SyntaxTheme).
+func (s *Syntax) SetSyntaxHighlighting(enabled bool) {
+	s.mu.Lock()
+	s.theme.DisableSyntax = !enabled
+	s.dirty = true
+	s.mu.Unlock()
+}
+
 // Render produces highlighted lines wrapped to width.
 func (s *Syntax) Render(width int64) []string {
 	s.mu.Lock()
@@ -289,11 +358,14 @@ func (s *Syntax) Invalidate() {
 func (s *Syntax) Update(msg core.Msg) core.Cmd { return nil }
 
 // Highlight tokenises `source` under `language` and returns one styled
-// string per source line. A nil / unknown language falls through to plain
-// text.
+// string per source line. A nil / unknown language, or theme.DisableSyntax,
+// falls through to plain TextFn styling.
 func Highlight(source, language string, theme SyntaxTheme) []string {
 	theme = mergeSyntaxTheme(theme)
 	spec := LookupLanguage(language)
+	if theme.DisableSyntax {
+		spec = nil
+	}
 	rawLines := strings.Split(source, "\n")
 	if spec == nil {
 		out := make([]string, len(rawLines))

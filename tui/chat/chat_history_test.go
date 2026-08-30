@@ -58,6 +58,54 @@ func TestChatHistoryViewportClipping(t *testing.T) {
 	}
 }
 
+func TestChatHistoryPendingCursorDoesNotExceedWidth(t *testing.T) {
+	h := NewChatHistory()
+	h.Append(ChatMessage{
+		Role:    RoleAssistant,
+		Text:    strings.Repeat("x", 80),
+		Pending: true,
+	})
+	const width int64 = 40
+	lines := h.Render(width)
+	if len(lines) == 0 {
+		t.Fatal("expected rendered lines")
+	}
+	foundCursor := false
+	for _, ln := range lines {
+		if w := core.VisibleWidth(ln); w > width {
+			t.Fatalf("pending line wider than viewport: width=%d line=%q", w, ln)
+		}
+		if strings.Contains(ln, "▊") {
+			foundCursor = true
+		}
+	}
+	if !foundCursor {
+		t.Fatalf("pending cursor missing from render: %q", strings.Join(lines, "\n"))
+	}
+}
+
+func TestAppendStreamingCursorFitsWidth(t *testing.T) {
+	line := strings.Repeat("a", 40)
+	got := appendStreamingCursor(line, "▊", 40)
+	if core.VisibleWidth(got) > 40 {
+		t.Fatalf("cursor overflow: width=%d got=%q", core.VisibleWidth(got), got)
+	}
+	if !strings.Contains(got, "▊") {
+		t.Fatalf("cursor missing: %q", got)
+	}
+}
+
+func TestChatHistoryShortTranscriptFitsWidth(t *testing.T) {
+	h := NewChatHistory()
+	h.Append(ChatMessage{Role: RoleUser, Text: "hi"})
+	const width int64 = 24
+	for _, ln := range h.Render(width) {
+		if w := core.VisibleWidth(ln); w > width {
+			t.Fatalf("short transcript line wider than viewport: width=%d line=%q", w, ln)
+		}
+	}
+}
+
 func TestChatHistoryScroll(t *testing.T) {
 	h := NewChatHistory()
 	for i := 0; i < 30; i++ {

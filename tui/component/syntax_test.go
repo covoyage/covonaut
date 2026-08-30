@@ -150,6 +150,71 @@ func TestSyntaxUnknownLanguageFallsThrough(t *testing.T) {
 	}
 }
 
+func TestSyntaxHighlightDisabled(t *testing.T) {
+	theme.ForceColor(true)
+	t.Cleanup(func() { theme.ForceColor(false) })
+	src := "if x { }"
+	on := Highlight(src, "go", DefaultSyntaxTheme())
+	if len(on) == 0 || !strings.Contains(on[0], "\x1b[") {
+		t.Fatalf("enabled highlighting should emit ANSI, got %q", on)
+	}
+	offTheme := DefaultSyntaxTheme()
+	offTheme.DisableSyntax = true
+	off := Highlight(src, "go", offTheme)
+	if len(off) == 0 {
+		t.Fatal("disabled highlighting produced no output")
+	}
+	if strings.Contains(off[0], "\x1b[38;5;") {
+		t.Fatalf("DisableSyntax should skip token colors, got %q", off[0])
+	}
+	if stripAnsiSyntax(off[0]) != src {
+		t.Fatalf("disabled highlighting changed content: %q", off[0])
+	}
+	if strings.Count(off[0], "\x1b[") >= strings.Count(on[0], "\x1b[") {
+		t.Fatalf("disabled highlighting should emit fewer ANSI runs than enabled:\non  %q\noff %q", on[0], off[0])
+	}
+}
+
+func TestSyntaxComponentSetSyntaxHighlighting(t *testing.T) {
+	theme.ForceColor(true)
+	t.Cleanup(func() { theme.ForceColor(false) })
+	s := NewSyntax("func main() {}", "go")
+	on := strings.Join(s.Render(40), "\n")
+	if !strings.Contains(on, "\x1b[") {
+		t.Fatalf("default Syntax component should highlight, got %q", on)
+	}
+	s.SetSyntaxHighlighting(false)
+	off := strings.Join(s.Render(40), "\n")
+	if strings.Contains(off, "\x1b[38;5;") {
+		t.Fatalf("SetSyntaxHighlighting(false) should skip token colors, got %q", off)
+	}
+	if !strings.Contains(stripAnsiSyntax(off), "func main() {}") {
+		t.Fatalf("disabled render lost source: %q", off)
+	}
+	if strings.Count(off, "\x1b[") >= strings.Count(on, "\x1b[") {
+		t.Fatalf("disabled render should emit fewer ANSI runs than enabled:\non  %q\noff %q", on, off)
+	}
+}
+
+func stripAnsiSyntax(s string) string {
+	var b strings.Builder
+	inEscape := false
+	for _, r := range s {
+		if inEscape {
+			if r == 'm' {
+				inEscape = false
+			}
+			continue
+		}
+		if r == '\x1b' {
+			inEscape = true
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 func TestSyntaxComponentCachesAcrossRenders(t *testing.T) {
 	s := NewSyntax("x := 1", "go")
 	first := s.Render(40)

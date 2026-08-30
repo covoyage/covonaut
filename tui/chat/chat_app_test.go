@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/covoyage/covonaut/tui/component"
 	"github.com/covoyage/covonaut/tui/core"
 	"github.com/covoyage/covonaut/tui/terminal"
 	"github.com/covoyage/covonaut/tui/theme"
@@ -52,6 +53,37 @@ func (h *testAppHost) RemoveOverlay(ov OverlayRef) bool {
 func (h *testAppHost) TerminalSize() (cols, rows int64) { return h.vt.Size() }
 func (h *testAppHost) EnableMouse(mode string)          {}
 func (h *testAppHost) DisableMouse()                    {}
+
+type stubComp struct{ lines []string }
+
+func (s stubComp) Render(width int64) []string { return s.lines }
+func (s stubComp) Invalidate()                 {}
+
+func TestChatLayoutNeverTallerThanTerminal(t *testing.T) {
+	vt := terminal.NewVirtualTerminal(40, 5)
+	status := component.NewStatusBar()
+	status.SetMode("status-line")
+	l := &chatLayout{
+		host:      &testAppHost{vt: vt},
+		history:   NewChatHistory(),
+		editor:    stubComp{lines: []string{"input"}},
+		footer:    stubComp{lines: []string{"footer-line"}},
+		statusBar: status,
+	}
+	l.history.Append(ChatMessage{Role: RoleAssistant, Text: "hello from history"})
+
+	out := l.Render(40)
+	if int64(len(out)) > 5 {
+		t.Fatalf("layout taller than terminal: got %d rows\n%s", len(out), strings.Join(out, "\n"))
+	}
+	joined := strings.Join(out, "\n")
+	if !strings.Contains(joined, "footer-line") {
+		t.Fatalf("footer dropped when terminal is short:\n%s", joined)
+	}
+	if !strings.Contains(joined, "status-line") {
+		t.Fatalf("status bar dropped when terminal is short:\n%s", joined)
+	}
+}
 
 func TestChatAppMessageDeltaStream(t *testing.T) {
 	app, _ := newTestChatApp(t, ChatAppConfig{})
@@ -451,5 +483,39 @@ func TestIsCopyShortcut(t *testing.T) {
 				t.Fatalf("isCopyShortcut(%+v)=%v want=%v", tc.key, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestFencedContentPreview(t *testing.T) {
+	// Known language → language-fenced block.
+	out := fencedContentPreview("/tmp/weather.py", "import os\nprint(os)\n")
+	if !strings.Contains(out, "```python") {
+		t.Errorf("expected python fence, got %q", out)
+	}
+	if !strings.Contains(out, "import os") {
+		t.Errorf("content missing: %q", out)
+	}
+
+	// Unknown language → plain fallback with indent, no fence.
+	out = fencedContentPreview("/tmp/notes.unknown", "hello\n")
+	if strings.Contains(out, "```") {
+		t.Errorf("unknown language should not fence, got %q", out)
+	}
+	if !strings.Contains(out, "  hello") {
+		t.Errorf("expected indented plain preview, got %q", out)
+	}
+
+	// Truncation trailer outside the fence.
+	content := strings.Repeat("line\n", 10)
+	out = fencedContentPreview("/tmp/big.go", content)
+	if !strings.Contains(out, "```go") {
+		t.Errorf("expected go fence, got %q", out)
+	}
+	if !strings.Contains(out, "+5 lines") {
+		t.Errorf("expected truncation trailer, got %q", out)
+	}
+	fenceCount := strings.Count(out, "```")
+	if fenceCount != 2 {
+		t.Errorf("expected exactly 2 fence markers, got %d: %q", fenceCount, out)
 	}
 }

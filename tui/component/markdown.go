@@ -35,42 +35,50 @@ import (
 
 // MarkdownTheme overrides the ANSI styling of rendered elements.
 type MarkdownTheme struct {
-	HeadingFn     [6]func(string) string // h1..h6
-	EmphasisFn    func(string) string    // italic
-	StrongFn      func(string) string    // bold
-	StrikeFn      func(string) string
-	CodeInlineFn  func(string) string
-	CodeBlockFn   func(string) string
-	CodeFenceFn   func(string) string // language label line
-	QuoteFn       func(string) string
-	LinkLabelFn   func(string) string
-	LinkURLFn     func(string) string
+	HeadingFn    [6]func(string) string // h1..h6
+	EmphasisFn   func(string) string    // italic
+	StrongFn     func(string) string    // bold
+	StrikeFn     func(string) string
+	CodeInlineFn func(string) string
+	CodeBlockFn  func(string) string
+	CodeFenceFn  func(string) string // language label line
+	QuoteFn      func(string) string
+	LinkLabelFn  func(string) string
+	LinkURLFn    func(string) string
 	// LinkRendererFn, when set, replaces the default label+URL rendering.
 	// It receives the raw label and URL and returns the fully rendered link string.
 	LinkRendererFn func(label, url string) string
 	HRFn           func(string) string
-	ListBulletFn  func(string) string
-	TableBorderFn func(string) string
-	TableHeaderFn func(string) string
+	ListBulletFn   func(string) string
+	TableBorderFn  func(string) string
+	TableHeaderFn  func(string) string
 	// Syntax, when set, is used to style fenced code blocks with a
 	// language tag. A nil value falls back to CodeBlockFn.
 	Syntax *SyntaxTheme
+	// DisableSyntax turns off token-level syntax highlighting for fenced
+	// code blocks (including diff fences), rendering them with the plain
+	// code style. It is a caller-provided preference — the library default
+	// keeps highlighting on.
+	DisableSyntax bool
 }
 
 // syntaxThemeFromMarkdown bridges a MarkdownTheme into a SyntaxTheme so
 // fenced code blocks can be highlighted by the Syntax tokenizer. Falls back
 // to a palette derived from CodeBlockFn when Syntax is nil.
 func syntaxThemeFromMarkdown(t MarkdownTheme) SyntaxTheme {
+	var st SyntaxTheme
 	if t.Syntax != nil {
-		return *t.Syntax
+		st = *t.Syntax
+	} else {
+		st = DefaultSyntaxTheme()
+		if t.CodeBlockFn != nil {
+			st.TextFn = t.CodeBlockFn
+			st.PunctuationFn = t.CodeBlockFn
+			st.OperatorFn = t.CodeBlockFn
+		}
 	}
-	dflt := DefaultSyntaxTheme()
-	if t.CodeBlockFn != nil {
-		dflt.TextFn = t.CodeBlockFn
-		dflt.PunctuationFn = t.CodeBlockFn
-		dflt.OperatorFn = t.CodeBlockFn
-	}
-	return dflt
+	st.DisableSyntax = t.DisableSyntax
+	return st
 }
 
 // Markdown is a Component that renders a markdown string.
@@ -185,6 +193,25 @@ func renderMarkdown(src string, width int64, theme MarkdownTheme) []string {
 			var rendered []string
 			if lang == "diff" {
 				rendered = make([]string, len(codeLines))
+				// Token-level highlighting of content lines: the file
+				// language is inferred from the +++/--- header extension.
+				// Disabled (or unknown languages) keep the plain full-line
+				// diff coloring.
+				hlContent := func(line string) string { return theme.CodeBlockFn(line) }
+				if !theme.DisableSyntax {
+					if fileLang := diffFileLanguage(codeLines); fileLang != "" {
+						if LookupLanguage(fileLang) != nil {
+							st := syntaxThemeFromMarkdown(theme)
+							hlContent = func(line string) string {
+								out := Highlight(line, fileLang, st)
+								if len(out) == 0 {
+									return theme.CodeBlockFn(line)
+								}
+								return out[0]
+							}
+						}
+					}
+				}
 				var oldLine, newLine int
 				for k, cl := range codeLines {
 					switch {
@@ -202,18 +229,18 @@ func renderMarkdown(src string, width int64, theme MarkdownTheme) []string {
 					case strings.HasPrefix(cl, "+++ ") || strings.HasPrefix(cl, "--- "):
 						rendered[k] = theme.CodeBlockFn(cl)
 					case strings.HasPrefix(cl, "+") && !strings.HasPrefix(cl, "++"):
-						rendered[k] = apitheme.CurrentPalette().Success.Render(fmt.Sprintf("%4d %s", newLine, theme.CodeBlockFn(cl)))
+						rendered[k] = apitheme.CurrentPalette().Success.Render(fmt.Sprintf("%4d +", newLine)) + hlContent(strings.TrimPrefix(cl, "+"))
 						newLine++
 					case strings.HasPrefix(cl, "-") && !strings.HasPrefix(cl, "--"):
-						rendered[k] = apitheme.CurrentPalette().Error.Render(fmt.Sprintf("%4d %s", oldLine, theme.CodeBlockFn(cl)))
+						rendered[k] = apitheme.CurrentPalette().Error.Render(fmt.Sprintf("%4d -", oldLine)) + hlContent(strings.TrimPrefix(cl, "-"))
 						oldLine++
 					default:
-						rendered[k] = fmt.Sprintf("     %s", theme.CodeBlockFn(cl))
+						rendered[k] = fmt.Sprintf("      %s", hlContent(strings.TrimPrefix(cl, " ")))
 						oldLine++
 						newLine++
 					}
 				}
-			} else if spec := LookupLanguage(lang); spec != nil {
+			} else if spec := LookupLanguage(lang); spec != nil && !theme.DisableSyntax {
 				rendered = Highlight(strings.Join(codeLines, "\n"), lang, syntaxThemeFromMarkdown(theme))
 			} else {
 				rendered = make([]string, len(codeLines))
@@ -566,5 +593,6 @@ func mergeMarkdownTheme(t MarkdownTheme) MarkdownTheme {
 			d.HeadingFn[i] = fn
 		}
 	}
+	d.DisableSyntax = t.DisableSyntax
 	return d
 }

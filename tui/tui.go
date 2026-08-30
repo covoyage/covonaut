@@ -806,6 +806,7 @@ func (t *TUI) renderFrame() {
 		// shrink components to fit, this is the last line of defense.
 		rows = rows[:termRows]
 	}
+	preventLastRowWrap(rows, cols, termRows)
 
 	// Locate the IME cursor marker across all rows. ParseLine already strips
 	// CURSOR_MARKER and records its column on the Row; here we just find the
@@ -880,6 +881,11 @@ func (t *TUI) renderFrame() {
 	if cursorRow >= 0 {
 		fmt.Fprintf(&buf, "\x1b[%d;%dH", cursorRow+1, cursorCol+1)
 		buf.WriteString("\x1b[?25h")
+	} else if termRows > 0 {
+		// Park on the last row, column 1 before wrap is re-enabled so a
+		// pending DEC xenl from the last cell cannot scroll the screen.
+		fmt.Fprintf(&buf, "\x1b[%d;1H", termRows)
+		buf.WriteString("\x1b[?25l")
 	} else {
 		buf.WriteString("\x1b[?25l")
 	}
@@ -1064,4 +1070,26 @@ func normalizeLine(line string, cols int64) string {
 		return line
 	}
 	return core.TruncateToWidth(line, cols, "…")
+}
+
+// preventLastRowWrap leaves the last cell of the last terminal row empty.
+//
+// Writing into that cell advances the cursor onto a phantom next line
+// (DEC xenl / wrap-pending). The next printable character then scrolls
+// the whole screen, leaving a duplicate footer and leftover chat text
+// glued to the old status line.
+func preventLastRowWrap(rows []core.Row, cols, termRows int64) {
+	if termRows <= 0 || int64(len(rows)) < termRows || cols <= 1 {
+		return
+	}
+	last := &rows[len(rows)-1]
+	limit := cols - 1
+	if last.VisibleWidth() <= limit {
+		return
+	}
+	if last.IsRaw() {
+		last.Raw = core.TruncateToWidth(last.Raw, limit, "")
+		return
+	}
+	*last = core.TruncateRow(*last, limit)
 }

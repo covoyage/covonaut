@@ -19,16 +19,47 @@ func (l *lineComp) Render(width int64) []string {
 	}
 	return out
 }
-func (l *lineComp) Invalidate()                 {}
+func (l *lineComp) Invalidate()                  {}
 func (l *lineComp) Update(msg core.Msg) core.Cmd { return nil }
 
 // rawLineComp emits its lines verbatim (no width padding), so an empty
 // string stays empty — used to exercise the blank-line overlay path.
 type rawLineComp struct{ lines []string }
 
-func (l *rawLineComp) Render(width int64) []string  { return l.lines }
-func (l *rawLineComp) Invalidate()                  {}
-func (l *rawLineComp) Update(core.Msg) core.Cmd     { return nil }
+func (l *rawLineComp) Render(width int64) []string { return l.lines }
+func (l *rawLineComp) Invalidate()                 {}
+func (l *rawLineComp) Update(core.Msg) core.Cmd    { return nil }
+
+func TestPreventLastRowWrapLeavesLastCellEmpty(t *testing.T) {
+	cols, termRows := int64(10), int64(3)
+	rows := []core.Row{
+		core.ParseLine(strings.Repeat("a", 10)),
+		core.ParseLine(strings.Repeat("b", 10)),
+		core.ParseLine(strings.Repeat("c", 10)),
+	}
+	preventLastRowWrap(rows, cols, termRows)
+	if got := rows[2].VisibleWidth(); got >= cols {
+		t.Fatalf("last row still full width: %d", got)
+	}
+	if got := rows[0].VisibleWidth(); got != cols {
+		t.Fatalf("non-last row should stay full width, got %d", got)
+	}
+	if got := rows[1].VisibleWidth(); got != cols {
+		t.Fatalf("middle row should stay full width, got %d", got)
+	}
+}
+
+func TestPreventLastRowWrapNoOpWhenFrameShorter(t *testing.T) {
+	cols, termRows := int64(10), int64(5)
+	rows := []core.Row{
+		core.ParseLine(strings.Repeat("a", 10)),
+		core.ParseLine(strings.Repeat("b", 10)),
+	}
+	preventLastRowWrap(rows, cols, termRows)
+	if got := rows[1].VisibleWidth(); got != cols {
+		t.Fatalf("short frame last row should stay full width, got %d", got)
+	}
+}
 
 // TestComposeOverlayBlankLineKeepsMargins is the regression test for the bug
 // where an overlay panel that emits an empty ("") content line (e.g. the TODO
@@ -320,8 +351,8 @@ func TestComposeOverlayRawOverlayCoversBase(t *testing.T) {
 // Raw overlay rows (APC payloads) that must not be cell-padded.
 type passthroughComp struct{ line string }
 
-func (p *passthroughComp) Render(int64) []string { return []string{p.line} }
-func (p *passthroughComp) Invalidate()           {}
+func (p *passthroughComp) Render(int64) []string    { return []string{p.line} }
+func (p *passthroughComp) Invalidate()              {}
 func (p *passthroughComp) Update(core.Msg) core.Cmd { return nil }
 
 // TestComposeOverlayDropShadow verifies the DimBackground drop shadow forms
