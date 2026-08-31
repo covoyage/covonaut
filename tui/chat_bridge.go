@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"github.com/covoyage/covonaut/tui/chat"
+	"github.com/covoyage/covonaut/tui/core"
 	"github.com/covoyage/covonaut/tui/terminal"
 )
 
@@ -19,6 +20,7 @@ func NewChatApp(cfg chat.ChatAppConfig) *chat.ChatApp {
 	opts := TUIOptions{
 		Keybindings:           km,
 		DisableBracketedPaste: cfg.DisableBracketedPaste,
+		Filter:                composeChatFilter(cfg),
 	}
 	if cfg.AltScreen {
 		opts.AltScreen = true
@@ -111,4 +113,43 @@ func (h *tuiAppHost) RemoveOverlay(ov chat.OverlayRef) bool {
 
 func (h *tuiAppHost) TerminalSize() (cols, rows int64) {
 	return h.TUI.Terminal().Size()
+}
+
+func composeChatFilter(cfg chat.ChatAppConfig) func(core.Component, core.Msg) core.Msg {
+	userFilter := cfg.Filter
+	onImage := cfg.OnImagePaste
+	onText := cfg.OnTextPaste
+	if userFilter == nil && onImage == nil && onText == nil {
+		return nil
+	}
+	return func(c core.Component, msg core.Msg) core.Msg {
+		if userFilter != nil {
+			msg = userFilter(c, msg)
+			if msg == nil {
+				return nil
+			}
+		}
+		paste, ok := msg.(core.PasteMsg)
+		if !ok {
+			return msg
+		}
+		if paste.Text == "" || (len(paste.Text) < 4 && paste.Text == "\r") {
+			if onImage != nil {
+				onImage()
+				return nil
+			}
+			return msg
+		}
+		if onText != nil {
+			replacement, consume := onText(paste.Text)
+			if consume {
+				if replacement == "" {
+					return nil
+				}
+				paste.Text = replacement
+				return paste
+			}
+		}
+		return msg
+	}
 }

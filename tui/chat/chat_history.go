@@ -174,6 +174,11 @@ type ChatHistory struct {
 	// slide on a trackpad.
 	lastWheelAt     time.Time
 	suppressGesture bool
+
+	// pendingJump is an absolute cachedAll line to reveal on the next Render
+	// when the cache was empty at JumpToAbsoluteLine time.
+	pendingJump int64
+	hasJump     bool
 }
 
 // NewChatHistory returns an empty history using the default theme.
@@ -564,8 +569,101 @@ func (h *ChatHistory) FollowTail() {
 	h.mu.Lock()
 	h.offset = 0
 	h.follow = true
+	h.hasJump = false
 	h.mu.Unlock()
 	h.invalidate()
+}
+
+// Offset returns lines scrolled up from the tail (0 = following bottom).
+func (h *ChatHistory) Offset() int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.offset
+}
+
+// ViewportHeight returns the current MaxRows clamp.
+func (h *ChatHistory) ViewportHeight() int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.maxRows
+}
+
+// LineCount returns the cached rendered line count (0 if never rendered).
+func (h *ChatHistory) LineCount() int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return int64(len(h.cachedAll))
+}
+
+// ScrollToOffset sets the viewport offset from the tail.
+func (h *ChatHistory) ScrollToOffset(n int64) {
+	h.mu.Lock()
+	if n < 0 {
+		n = 0
+	}
+	h.offset = n
+	h.follow = n == 0
+	h.hasJump = false
+	h.mu.Unlock()
+	h.invalidate()
+}
+
+// JumpToAbsoluteLine reveals an absolute cachedAll line near the top of the viewport.
+func (h *ChatHistory) JumpToAbsoluteLine(line int64) {
+	h.mu.Lock()
+	total := int64(len(h.cachedAll))
+	if total == 0 {
+		h.pendingJump = line
+		h.hasJump = true
+		h.mu.Unlock()
+		h.invalidate()
+		return
+	}
+	h.applyJumpLocked(line, total)
+	h.mu.Unlock()
+	h.invalidate()
+}
+
+func (h *ChatHistory) applyJumpLocked(line, total int64) {
+	if total <= 0 {
+		h.pendingJump = line
+		h.hasJump = true
+		return
+	}
+	if line < 0 {
+		line = 0
+	}
+	if line >= total {
+		line = total - 1
+	}
+	end := line + h.maxRows
+	if end > total {
+		end = total
+	}
+	offset := total - end
+	if offset < 0 {
+		offset = 0
+	}
+	h.offset = offset
+	h.follow = offset == 0
+	h.hasJump = false
+}
+
+// MessageLineRange returns the cachedAll [start, end) range for message idx.
+func (h *ChatHistory) MessageLineRange(msgIndex int) (start, end int, ok bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.cachedMsgRanges {
+		if r.msgIndex == msgIndex && !r.toolGroup {
+			return r.startLine, r.endLine, true
+		}
+	}
+	for _, r := range h.cachedMsgRanges {
+		if r.msgIndex == msgIndex {
+			return r.startLine, r.endLine, true
+		}
+	}
+	return 0, 0, false
 }
 
 // Render draws the transcript, clipping to MaxRows when set.
@@ -596,10 +694,17 @@ func (h *ChatHistory) Render(width int64) []string {
 			}
 		}
 	}
+	if h.hasJump {
+		h.applyJumpLocked(h.pendingJump, int64(len(h.cachedAll)))
+	}
 	all := h.cachedAll
 	maxRows := h.maxRows
 	offset := h.offset
 	follow := h.follow
+	sticky := ""
+	if !follow && offset > 0 {
+		sticky = h.stickyUserPromptLocked(all, maxRows, offset)
+	}
 	h.mu.Unlock()
 
 	visible := all
@@ -626,6 +731,12 @@ func (h *ChatHistory) Render(width int64) []string {
 			visible = append([]string{indicator}, visible...)
 		}
 	}
+	if sticky != "" && maxRows > 0 {
+		if int64(len(visible)) >= maxRows && len(visible) > 0 {
+			visible = visible[:len(visible)-1]
+		}
+		visible = append([]string{sticky}, visible...)
+	}
 
 	// Pad every line to full width so the TUI diff engine's \x1b[2K
 	// never leaves a partial column that could bleed into the next line.
@@ -633,6 +744,44 @@ func (h *ChatHistory) Render(width int64) []string {
 	// cannot push the footer/status bar down. This runs on every path,
 	// including short transcripts that previously skipped the clamp.
 	return fitHistoryLines(visible, width)
+}
+
+func (h *ChatHistory) stickyUserPromptLocked(all []string, maxRows, offset int64) string {
+	if len(h.cachedMsgRanges) == 0 || len(h.messages) == 0 || maxRows <= 0 {
+		return ""
+	}
+	total := int64(len(all))
+	end := total - offset
+	if end > total {
+		end = total
+	}
+	start := end - maxRows
+	if start < 0 {
+		start = 0
+	}
+	best := -1
+	for _, r := range h.cachedMsgRanges {
+		if r.msgIndex < 0 || r.msgIndex >= len(h.messages) {
+			continue
+		}
+		if h.messages[r.msgIndex].Role != RoleUser {
+			continue
+		}
+		if int64(r.endLine) <= start {
+			best = r.msgIndex
+		}
+	}
+	if best < 0 {
+		return ""
+	}
+	text := strings.ReplaceAll(h.messages[best].Text, "\n", " ")
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	prefix := h.theme.DimStyle.Render("↑ ")
+	inner := core.TruncateToWidth(text, 80, "…")
+	return prefix + h.theme.DimStyle.Render(inner)
 }
 
 func fitHistoryLines(lines []string, width int64) []string {

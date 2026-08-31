@@ -15,6 +15,7 @@ import (
 // Features:
 //   - Multi-line buffer, hard newlines via Shift+Enter / Alt+Enter.
 //   - Enter submits (OnSubmit); Ctrl+J inserts newline regardless.
+//   - Bracketed paste inserts text (including hard newlines) and never submits.
 //   - Emacs-style keybindings for cursor motion and deletion (reuses the
 //     tui.editor.* keybindings).
 //   - Soft wrap at viewport width (CJK-aware via VisibleWidth).
@@ -114,10 +115,11 @@ type editorSelPos struct {
 // hardRow is -1 for rows with no backing content (e.g. MinRows growth
 // padding beyond the buffer's actual line count).
 type editorVisualRow struct {
-	hardRow    int64
-	colStart   int64
-	colEnd     int64
-	isFirstSeg bool
+	hardRow        int64
+	colStart       int64
+	colEnd         int64
+	isFirstSeg     bool
+	useFirstPrompt bool // true only for the composer prompt row
 }
 
 // NewEditor creates a multi-line editor bound to km (nil = global).
@@ -445,7 +447,7 @@ func (e *Editor) hitTestLocked(screenRow, screenCol int64) (row, col int64, ok b
 		return 0, 0, false
 	}
 	promptW := e.lastPromptWFirst
-	if !v.isFirstSeg {
+	if !v.useFirstPrompt {
 		promptW = e.lastPromptWCont
 	}
 	innerCol := screenCol - e.lastPadX - promptW
@@ -577,8 +579,9 @@ func (e *Editor) Render(width int64) []string {
 		offset := int64(0)
 		first := true
 		for offset < int64(len(ln)) {
+			composerFirst := i == 0 && first
 			w := innerWidth
-			if !first {
+			if !composerFirst {
 				w = contInner
 			}
 			slice := core.SliceRunesByCells(ln, core.CellWidthOfRunes(ln, 0, offset), core.CellWidthOfRunes(ln, 0, offset)+w)
@@ -623,19 +626,21 @@ func (e *Editor) Render(width int64) []string {
 	var out []string
 	rowsMeta := make([]editorVisualRow, 0, len(visuals))
 	for idx, v := range visuals {
+		useFirstPrompt := idx == 0
 		prompt := firstPrompt
 		innerW := innerWidth
-		if !v.isFirstSeg {
+		if !useFirstPrompt {
 			prompt = contPrompt
 			innerW = contInner
 		}
 		segRunes := []rune(v.text)
 		segLen := int64(len(segRunes))
 		rowsMeta = append(rowsMeta, editorVisualRow{
-			hardRow:    v.hardRow,
-			colStart:   v.colOffset,
-			colEnd:     v.colOffset + segLen,
-			isFirstSeg: v.isFirstSeg,
+			hardRow:        v.hardRow,
+			colStart:       v.colOffset,
+			colEnd:         v.colOffset + segLen,
+			isFirstSeg:     v.isFirstSeg,
+			useFirstPrompt: useFirstPrompt,
 		})
 
 		var bodyText string
@@ -682,13 +687,18 @@ func (e *Editor) Render(width int64) []string {
 	}
 	// Growth policy.
 	for int64(len(out)) < e.minRows {
+		useFirstPrompt := len(out) == 0
 		emptyPrompt := firstPrompt
 		emptyInner := innerWidth
+		if !useFirstPrompt {
+			emptyPrompt = contPrompt
+			emptyInner = contInner
+		}
 		emptyPad := pad
 		body := core.PadToWidth("", emptyInner)
 		line := emptyPad + promptFn(emptyPrompt) + body
 		out = append(out, core.PadToWidth(line, width))
-		rowsMeta = append(rowsMeta, editorVisualRow{hardRow: -1})
+		rowsMeta = append(rowsMeta, editorVisualRow{hardRow: -1, useFirstPrompt: useFirstPrompt})
 	}
 	if int64(len(out)) > e.maxRows {
 		// Keep the segment containing the cursor visible; drop leading rows.
@@ -748,15 +758,54 @@ func (e *Editor) Invalidate() {}
 func (e *Editor) Update(msg core.Msg) core.Cmd {
 	switch m := msg.(type) {
 	case core.KeyMsg:
-		e.processKeys(m.Data)
+		if looksLikePastedText(m.Data) {
+			e.insertPastedText(m.Data)
+		} else {
+			e.processKeys(m.Data)
+		}
 	case core.PasteMsg:
-		e.processKeys(m.Text)
+		e.insertPastedText(m.Text)
 	case core.WindowSizeMsg:
 		e.Invalidate()
 	case core.MouseMsg:
 		e.handleMouse(m)
 	}
 	return nil
+}
+
+// looksLikePastedText reports whether a KeyMsg payload is a batched paste
+// (multiple key events including a newline) rather than a single Enter.
+func looksLikePastedText(data string) bool {
+	if !strings.ContainsAny(data, "\n\r") {
+		return false
+	}
+	return len(terminal.ParseKeys(data)) > 1
+}
+
+func normalizePasteNewlines(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	return strings.ReplaceAll(s, "\r", "\n")
+}
+
+// insertPastedText inserts s at the cursor as buffer text. Newlines become
+// hard lines; Enter is never treated as submit.
+func (e *Editor) insertPastedText(s string) {
+	s = normalizePasteNewlines(s)
+	if s == "" {
+		return
+	}
+	e.mu.Lock()
+	e.ghostText = ""
+	e.clearMouseSelectionLocked()
+	e.pushSnapshotLocked()
+	e.insertStringLocked(s)
+	e.lastKill = false
+	fn := e.onChange
+	v := e.valueLocked()
+	e.mu.Unlock()
+	if fn != nil {
+		fn(v)
+	}
 }
 
 func (e *Editor) processKeys(data string) {

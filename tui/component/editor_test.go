@@ -223,3 +223,77 @@ func TestEditorVimDeleteLine(t *testing.T) {
 		t.Fatalf("dd should delete current line, got %q", got)
 	}
 }
+
+func TestEditorPasteMultilineDoesNotSubmit(t *testing.T) {
+	e := NewEditor(nil)
+	e.SetFocused(true)
+	submitted := 0
+	e.OnSubmit(func(string) { submitted++ })
+	e.Update(core.KeyMsg{Data: "hello"})
+	e.Update(core.PasteMsg{Text: "a\nb\nc"})
+	if submitted != 0 {
+		t.Fatalf("multiline paste must not submit, got %d submits", submitted)
+	}
+	if got := e.GetValue(); got != "helloa\nb\nc" {
+		t.Fatalf("want %q, got %q", "helloa\nb\nc", got)
+	}
+}
+
+func TestEditorPasteCRLFNormalizes(t *testing.T) {
+	e := NewEditor(nil)
+	e.SetFocused(true)
+	submitted := 0
+	e.OnSubmit(func(string) { submitted++ })
+	e.Update(core.PasteMsg{Text: "a\r\nb"})
+	if submitted != 0 {
+		t.Fatalf("CRLF paste must not submit, got %d submits", submitted)
+	}
+	if got := e.GetValue(); got != "a\nb" {
+		t.Fatalf("want %q, got %q", "a\nb", got)
+	}
+}
+
+func TestEditorEnterStillSubmits(t *testing.T) {
+	e := NewEditor(nil)
+	e.SetFocused(true)
+	submitted := ""
+	e.OnSubmit(func(v string) { submitted = v })
+	e.Update(core.KeyMsg{Data: "hello"})
+	e.Update(core.KeyMsg{Data: "\r"})
+	if submitted != "hello" {
+		t.Fatalf("enter should submit current value, got %q", submitted)
+	}
+	if got := e.GetValue(); got != "hello" {
+		t.Fatalf("submit should leave buffer intact, got %q", got)
+	}
+}
+
+func TestEditorPasteReplacesSelectAll(t *testing.T) {
+	e := NewEditor(nil)
+	e.SetFocused(true)
+	submitted := 0
+	e.OnSubmit(func(string) { submitted++ })
+	e.Update(core.KeyMsg{Data: "hello"})
+	e.Update(core.KeyMsg{Data: "\x1b[97;9u"}) // Kitty CSI-u: super+a
+	e.Update(core.PasteMsg{Text: "a\nb"})
+	if submitted != 0 {
+		t.Fatalf("paste over selection must not submit, got %d submits", submitted)
+	}
+	if got := e.GetValue(); got != "a\nb" {
+		t.Fatalf("want %q, got %q", "a\nb", got)
+	}
+}
+
+func TestEditorBatchedKeyMsgWithNewlinesDoesNotSubmit(t *testing.T) {
+	e := NewEditor(nil)
+	e.SetFocused(true)
+	submitted := 0
+	e.OnSubmit(func(string) { submitted++ })
+	e.Update(core.KeyMsg{Data: "a\nb"})
+	if submitted != 0 {
+		t.Fatalf("batched newline KeyMsg must not submit, got %d submits", submitted)
+	}
+	if got := e.GetValue(); got != "a\nb" {
+		t.Fatalf("want %q, got %q", "a\nb", got)
+	}
+}

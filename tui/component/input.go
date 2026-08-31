@@ -1,6 +1,7 @@
 package component
 
 import (
+	"strings"
 	"sync"
 
 	"github.com/covoyage/covonaut/tui/core"
@@ -237,13 +238,47 @@ func (i *Input) Invalidate() {}
 func (i *Input) Update(msg core.Msg) core.Cmd {
 	switch m := msg.(type) {
 	case core.KeyMsg:
-		i.processKeys(m.Data)
+		if looksLikePastedText(m.Data) {
+			i.insertPastedText(m.Data)
+		} else {
+			i.processKeys(m.Data)
+		}
 	case core.PasteMsg:
-		i.processKeys(m.Text)
+		i.insertPastedText(m.Text)
 	case core.WindowSizeMsg:
 		i.Invalidate()
 	}
 	return nil
+}
+
+// insertPastedText inserts s at the cursor without submitting. Newlines are
+// flattened because Input is single-line.
+func (i *Input) insertPastedText(s string) {
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	if s == "" {
+		return
+	}
+	i.mu.Lock()
+	if i.allSelected {
+		i.clearSelectionContentLocked()
+	}
+	runes := []rune(s)
+	newRunes := make([]rune, 0, len(i.runes)+len(runes))
+	newRunes = append(newRunes, i.runes[:i.cursor]...)
+	newRunes = append(newRunes, runes...)
+	newRunes = append(newRunes, i.runes[i.cursor:]...)
+	i.runes = newRunes
+	i.cursor += int64(len(runes))
+	i.lastKillOp = false
+	i.allSelected = false
+	value := string(i.runes)
+	changeFn := i.onChange
+	i.mu.Unlock()
+	if changeFn != nil {
+		changeFn(value)
+	}
 }
 
 func (i *Input) processKeys(data string) {

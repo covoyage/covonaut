@@ -85,6 +85,20 @@ type ChatAppConfig struct {
 	OnInterrupt  func()
 	OnImagePaste func() // called when an image paste is detected (clipboard image, empty text)
 
+	// ExpandSubmit rewrites the composer value before it is shown in history
+	// and passed to OnSubmit. Used to expand paste chips into the original text.
+	ExpandSubmit func(input string) string
+
+	// OnTextPaste is called for non-empty bracketed pastes before the editor
+	// inserts the text. replacement is inserted when consume is true; an empty
+	// replacement drops the paste. When consume is false the original text is
+	// inserted unchanged.
+	OnTextPaste func(text string) (replacement string, consume bool)
+
+	// Filter is invoked by the host TUI before a message is dispatched.
+	// Returning nil drops the event. Nil means no extra filtering.
+	Filter func(c core.Component, msg core.Msg) core.Msg
+
 	// OnHistoryJump is called when the user presses ESC twice quickly on an
 	// empty, idle editor (no agent turn running). Callers typically open a
 	// history / rewind navigation dialog. Nil disables the gesture.
@@ -553,6 +567,9 @@ func (a *ChatApp) onEditorSubmit(value string) {
 	a.mu.Unlock()
 
 	trimmed := strings.TrimSpace(value)
+	if a.cfg.ExpandSubmit != nil {
+		trimmed = strings.TrimSpace(a.cfg.ExpandSubmit(trimmed))
+	}
 	if trimmed == "" {
 		return
 	}
@@ -1172,6 +1189,21 @@ func (l *chatLayout) Update(msg core.Msg) core.Cmd {
 		if m.Text == "" || (len(m.Text) < 4 && m.Text == "\r") {
 			if l.app.cfg.OnImagePaste != nil {
 				l.app.cfg.OnImagePaste()
+				return nil
+			}
+		} else if l.app.cfg.OnTextPaste != nil {
+			replacement, consume := l.app.cfg.OnTextPaste(m.Text)
+			if consume {
+				if replacement == "" {
+					return nil
+				}
+				if ed, ok := l.editor.(interface{ SetValue(string) }); ok {
+					cur := ""
+					if getter, ok := l.editor.(interface{ GetValue() string }); ok {
+						cur = getter.GetValue()
+					}
+					ed.SetValue(cur + replacement)
+				}
 				return nil
 			}
 		}
