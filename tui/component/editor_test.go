@@ -3,6 +3,7 @@ package component
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/covoyage/covonaut/tui/core"
 )
@@ -295,5 +296,66 @@ func TestEditorBatchedKeyMsgWithNewlinesDoesNotSubmit(t *testing.T) {
 	}
 	if got := e.GetValue(); got != "a\nb" {
 		t.Fatalf("want %q, got %q", "a\nb", got)
+	}
+}
+
+func TestEditorOnTextPasteRewritesInsert(t *testing.T) {
+	e := NewEditor(nil)
+	e.SetFocused(true)
+	e.OnTextPaste(func(text string) (string, bool) {
+		return "[Pasted ~2 lines]", true
+	})
+	e.Update(core.PasteMsg{Text: "a\nb"})
+	if got := e.GetValue(); got != "[Pasted ~2 lines]" {
+		t.Fatalf("want chip, got %q", got)
+	}
+}
+
+func TestEditorPasteChipDeletesAtomically(t *testing.T) {
+	e := NewEditor(nil)
+	e.SetFocused(true)
+	e.SetValue("x[Pasted ~2 lines]y")
+	e.Update(core.KeyMsg{Data: "\x7f"}) // backspace at end
+	if got := e.GetValue(); got != "x[Pasted ~2 lines]" {
+		t.Fatalf("first backspace should delete trailing y, got %q", got)
+	}
+	e.Update(core.KeyMsg{Data: "\x7f"})
+	if got := e.GetValue(); got != "x" {
+		t.Fatalf("second backspace should delete whole chip, got %q", got)
+	}
+}
+
+func TestEditorPasteChipInsertsBeforeNotInside(t *testing.T) {
+	e := NewEditor(nil)
+	e.SetFocused(true)
+	e.SetValue("[Pasted ~2 lines]")
+	e.mu.Lock()
+	e.col = 0
+	e.mu.Unlock()
+	e.Update(core.KeyMsg{Data: "z"})
+	if got := e.GetValue(); got != "z[Pasted ~2 lines]" {
+		t.Fatalf("typing at chip start should insert before, got %q", got)
+	}
+}
+
+func TestEditorPasteBurstEnterInsertsNewline(t *testing.T) {
+	e := NewEditor(nil)
+	e.SetFocused(true)
+	submitted := 0
+	e.OnSubmit(func(string) { submitted++ })
+	t0 := time.Now()
+	e.burst.now = func() time.Time { return t0 }
+	e.Update(core.KeyMsg{Data: "a"})
+	e.burst.now = func() time.Time { return t0.Add(time.Millisecond) }
+	e.Update(core.KeyMsg{Data: "b"})
+	e.burst.now = func() time.Time { return t0.Add(2 * time.Millisecond) }
+	e.Update(core.KeyMsg{Data: "c"})
+	e.burst.now = func() time.Time { return t0.Add(3 * time.Millisecond) }
+	e.Update(core.KeyMsg{Data: "\r"})
+	if submitted != 0 {
+		t.Fatalf("burst enter must not submit, got %d", submitted)
+	}
+	if got := e.GetValue(); got != "abc\n" {
+		t.Fatalf("want newline insert, got %q", got)
 	}
 }

@@ -62,6 +62,13 @@ type ChatAppConfig struct {
 	EditorMaxRows int64
 	EditorPrompt  string
 
+	// EditorPlaceholder is shown when the composer is empty and idle.
+	EditorPlaceholder string
+	// EditorStartingPlaceholder is shown while HoldSubmit is active.
+	EditorStartingPlaceholder string
+	// EditorBusyPlaceholder is shown while the agent is running.
+	EditorBusyPlaceholder string
+
 	ShowTimings bool
 	ShowTurns   bool
 
@@ -83,7 +90,8 @@ type ChatAppConfig struct {
 	OnSubmit     func(ctx context.Context, input string)
 	OnQuit       func()
 	OnInterrupt  func()
-	OnImagePaste func() // called when an image paste is detected (clipboard image, empty text)
+	OnImagePaste func()                                  // called when an image paste is detected (clipboard image, empty text)
+	OnQueue      func(ctx context.Context, input string) // Tab while the agent is running
 
 	// ExpandSubmit rewrites the composer value before it is shown in history
 	// and passed to OnSubmit. Used to expand paste chips into the original text.
@@ -186,6 +194,9 @@ type ChatApp struct {
 	mu    sync.Mutex
 	model chatModel
 
+	submitHeld    bool
+	pendingCommit bool
+
 	helpOverlay OverlayRef
 
 	// SuppressAutoRetry suppresses auto-retry messages from being printed to
@@ -233,8 +244,15 @@ func newChatApp(cfg ChatAppConfig) *ChatApp {
 	editor.SetMaxRows(cfg.EditorMaxRows)
 	editor.SetPrompt(cfg.EditorPrompt, strings.Repeat(" ", len(cfg.EditorPrompt)))
 	editor.SetFocusIndicator("")
-	editor.SetPlaceholder("Type a message...")
+	idlePlaceholder := cfg.EditorPlaceholder
+	if idlePlaceholder == "" {
+		idlePlaceholder = "Type a message..."
+	}
+	editor.SetPlaceholder(idlePlaceholder)
 	editor.SetPlaceholderFn(func(s string) string { return theme.CurrentPalette().Dim.Render(s) })
+	if cfg.OnTextPaste != nil {
+		editor.OnTextPaste(cfg.OnTextPaste)
+	}
 
 	loader := component.NewLoader(func() {}, theme.CurrentPalette().Dim.Render("thinking..."))
 
@@ -391,6 +409,40 @@ func (a *ChatApp) Start() error {
 	return nil
 }
 
+// HoldSubmit keeps the composer editable but defers Enter/Tab until SetReady.
+func (a *ChatApp) HoldSubmit() {
+	a.mu.Lock()
+	a.submitHeld = true
+	a.mu.Unlock()
+	if a.editor != nil {
+		a.editor.SetPlaceholder(a.startingPlaceholder())
+	}
+	if a.host != nil {
+		a.host.RequestRender()
+	}
+}
+
+// SetReady allows submit/queue and flushes Enter pressed during HoldSubmit.
+func (a *ChatApp) SetReady() {
+	a.mu.Lock()
+	a.submitHeld = false
+	pending := a.pendingCommit
+	a.pendingCommit = false
+	running := a.model.Running
+	a.mu.Unlock()
+	if a.editor != nil && !running {
+		a.editor.SetPlaceholder(a.idlePlaceholder())
+	}
+	if a.host != nil {
+		a.host.RequestRender()
+	}
+	if pending && a.editor != nil {
+		if v := a.editor.GetValue(); v != "" {
+			a.commitComposer(v, false)
+		}
+	}
+}
+
 func (a *ChatApp) Stop() error { return a.host.Stop() }
 
 func (a *ChatApp) Done() <-chan struct{} { return a.host.Done() }
@@ -460,7 +512,7 @@ func (a *ChatApp) Busy(message string) {
 	if a.statusBar != nil {
 		a.statusBar.Busy()
 	}
-	a.editor.SetPlaceholder("Ctrl+C to interrupt")
+	a.editor.SetPlaceholder(a.busyPlaceholder())
 	a.host.RequestRender()
 }
 
@@ -472,8 +524,29 @@ func (a *ChatApp) Idle() {
 	if a.statusBar != nil {
 		a.statusBar.Idle()
 	}
-	a.editor.SetPlaceholder("")
+	a.editor.SetPlaceholder(a.idlePlaceholder())
 	a.host.RequestRender()
+}
+
+func (a *ChatApp) idlePlaceholder() string {
+	if a.cfg.EditorPlaceholder != "" {
+		return a.cfg.EditorPlaceholder
+	}
+	return "Type a message..."
+}
+
+func (a *ChatApp) startingPlaceholder() string {
+	if a.cfg.EditorStartingPlaceholder != "" {
+		return a.cfg.EditorStartingPlaceholder
+	}
+	return "Starting..."
+}
+
+func (a *ChatApp) busyPlaceholder() string {
+	if a.cfg.EditorBusyPlaceholder != "" {
+		return a.cfg.EditorBusyPlaceholder
+	}
+	return "Ctrl+C interrupt · Tab queue"
 }
 
 func (a *ChatApp) PrintStatus(message string) {
@@ -544,42 +617,56 @@ func (o *overlayHandle) OverlayPercentY() int           { return o.percentY }
 func (o *overlayHandle) OverlayWidthPct() int           { return o.widthPct }
 func (o *overlayHandle) OverlayHeightPct() int          { return o.heightPct }
 
+func (a *ChatApp) prepareComposerValue(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if a.cfg.ExpandSubmit != nil {
+		trimmed = strings.TrimSpace(a.cfg.ExpandSubmit(trimmed))
+	}
+	return trimmed
+}
+
 func (a *ChatApp) onEditorSubmit(value string) {
+	a.commitComposer(value, false)
+}
+
+func (a *ChatApp) onEditorQueue(value string) {
+	a.commitComposer(value, true)
+}
+
+func (a *ChatApp) commitComposer(value string, queue bool) {
 	a.mu.Lock()
-	if a.ac != nil && a.ac.Active() {
-		// Autocomplete is active — let chatLayout forward the key to it.
-		// Don't submit or forward here to avoid double-processing.
+	if a.submitHeld {
+		a.pendingCommit = true
 		a.mu.Unlock()
 		return
 	}
-	// Hide autocomplete under the same lock that checked Active() — without
-	// this, the unlock window between the check and Hide() could let the ac
-	// state drift (the previous code re-locked and re-checked a.ac != nil,
-	// racing with concurrent activation).
+	if a.ac != nil && a.ac.Active() {
+		// Autocomplete is active — let chatLayout forward the key to it.
+		a.mu.Unlock()
+		return
+	}
 	if a.ac != nil {
 		a.ac.Hide()
 	}
 	onSubmit := a.cfg.OnSubmit
+	onQueue := a.cfg.OnQueue
 	ctx := a.cfg.Context
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	a.mu.Unlock()
 
-	trimmed := strings.TrimSpace(value)
-	if a.cfg.ExpandSubmit != nil {
-		trimmed = strings.TrimSpace(a.cfg.ExpandSubmit(trimmed))
-	}
+	trimmed := a.prepareComposerValue(value)
 	if trimmed == "" {
 		return
 	}
-	// PrintUser / PushInputHistory / SetValue operate on history and editor
-	// components, which own their own internal locks — they do not touch
-	// ChatApp.model, so holding ChatApp.mu here is unnecessary and would
-	// serialise with the event loop for no benefit.
 	a.PrintUser(trimmed)
 	a.editor.PushInputHistory(trimmed)
 	a.editor.SetValue("")
+	if queue && onQueue != nil {
+		onQueue(ctx, trimmed)
+		return
+	}
 	if onSubmit != nil {
 		onSubmit(ctx, trimmed)
 	}
@@ -1184,26 +1271,9 @@ func (l *chatLayout) Update(msg core.Msg) core.Cmd {
 		l.lastRows = m.Height
 		l.recalcMaxRows(m.Width, m.Height)
 	case core.PasteMsg:
-		// Image paste detection: when clipboard has an image, the terminal
-		// sends empty/short text.  Let the caller hook pasteImageFn.
 		if m.Text == "" || (len(m.Text) < 4 && m.Text == "\r") {
 			if l.app.cfg.OnImagePaste != nil {
 				l.app.cfg.OnImagePaste()
-				return nil
-			}
-		} else if l.app.cfg.OnTextPaste != nil {
-			replacement, consume := l.app.cfg.OnTextPaste(m.Text)
-			if consume {
-				if replacement == "" {
-					return nil
-				}
-				if ed, ok := l.editor.(interface{ SetValue(string) }); ok {
-					cur := ""
-					if getter, ok := l.editor.(interface{ GetValue() string }); ok {
-						cur = getter.GetValue()
-					}
-					ed.SetValue(cur + replacement)
-				}
 				return nil
 			}
 		}
@@ -1299,10 +1369,13 @@ func (l *chatLayout) Update(msg core.Msg) core.Cmd {
 					}
 					return nil
 				case "tab":
-					// Tab accepts ghost text when autocomplete is not active
 					if l.app.editor.GhostText() != "" {
 						l.app.editor.AcceptGhost()
 						l.app.host.RequestRender()
+						return nil
+					}
+					if l.app.isRunning() && l.app.cfg.OnQueue != nil && l.app.editor.GetValue() != "" {
+						l.app.onEditorQueue(l.app.editor.GetValue())
 						return nil
 					}
 				case "pageUp":
@@ -1311,13 +1384,6 @@ func (l *chatLayout) Update(msg core.Msg) core.Cmd {
 					l.history.ScrollBy(5)
 				case "c", "insert":
 					if isCopyShortcut(k) {
-						// Prefer copying an active selection over interrupting.
-						// This matters because many terminals don't report a
-						// distinguishable Cmd modifier (no Kitty keyboard protocol
-						// support) and send Cmd+C as the same byte sequence as
-						// Ctrl+C. Without this check, Cmd+C while the agent is
-						// running would interrupt it instead of copying the text
-						// the user just selected.
 						if hasSelection(l) {
 							doCopy(l)
 							return nil

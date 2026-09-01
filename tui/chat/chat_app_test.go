@@ -317,9 +317,7 @@ func TestChatAppEditorSubmit(t *testing.T) {
 	app, _ := newTestChatApp(t, ChatAppConfig{
 		OnSubmit: func(_ context.Context, in string) { captured = in },
 	})
-	for _, r := range "hello" {
-		app.editor.Update(core.KeyMsg{Data: string(r)})
-	}
+	app.editor.SetValue("hello")
 	app.editor.Update(core.KeyMsg{Data: "\r"})
 
 	if captured != "hello" {
@@ -343,6 +341,29 @@ func TestChatAppBusyIdle(t *testing.T) {
 	app.Idle()
 	if app.loader.IsRunning() {
 		t.Fatalf("loader should be stopped")
+	}
+}
+
+func TestChatAppHoldSubmitDefersUntilReady(t *testing.T) {
+	var captured string
+	app, _ := newTestChatApp(t, ChatAppConfig{
+		OnSubmit: func(_ context.Context, in string) { captured = in },
+	})
+	app.HoldSubmit()
+	app.editor.SetValue("hello")
+	app.editor.Update(core.KeyMsg{Data: "\r"})
+	if captured != "" {
+		t.Fatalf("submit while held captured=%q", captured)
+	}
+	if got := app.editor.GetValue(); got != "hello" {
+		t.Fatalf("draft should remain while held, got %q", got)
+	}
+	app.SetReady()
+	if captured != "hello" {
+		t.Fatalf("SetReady should flush pending submit, got %q", captured)
+	}
+	if app.editor.GetValue() != "" {
+		t.Fatalf("editor should clear after flush, got %q", app.editor.GetValue())
 	}
 }
 

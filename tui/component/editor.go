@@ -3,6 +3,7 @@ package component
 import (
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/covoyage/covonaut/tui/core"
 	"github.com/covoyage/covonaut/tui/terminal"
@@ -86,9 +87,12 @@ type Editor struct {
 	ghostCol  int64  // rune offset in the current line where ghost starts (cursor position at request time)
 	ghostRow  int64  // hard row index where the ghost applies
 
-	onSubmit func(value string)
-	onChange func(value string)
-	onCancel func()
+	onSubmit    func(value string)
+	onChange    func(value string)
+	onCancel    func()
+	onTextPaste func(text string) (replacement string, consume bool)
+
+	burst pasteBurst
 
 	// Optional vim modal editing. When enabled, the editor starts in insert
 	// mode so typing still works; Esc enters normal mode (hjkl / i / a / x / dd).
@@ -494,6 +498,13 @@ func (e *Editor) OnSubmit(fn func(string)) { e.mu.Lock(); e.onSubmit = fn; e.mu.
 func (e *Editor) OnChange(fn func(string)) { e.mu.Lock(); e.onChange = fn; e.mu.Unlock() }
 func (e *Editor) OnCancel(fn func())       { e.mu.Lock(); e.onCancel = fn; e.mu.Unlock() }
 
+// OnTextPaste registers a rewrite hook for pasted text (bracketed or burst).
+func (e *Editor) OnTextPaste(fn func(string) (string, bool)) {
+	e.mu.Lock()
+	e.onTextPaste = fn
+	e.mu.Unlock()
+}
+
 // SetFocused / IsFocused implement Focusable.
 func (e *Editor) SetFocused(on bool) { e.mu.Lock(); e.focused = on; e.mu.Unlock() }
 func (e *Editor) IsFocused() bool {
@@ -773,6 +784,20 @@ func (e *Editor) Update(msg core.Msg) core.Cmd {
 	return nil
 }
 
+func (e *Editor) applyTextPaste(s string) string {
+	e.mu.RLock()
+	fn := e.onTextPaste
+	e.mu.RUnlock()
+	if fn == nil {
+		return s
+	}
+	replacement, consume := fn(s)
+	if !consume {
+		return s
+	}
+	return replacement
+}
+
 // looksLikePastedText reports whether a KeyMsg payload is a batched paste
 // (multiple key events including a newline) rather than a single Enter.
 func looksLikePastedText(data string) bool {
@@ -791,6 +816,10 @@ func normalizePasteNewlines(s string) string {
 // hard lines; Enter is never treated as submit.
 func (e *Editor) insertPastedText(s string) {
 	s = normalizePasteNewlines(s)
+	if s == "" {
+		return
+	}
+	s = e.applyTextPaste(s)
 	if s == "" {
 		return
 	}
@@ -814,14 +843,20 @@ func (e *Editor) processKeys(data string) {
 		return
 	}
 	km := e.km
+	single := len(keys) == 1
 	for _, k := range keys {
 		raw := k.Raw
 		switch {
 		case km.Matches(raw, "tui.input.newLine"):
 			e.ghostText = ""
+			e.burst.reset()
 			e.insertRune('\n')
 		case km.Matches(raw, "tui.input.submit"):
 			e.ghostText = ""
+			if single && e.burst.consumeEnterAsNewline() {
+				e.insertRune('\n')
+				continue
+			}
 			e.submit()
 		case e.handleVimKey(k):
 			e.ghostText = ""
@@ -901,6 +936,11 @@ func (e *Editor) processKeys(data string) {
 			}
 			if k.IsPrintable() {
 				e.ghostText = ""
+				if single {
+					e.burst.notePlain()
+				} else {
+					e.burst.reset()
+				}
 				e.insertRune(k.Rune)
 			}
 		}
@@ -1078,6 +1118,9 @@ func (e *Editor) insertRune(r rune) {
 	if e.allSelected {
 		e.clearSelectionContentLocked()
 	}
+	if start, end, ok := chipSpanAtLocked(e.lines, e.row, e.col, 1); ok && e.col != start.col {
+		e.col = end.col
+	}
 	if r == '\n' {
 		cur := e.lines[e.row]
 		before := append([]rune{}, cur[:e.col]...)
@@ -1111,6 +1154,7 @@ func (e *Editor) insertRune(r rune) {
 
 func (e *Editor) moveCursor(dRow, dCol int64) {
 	e.mu.Lock()
+	e.burst.reset()
 	e.allSelected = false
 	e.clearMouseSelectionLocked()
 	if dRow != 0 {
@@ -1143,6 +1187,11 @@ func (e *Editor) moveCursor(dRow, dCol int64) {
 				e.col = int64(len(e.lines[e.row]))
 			}
 		}
+		if dCol < 0 {
+			e.skipChipLocked(-1)
+		} else {
+			e.skipChipLocked(1)
+		}
 	}
 	e.lastKill = false
 	e.mu.Unlock()
@@ -1172,6 +1221,7 @@ func (e *Editor) moveWord(delta int64) {
 }
 
 func (e *Editor) deleteBackward() {
+	e.burst.reset()
 	e.mu.Lock()
 	e.clearMouseSelectionLocked()
 	e.pushSnapshotLocked()
@@ -1185,7 +1235,9 @@ func (e *Editor) deleteBackward() {
 		}
 		return
 	}
-	if e.col == 0 {
+	if start, end, ok := chipSpanAtLocked(e.lines, e.row, e.col, -1); ok {
+		e.deleteSpanLocked(start, end)
+	} else if e.col == 0 {
 		if e.row == 0 {
 			e.mu.Unlock()
 			return
@@ -1212,6 +1264,7 @@ func (e *Editor) deleteBackward() {
 }
 
 func (e *Editor) deleteForward() {
+	e.burst.reset()
 	e.mu.Lock()
 	e.clearMouseSelectionLocked()
 	e.pushSnapshotLocked()
@@ -1225,17 +1278,21 @@ func (e *Editor) deleteForward() {
 		}
 		return
 	}
-	cur := e.lines[e.row]
-	if e.col >= int64(len(cur)) {
-		if e.row >= int64(len(e.lines)-1) {
-			e.mu.Unlock()
-			return
-		}
-		next := e.lines[e.row+1]
-		e.lines[e.row] = append(cur, next...)
-		e.lines = append(e.lines[:e.row+1], e.lines[e.row+2:]...)
+	if start, end, ok := chipSpanAtLocked(e.lines, e.row, e.col, 1); ok {
+		e.deleteSpanLocked(start, end)
 	} else {
-		e.lines[e.row] = append(cur[:e.col], cur[e.col+1:]...)
+		cur := e.lines[e.row]
+		if e.col >= int64(len(cur)) {
+			if e.row >= int64(len(e.lines)-1) {
+				e.mu.Unlock()
+				return
+			}
+			next := e.lines[e.row+1]
+			e.lines[e.row] = append(cur, next...)
+			e.lines = append(e.lines[:e.row+1], e.lines[e.row+2:]...)
+		} else {
+			e.lines[e.row] = append(cur[:e.col], cur[e.col+1:]...)
+		}
 	}
 	fn := e.onChange
 	v := e.valueLocked()
@@ -1446,6 +1503,79 @@ func (e *Editor) yankPop() {
 	if fn != nil {
 		fn(v)
 	}
+}
+
+func (e *Editor) skipChipLocked(dir int64) {
+	start, end, ok := chipSpanAtLocked(e.lines, e.row, e.col, dir)
+	if !ok {
+		return
+	}
+	if dir < 0 {
+		e.col = start.col
+	} else {
+		e.col = end.col
+	}
+}
+
+func (e *Editor) deleteSpanLocked(start, end editorSelPos) {
+	if start.row != end.row || start.row < 0 || start.row >= int64(len(e.lines)) {
+		return
+	}
+	line := e.lines[start.row]
+	if start.col < 0 {
+		start.col = 0
+	}
+	if end.col > int64(len(line)) {
+		end.col = int64(len(line))
+	}
+	if end.col < start.col {
+		return
+	}
+	e.lines[start.row] = append(line[:start.col], line[end.col:]...)
+	e.row = start.row
+	e.col = start.col
+}
+
+const editorPasteChipPrefix = "[Pasted ~"
+
+func chipSpansInLine(line []rune) [][2]int64 {
+	s := string(line)
+	var spans [][2]int64
+	from := 0
+	for {
+		rel := strings.Index(s[from:], editorPasteChipPrefix)
+		if rel < 0 {
+			return spans
+		}
+		i := from + rel
+		j := strings.Index(s[i:], "]")
+		if j < 0 {
+			return spans
+		}
+		j += i + 1
+		start := int64(utf8.RuneCountInString(s[:i]))
+		end := int64(utf8.RuneCountInString(s[:j]))
+		spans = append(spans, [2]int64{start, end})
+		from = j
+	}
+}
+
+func chipSpanAtLocked(lines [][]rune, row, col, dir int64) (start, end editorSelPos, ok bool) {
+	if row < 0 || row >= int64(len(lines)) {
+		return editorSelPos{}, editorSelPos{}, false
+	}
+	for _, sp := range chipSpansInLine(lines[row]) {
+		if dir < 0 {
+			if col > sp[0] && col <= sp[1] {
+				return editorSelPos{row: row, col: sp[0]}, editorSelPos{row: row, col: sp[1]}, true
+			}
+			continue
+		}
+		if col >= sp[0] && col < sp[1] {
+			return editorSelPos{row: row, col: sp[0]}, editorSelPos{row: row, col: sp[1]}, true
+		}
+	}
+	return editorSelPos{}, editorSelPos{}, false
 }
 
 func (e *Editor) insertStringLocked(s string) {

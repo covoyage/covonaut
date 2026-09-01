@@ -118,8 +118,7 @@ func (h *tuiAppHost) TerminalSize() (cols, rows int64) {
 func composeChatFilter(cfg chat.ChatAppConfig) func(core.Component, core.Msg) core.Msg {
 	userFilter := cfg.Filter
 	onImage := cfg.OnImagePaste
-	onText := cfg.OnTextPaste
-	if userFilter == nil && onImage == nil && onText == nil {
+	if userFilter == nil && onImage == nil {
 		return nil
 	}
 	return func(c core.Component, msg core.Msg) core.Msg {
@@ -137,17 +136,6 @@ func composeChatFilter(cfg chat.ChatAppConfig) func(core.Component, core.Msg) co
 			if onImage != nil {
 				onImage()
 				return nil
-			}
-			return msg
-		}
-		if onText != nil {
-			replacement, consume := onText(paste.Text)
-			if consume {
-				if replacement == "" {
-					return nil
-				}
-				paste.Text = replacement
-				return paste
 			}
 		}
 		return msg
