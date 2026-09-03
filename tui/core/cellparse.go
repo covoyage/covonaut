@@ -240,6 +240,11 @@ func TruncateRow(row Row, width int64) Row {
 		// string-level TruncateToWidth if needed. Return as-is.
 		return row
 	}
+	if width <= 0 {
+		// Degenerate width (e.g. size torn mid-resize): bail with an empty
+		// well-formed row instead of emitting bogus cursor positions.
+		return Row{CursorCol: -1}
+	}
 	w := row.VisibleWidth()
 	if w <= width {
 		return row

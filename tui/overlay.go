@@ -49,6 +49,8 @@ type OverlaySize struct {
 }
 
 // resolve computes the effective cell count for a given viewport dimension.
+// The result is guaranteed ≥ 1 so callers can always build a non-empty
+// blank row / padding; a torn viewport (≤ 0) resolves to 1 cell rather than 0.
 func (s OverlaySize) resolve(viewport int64) int64 {
 	v := s.Value
 	if s.Percent {
@@ -63,8 +65,11 @@ func (s OverlaySize) resolve(viewport int64) int64 {
 	if v < 1 {
 		v = 1
 	}
-	if v > viewport {
+	if viewport > 0 && v > viewport {
 		v = viewport
+	}
+	if v < 1 {
+		v = 1
 	}
 	return v
 }
@@ -134,6 +139,12 @@ func composeOverlays(base []core.Row, overlays []*Overlay, cols, rows int64) []c
 	if len(overlays) == 0 {
 		return base
 	}
+	// Bounds defense: a torn viewport (size read mid-resize) must never
+	// reach blankRow/OverlaySize.resolve. -1/0 cols would panic on
+	// make([]Cell, cols); treat it like renderFrame's fallback.
+	if cols < 1 {
+		cols = 80
+	}
 	// Deep-copy the caller's base: dimBackgroundRows / spliceOverlayRows
 	// mutate cell contents in place. Without this copy we'd corrupt the
 	// caller's slice — and in tests, any reused base would accumulate
@@ -148,6 +159,10 @@ func composeOverlays(base []core.Row, overlays []*Overlay, cols, rows int64) []c
 	}
 	base = clone
 	// Ensure we have at least `rows` lines so bottom-anchored overlays land.
+	// A torn rows value (≤ 0, e.g. mid-resize) degenerates to the base height.
+	if rows < 1 {
+		rows = int64(len(base))
+	}
 	for int64(len(base)) < rows {
 		base = append(base, blankRow(cols))
 	}
@@ -241,6 +256,9 @@ func composeOverlays(base []core.Row, overlays []*Overlay, cols, rows int64) []c
 
 // blankRow returns a Row of `cols` space cells in the default style.
 func blankRow(cols int64) core.Row {
+	if cols < 1 {
+		cols = 1
+	}
 	cells := make([]core.Cell, cols)
 	for i := range cells {
 		cells[i] = core.Cell{Rune: ' ', Width: 1, Style: core.DefaultStyle}

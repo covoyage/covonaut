@@ -2,6 +2,7 @@ package tui
 
 import (
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +22,22 @@ func (k *keyCounterComponent) Update(msg core.Msg) core.Cmd {
 		k.count++
 	}
 	return nil
+}
+
+// TestNormalizeLineTornWidth guards the component-line normaliser against a
+// ≤ 0 width (mid-resize tear): it must fall back to the 80-col default
+// instead of truncating everything to nothing.
+func TestNormalizeLineTornWidth(t *testing.T) {
+	const line = "abcdefghijklmnopqrstuvwxyz"
+	if got := normalizeLine(line, 0); core.VisibleWidth(got) < 26 {
+		t.Fatalf("normalizeLine(width=0) = %q (width %d), want untruncated line", got, core.VisibleWidth(got))
+	}
+	if got := normalizeLine(line, -7); core.VisibleWidth(got) < 26 {
+		t.Fatalf("normalizeLine(width=-7) = %q (width %d), want untruncated line", got, core.VisibleWidth(got))
+	}
+	if got := normalizeLine(strings.Repeat("x", 200), 10); core.VisibleWidth(got) != 10 {
+		t.Fatalf("normalizeLine(width=10) width = %d, want 10", core.VisibleWidth(got))
+	}
 }
 
 // TestStopWithoutStartClosesStdin verifies #1: Stop is safe to call on a TUI

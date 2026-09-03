@@ -169,9 +169,26 @@ func parsePlain(s string, i int) (Key, int) {
 		return Key{Name: "escape", Raw: string(b)}, 1
 	}
 	if b < 0x20 {
-		letter := rune(b) + 'a' - 1
-		if b == 0 {
+		// C0 controls. 0x01–0x1A map to ctrl+a..ctrl+z; the handful of
+		// controls beyond that are canonical ctrl escapes. This canonical
+		// mapping is the C0 fallback for terminals that deliver raw control
+		// bytes (older xterm, raw ptys, tmux passthrough).
+		var letter rune
+		switch b {
+		case 0x00:
 			letter = ' '
+		case 0x1C: // FS — ctrl+\
+			letter = '\\'
+		case 0x1D: // GS — ctrl+]
+			letter = ']'
+		case 0x1E: // RS — ctrl+^
+			letter = '^'
+		case 0x1F: // US — ctrl+_
+			letter = '_'
+		case 0x1B: // ESC is already handled by the caller
+			letter = '['
+		default:
+			letter = rune(b) + 'a' - 1
 		}
 		return Key{
 			Name: string(letter),
@@ -415,6 +432,14 @@ type parsedKeyID struct {
 	mods Modifier
 }
 
+// meaningfulMods strips modifier bits that should never participate in a
+// shortcut match. macOS terminals set Caps/NumLk from OS lock state, and
+// several emulators report Meta/Hyper spuriously (or alias them to Super);
+// a stray bit must not turn a clean "ctrl+p" into a different shortcut.
+func meaningfulMods(m Modifier) Modifier {
+	return m &^ (ModMeta | ModHyper | ModCaps | ModNumLk)
+}
+
 func keysEqual(got Key, want parsedKeyID) bool {
 	if got.Name == "" {
 		return false
@@ -425,9 +450,9 @@ func keysEqual(got Key, want parsedKeyID) bool {
 	// For printable keys, Shift is encoded in the case of the rune, so we
 	// compare mods *excluding* Shift.
 	if len(got.Name) == 1 {
-		return (got.Mods &^ ModShift) == (want.mods &^ ModShift)
+		return (meaningfulMods(got.Mods)&^ModShift) == (meaningfulMods(want.mods)&^ModShift)
 	}
-	return got.Mods == want.mods
+	return meaningfulMods(got.Mods) == meaningfulMods(want.mods)
 }
 
 func parseKeyID(id string) parsedKeyID {

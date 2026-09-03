@@ -262,18 +262,24 @@ func (a *Autocomplete) detectTriggerLocked() (core.AutocompleteProvider, int64, 
 	return nil, -1, ""
 }
 
+// ApplyCurrent injects the highlighted suggestion into the host buffer.
+// It returns the new buffer value and true when a suggestion was applied.
+func (a *Autocomplete) ApplyCurrent() (string, bool) {
+	return a.applyCurrent()
+}
+
 // applyCurrent injects the highlighted suggestion back into the host buffer.
-func (a *Autocomplete) applyCurrent() {
+func (a *Autocomplete) applyCurrent() (string, bool) {
 	a.mu.Lock()
 	item, ok := a.list.CurrentItem()
 	if !ok {
 		a.mu.Unlock()
-		return
+		return "", false
 	}
 	trigger, triggerPos, _ := a.detectTriggerLocked()
 	if trigger == nil {
 		a.mu.Unlock()
-		return
+		return "", false
 	}
 	replace := item.Value
 	if trigger.Trigger() != "" {
@@ -299,6 +305,7 @@ func (a *Autocomplete) applyCurrent() {
 	if fn != nil {
 		fn(newValue, newCursor, suggestion)
 	}
+	return newValue, true
 }
 
 // ---------------------------------------------------------------------------

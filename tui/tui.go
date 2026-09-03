@@ -54,6 +54,12 @@ type TUIOptions struct {
 	// terminal scrollback and gives a clean "app" feel.
 	AltScreen bool
 
+	// Scrollback renders the live frame into a bottom-pinned scroll region of
+	// the main screen, so content written via WriteScrollback scrolls up into
+	// the terminal's native scrollback instead of being overwritten. Mutually
+	// exclusive with AltScreen (Scrollback wins if both are set).
+	Scrollback bool
+
 	// MouseMode enables mouse event reporting. Supported values:
 	//   "" or "off" — no mouse events (default).
 	//   "x11"       — X11-style mouse tracking (basic click/wheel).
@@ -162,9 +168,21 @@ type TUI struct {
 	altScreenOn bool
 	mouseMode   string
 
+	// liveRows is the height of the bottom-pinned scroll region in
+	// scrollback mode. Content written via WriteNativeScrollback scrolls up
+	// into the terminal's native scrollback above this region.
+	liveRows int64
+
 	doneCh chan struct{}
 	tickCh chan struct{}
 	msgCh  chan core.Msg
+
+	// inputCh carries input-priority messages (key presses, pastes, mouse).
+	// They are routed by type in sendMsgSafe and drained by the event loop
+	// BEFORE msgCh, so fast typing is never queued behind a long burst of
+	// async agent updates (which would otherwise make the UI lag the
+	// keystrokes).
+	inputCh chan core.Msg
 
 	// stopped is set atomically BEFORE close(doneCh) in Stop. sendMsgSafe
 	// checks it to decide whether to enqueue, which closes the TOCTOU window
@@ -208,6 +226,7 @@ func NewTUI(term terminal.Terminal, opts ...TUIOptions) *TUI {
 		doneCh:     make(chan struct{}),
 		tickCh:     make(chan struct{}, 1),
 		msgCh:      make(chan core.Msg, 64),
+		inputCh:    make(chan core.Msg, 128),
 		ctx:        ctx,
 		cancel:     cancel,
 	}
@@ -355,6 +374,10 @@ func (t *TUI) Stop() error {
 			// will issue the final pop for the main-screen push.
 			t.term.PopKittyKeyboard()
 			_, _ = t.term.Write([]byte("\x1b[?1049l"))
+		} else if t.options.Scrollback {
+			// Restore the full-screen scroll region before exiting so the
+			// caller's shell isn't left with a leftover DECSTBM.
+			_, _ = t.term.Write([]byte("\x1b[r"))
 		}
 
 		// Restore terminal state BEFORE signaling done, so callers waiting on
@@ -557,14 +580,35 @@ func (t *TUI) eventLoop() {
 	defer ticker.Stop()
 
 	for {
+		// Phase 1 — input priority. Drain every buffered input event first.
+		// While input keeps arriving the loop stays here, so keystrokes /
+		// pastes / mouse never queue behind a burst of async agent msgs.
+		// The batch cap guarantees the loop can't be monopolised forever.
+		t.drainInputBatch(inputDrainBatchMax)
+
+		// Phase 2 — block until work arrives.
+		inputArrived := false
 		select {
 		case <-t.doneCh:
 			return
+		case msg := <-t.inputCh:
+			t.processMsg(msg)
+			inputArrived = true
 		case msg := <-t.msgCh:
 			t.processMsg(msg)
 		case <-t.tickCh:
 		case <-ticker.C:
 		}
+
+		// Phase 3 — coalescing. When the last select did not deliver input,
+		// absorb a small batch of buffered background msgs so bursts (e.g. a
+		// stream of tool updates) render as one frame instead of one per
+		// msg. Input events are never part of this batch: they stay ahead of
+		// msgCh, drained first next iteration.
+		if !inputArrived {
+			t.drainMsgBatch(msgDrainBatchMax)
+		}
+
 		// Promote a pending lone ESC byte into an actual key event so
 		// ESC-only presses reach the application (not just CSI sequences).
 		if t.stdin != nil {
@@ -576,6 +620,44 @@ func (t *TUI) eventLoop() {
 		}
 		t.renderFrame()
 		t.maybeProbeCursor()
+	}
+}
+
+// inputDrainBatchMax caps how many input events the loop processes in a row
+// before checking for stop/done and other lanes. Pastes arrive as a single
+// PasteMsg, so typing bursts rarely exceed this.
+const inputDrainBatchMax = 32
+
+// msgDrainBatchMax caps the coalescing batch drained when idle.
+const msgDrainBatchMax = 16
+
+// drainInputBatch processes up to max queued input events.
+func (t *TUI) drainInputBatch(max int) bool {
+	drained := false
+	for i := 0; i < max; i++ {
+		select {
+		case msg := <-t.inputCh:
+			t.processMsg(msg)
+			drained = true
+		default:
+			return drained
+		}
+	}
+	return drained
+}
+
+// drainMsgBatch processes up to max queued input-or-background msgs when the
+// loop is otherwise idle.
+func (t *TUI) drainMsgBatch(max int) {
+	for i := 0; i < max; i++ {
+		select {
+		case msg := <-t.inputCh:
+			t.processMsg(msg)
+		case msg := <-t.msgCh:
+			t.processMsg(msg)
+		default:
+			return
+		}
 	}
 }
 
@@ -733,9 +815,29 @@ func (t *TUI) sendMsgSafe(msg core.Msg) {
 	if t.stopped.Load() {
 		return // already stopped — drop silently
 	}
+	if isInputMsg(msg) {
+		select {
+		case t.inputCh <- msg:
+		case <-t.doneCh:
+		}
+		return
+	}
 	select {
 	case t.msgCh <- msg:
 	case <-t.doneCh:
+	}
+}
+
+// isInputMsg reports whether msg belongs to the input-priority lane. Key,
+// paste and mouse events are all user-initiated; routing them by type (rather
+// than by caller) means every path that delivers them — stdin handlers,
+// SendMsg, execCmd results — goes through the prioritized lane.
+func isInputMsg(msg core.Msg) bool {
+	switch msg.(type) {
+	case core.KeyMsg, core.PasteMsg, core.MouseMsg:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -821,6 +923,25 @@ func (t *TUI) renderFrame() {
 		}
 	}
 
+	// Scrollback mode: pin the live frame to a scroll region at the bottom of
+	// the terminal. Content emitted above the region via WriteNativeScrollback
+	// then scrolls up into the native scrollback buffer instead of being
+	// overwritten by the next repaint.
+	scrollback := t.options.Scrollback && termRows > 0
+	liveRows := int64(len(rows))
+	regionTop := int64(1) // 1-based terminal row
+	if scrollback {
+		if liveRows > termRows {
+			liveRows = termRows
+		}
+		if liveRows < termRows {
+			regionTop = termRows - liveRows + 1
+		}
+		t.outMu.Lock()
+		t.liveRows = liveRows
+		t.outMu.Unlock()
+	}
+
 	var buf bytes.Buffer
 	if !t.options.DisableSynchronizedOutput {
 		buf.WriteString("\x1b[?2026h")
@@ -842,6 +963,63 @@ func (t *TUI) renderFrame() {
 	// shift every subsequent row; repaint those frames fully so the
 	// terminal state can never drift from the model across transitions.
 	frameMode, frameDiffs, frameMaxDiffRow := "full", 0, int64(0)
+	if scrollback {
+		// Bottom-pinned scroll region. The frame occupies rows
+		// [regionTop, termRows]; DECSTBM confines scrolling to this region
+		// so scrollback writes or cursor motion can't repaint history.
+		buf.WriteString(fmt.Sprintf("\x1b[%d;%dr", regionTop, termRows))
+		buf.WriteString("\x1b[?25l")
+		if first || prevW != cols || len(rows) != len(prev) {
+			t.lastFullPaint = time.Now()
+			buf.WriteString(fmt.Sprintf("\x1b[%d;1H", regionTop))
+			buf.WriteString("\x1b[0J")
+			for i, r := range rows {
+				buf.WriteString(core.SerializeRow(r))
+				buf.WriteString("\x1b[0m")
+				if i < len(rows)-1 {
+					buf.WriteString("\r\n")
+				}
+			}
+		} else {
+			diff := core.DiffRows(prev, rows)
+			frameMode = "diff"
+			frameDiffs = len(diff)
+			for _, d := range diff {
+				if d.Row+1 > frameMaxDiffRow {
+					frameMaxDiffRow = d.Row + 1
+				}
+				fmt.Fprintf(&buf, "\x1b[%d;1H", d.Row+1+regionTop-1)
+				buf.WriteString("\x1b[2K")
+				buf.WriteString(core.SerializeRow(d.Content))
+				buf.WriteString("\x1b[0m")
+			}
+			if len(rows) < len(prev) {
+				fmt.Fprintf(&buf, "\x1b[%d;1H", termRows+1)
+				buf.WriteString("\x1b[0J")
+			}
+		}
+		// Restore the full-screen scroll region for scrollback writes.
+		// DECSTBM home the cursor, so the IME position is applied after.
+		buf.WriteString("\x1b[r\x1b[?7h")
+		if cursorRow >= 0 {
+			fmt.Fprintf(&buf, "\x1b[%d;%dH", cursorRow+1+regionTop-1, cursorCol+1)
+			buf.WriteString("\x1b[?25h")
+		} else {
+			fmt.Fprintf(&buf, "\x1b[%d;1H", termRows)
+			buf.WriteString("\x1b[?25l")
+		}
+		if !t.options.DisableSynchronizedOutput {
+			buf.WriteString("\x1b[?2026l")
+		}
+		t.teeFrame(frameMode, len(rows), termRows, frameDiffs, frameMaxDiffRow, buf.Bytes())
+		_, _ = t.term.Write(buf.Bytes())
+		t.mu.Lock()
+		t.prevFrame = rows
+		t.prevWidth = cols
+		t.firstFrame = false
+		t.mu.Unlock()
+		return
+	}
 	if first || prevW != cols || len(rows) != len(prev) {
 		t.lastFullPaint = time.Now()
 		// Full repaint: write every row from top to bottom.
@@ -909,6 +1087,57 @@ func (t *TUI) renderFrame() {
 
 // EnableMouse enables SGR mouse reporting. Safe to call multiple times.
 func (t *TUI) EnableMouse(mode string) { t.enableMouse(mode) }
+
+// WriteNativeScrollback appends rendered lines to the terminal's native
+// scrollback buffer, above the bottom-pinned live region used in scrollback
+// mode. Each frame re-renders only its own region, so content written here
+// persists in the terminal's history for the user to scroll up through.
+//
+// The implementation mirrors the grok inline model: move to the top of the
+// live region, clear from there down, print the new content, then re-create
+// the live region's blank space at the bottom. Old content above is pushed
+// into native scrollback by the terminal.
+func (t *TUI) WriteNativeScrollback(lines []string) {
+	if !t.options.Scrollback || len(lines) == 0 {
+		return
+	}
+	cols, termRows := t.term.Size()
+	if cols <= 0 || termRows <= 0 {
+		return
+	}
+	t.outMu.Lock()
+	liveRows := t.liveRows
+	t.outMu.Unlock()
+	if liveRows < 1 {
+		liveRows = termRows
+	}
+	if liveRows > termRows {
+		liveRows = termRows
+	}
+	regionTop := termRows - liveRows + 1
+
+	var buf bytes.Buffer
+	buf.WriteString("\x1b[0m")
+	buf.WriteString(fmt.Sprintf("\x1b[%d;1H", regionTop))
+	buf.WriteString("\x1b[0J")
+	buf.WriteString("\x1b[0m")
+	for i, ln := range lines {
+		if i > 0 {
+			buf.WriteString("\r\n")
+		}
+		buf.WriteString(ln)
+	}
+	buf.WriteString("\x1b[0m")
+	// Re-create the live region as blank rows at the bottom so the next
+	// frame render has stable space and the terminal scrolls the printed
+	// content up into history.
+	for i := int64(0); i < liveRows; i++ {
+		buf.WriteString("\r\n\x1b[0m")
+	}
+	buf.WriteString("\x1b[0m")
+	_, _ = t.term.Write(buf.Bytes())
+	t.RequestRender()
+}
 
 // DisableMouse disables SGR mouse reporting.
 func (t *TUI) DisableMouse() { t.disableMouse() }
@@ -1066,6 +1295,9 @@ func (t *TUI) Overlays() []*Overlay {
 // normalizeLine ensures a single component-rendered line fits within `cols`.
 // It truncates with ellipsis and preserves ANSI styles across the cut.
 func normalizeLine(line string, cols int64) string {
+	if cols < 1 {
+		cols = 80
+	}
 	if core.VisibleWidth(line) <= cols {
 		return line
 	}

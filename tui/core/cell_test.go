@@ -491,3 +491,21 @@ func TestTruncateRowCursorColClamped(t *testing.T) {
 		t.Fatalf("cursor col = %d, want 2 (clamped)", row.CursorCol)
 	}
 }
+
+func TestTruncateRowTornWidth(t *testing.T) {
+	row := ParseLine("hello")
+	g := TruncateRow(row, 0)
+	if len(g.Cells) != 0 || g.CursorCol != -1 {
+		t.Fatalf("TruncateRow(width=0) = %+v, want empty row CursorCol=-1", g)
+	}
+	g = TruncateRow(row, -5)
+	if len(g.Cells) != 0 || g.CursorCol != -1 {
+		t.Fatalf("TruncateRow(width=-5) = %+v, want empty row CursorCol=-1", g)
+	}
+	// Raw rows still pass through untouched regardless of torn width.
+	raw := Row{Raw: "\x1b_Gfoo\x1b\\"}
+	g = TruncateRow(raw, -1)
+	if g.Raw != raw.Raw {
+		t.Fatalf("raw row should pass through untouched")
+	}
+}

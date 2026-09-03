@@ -10,6 +10,7 @@ import (
 
 func NewChatApp(cfg chat.ChatAppConfig) *chat.ChatApp {
 	term := terminal.NewProcessTerminal()
+	term.SetTerminalProbe(cfg.ProbeTerminal)
 	if cfg.KittyKeyboardMode != "" {
 		term.SetKittyKeyboardMode(cfg.KittyKeyboardMode)
 	}
@@ -22,14 +23,20 @@ func NewChatApp(cfg chat.ChatAppConfig) *chat.ChatApp {
 		DisableBracketedPaste: cfg.DisableBracketedPaste,
 		Filter:                composeChatFilter(cfg),
 	}
-	if cfg.AltScreen {
+	// Scrollback mode writes completed messages to the terminal's native
+	// scrollback (main screen), so it is mutually exclusive with the
+	// alternate-screen buffer — enable one or the other, never both.
+	if cfg.Scrollback {
+		opts.Scrollback = true
+		opts.AltScreen = false
+	} else if cfg.AltScreen {
 		opts.AltScreen = true
 	}
 	if cfg.MouseMode != "" {
 		opts.MouseMode = cfg.MouseMode
 	}
 	app := NewTUI(term, opts)
-	host := &tuiAppHost{TUI: app}
+	host := &tuiAppHost{TUI: app, scrollback: cfg.Scrollback}
 	cfg.Host = host
 	// Wire the TUI's lifecycle context so OnSubmit submissions are cancelled
 	// when the TUI stops (instead of receiving an un-cancellable
@@ -46,6 +53,8 @@ type tuiAppHost struct {
 	*TUI
 	mu       sync.Mutex
 	overlays map[chat.OverlayRef]*Overlay
+	// scrollback reports whether native scrollback mode is active.
+	scrollback bool
 }
 
 func (h *tuiAppHost) PushOverlay(ov chat.OverlayRef) {
@@ -113,6 +122,27 @@ func (h *tuiAppHost) RemoveOverlay(ov chat.OverlayRef) bool {
 
 func (h *tuiAppHost) TerminalSize() (cols, rows int64) {
 	return h.TUI.Terminal().Size()
+}
+
+// TerminalProbe returns the terminal's resolved capabilities, when the
+// underlying terminal supports reporting them.
+func (h *tuiAppHost) TerminalProbe() (terminal.Capabilities, bool) {
+	tm := h.TUI.Terminal()
+	if cp, ok := tm.(terminal.CapabilitiesProvider); ok {
+		return cp.Capabilities(), true
+	}
+	return terminal.Capabilities{}, false
+}
+
+// WriteScrollback writes rendered lines directly to the terminal's native
+// scrollback buffer. In scrollback mode the TUI renders into a bottom-pinned
+// scroll region, so lines written here persist above the live area instead
+// of being overwritten by the next repaint.
+func (h *tuiAppHost) WriteScrollback(lines []string) {
+	if !h.scrollback || len(lines) == 0 {
+		return
+	}
+	h.WriteNativeScrollback(lines)
 }
 
 func composeChatFilter(cfg chat.ChatAppConfig) func(core.Component, core.Msg) core.Msg {

@@ -402,3 +402,53 @@ func TestComposeOverlayDropShadow(t *testing.T) {
 		}
 	}
 }
+
+// TestComposeOverlaysTornViewport feeds a torn (≤ 0) viewport into
+// composeOverlays — the mid-resize panic regression. It must degrade to the
+// 80-col fallback / base height instead of slicing/allocating at a negative
+// size or letting an overlay resolve to 0×0.
+func TestComposeOverlaysTornViewport(t *testing.T) {
+	base := stringRows(5, 40)
+	ov := &Overlay{
+		Anchor:   AnchorCenter,
+		PercentX: 50, PercentY: 50,
+		Width:  OverlaySize{Value: 20, Percent: true},
+		Height: OverlaySize{Value: 50, Percent: true},
+		Content: &lineComp{lines: []string{"AA", "BB"}},
+	}
+	out := composeOverlays(base, []*Overlay{ov}, 0, 0)
+	if len(out) == 0 {
+		t.Fatal("expected overlay to grow the frame, got empty")
+	}
+	if out[0].VisibleWidth() != 40 || out[0].Cells == nil {
+		t.Fatalf("base rows must preserve their 40-column grid, got width %d cells-nil=%v",
+			out[0].VisibleWidth(), out[0].Cells == nil)
+	}
+
+	neg := composeOverlays(stringRows(3, 10), []*Overlay{ov}, -1, -1)
+	if len(neg) == 0 {
+		t.Fatal("expected rows from negative-viewport compose, got empty")
+	}
+	for i, r := range neg {
+		if r.VisibleWidth() < 10 {
+			t.Fatalf("row %d underflowed to width %d", i, r.VisibleWidth())
+		}
+	}
+
+	// OverlaySize.resolve must never emit 0 even for a zero viewport.
+	s := (OverlaySize{Value: 50, Percent: true}).resolve(0)
+	if s < 1 {
+		t.Fatalf("resolve(0) = %d, want ≥ 1", s)
+	}
+}
+
+// TestBlankRowTornWidth guards blankRow against a negative column count
+// (make([]Cell, -1) would panic).
+func TestBlankRowTornWidth(t *testing.T) {
+	if r := blankRow(0); len(r.Cells) != 1 {
+		t.Fatalf("blankRow(0) cells = %d, want 1", len(r.Cells))
+	}
+	if r := blankRow(-3); len(r.Cells) != 1 {
+		t.Fatalf("blankRow(-3) cells = %d, want 1", len(r.Cells))
+	}
+}

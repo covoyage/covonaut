@@ -315,6 +315,12 @@ func TestEditorPasteChipDeletesAtomically(t *testing.T) {
 	e := NewEditor(nil)
 	e.SetFocused(true)
 	e.SetValue("x[Pasted ~2 lines]y")
+	e.mu.RLock()
+	if n := len(e.lines[0]); n != 3 {
+		e.mu.RUnlock()
+		t.Fatalf("chip should occupy one rune, buffer len=%d", n)
+	}
+	e.mu.RUnlock()
 	e.Update(core.KeyMsg{Data: "\x7f"}) // backspace at end
 	if got := e.GetValue(); got != "x[Pasted ~2 lines]" {
 		t.Fatalf("first backspace should delete trailing y, got %q", got)
@@ -322,6 +328,20 @@ func TestEditorPasteChipDeletesAtomically(t *testing.T) {
 	e.Update(core.KeyMsg{Data: "\x7f"})
 	if got := e.GetValue(); got != "x" {
 		t.Fatalf("second backspace should delete whole chip, got %q", got)
+	}
+}
+
+func TestEditorPasteChipRendersLabelNotMark(t *testing.T) {
+	e := NewEditor(nil)
+	e.SetFocused(true)
+	e.SetValue("[Pasted ~5 lines]")
+	lines := e.Render(40)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "[Pasted ~5 lines]") {
+		t.Fatalf("render missing chip label: %q", joined)
+	}
+	if strings.ContainsRune(joined, chipMarkBase) {
+		t.Fatalf("render leaked chip mark: %q", joined)
 	}
 }
 
@@ -335,6 +355,53 @@ func TestEditorPasteChipInsertsBeforeNotInside(t *testing.T) {
 	e.Update(core.KeyMsg{Data: "z"})
 	if got := e.GetValue(); got != "z[Pasted ~2 lines]" {
 		t.Fatalf("typing at chip start should insert before, got %q", got)
+	}
+}
+
+func TestEditorCaptureRestoreDraft(t *testing.T) {
+	e := NewEditor(nil)
+	e.SetFocused(true)
+	e.SetValue("hello\nworld")
+	e.mu.Lock()
+	e.row = 0
+	e.col = 2
+	e.mu.Unlock()
+
+	draft := e.CaptureDraft()
+	e.SetValue("other")
+	e.RestoreDraft(draft)
+	if got := e.GetValue(); got != "hello\nworld" {
+		t.Fatalf("text: want %q, got %q", "hello\nworld", got)
+	}
+	e.mu.RLock()
+	row, col := e.row, e.col
+	e.mu.RUnlock()
+	if row != 0 || col != 2 {
+		t.Fatalf("cursor: want 0,2 got %d,%d", row, col)
+	}
+
+	e.SetValue("x[Pasted ~2 lines]y")
+	chipDraft := e.CaptureDraft()
+	e.SetValue("cleared")
+	e.RestoreDraft(chipDraft)
+	if got := e.GetValue(); got != "x[Pasted ~2 lines]y" {
+		t.Fatalf("chip text: want restored, got %q", got)
+	}
+	e.mu.RLock()
+	n := len(e.lines[0])
+	e.mu.RUnlock()
+	if n != 3 {
+		t.Fatalf("chip should occupy one rune after restore, buffer len=%d", n)
+	}
+	e.Update(core.KeyMsg{Data: "\x7f"})
+	e.Update(core.KeyMsg{Data: "\x7f"})
+	if got := e.GetValue(); got != "x" {
+		t.Fatalf("chip should delete atomically after restore, got %q", got)
+	}
+
+	e.RestoreDraft(EditorDraft{})
+	if got := e.GetValue(); got != "" {
+		t.Fatalf("empty draft should clear, got %q", got)
 	}
 }
 

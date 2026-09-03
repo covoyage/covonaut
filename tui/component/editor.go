@@ -3,7 +3,6 @@ package component
 import (
 	"strings"
 	"sync"
-	"unicode/utf8"
 
 	"github.com/covoyage/covonaut/tui/core"
 	"github.com/covoyage/covonaut/tui/terminal"
@@ -94,6 +93,9 @@ type Editor struct {
 
 	burst pasteBurst
 
+	chips    map[rune]string
+	nextChip rune
+
 	// Optional vim modal editing. When enabled, the editor starts in insert
 	// mode so typing still works; Esc enters normal mode (hjkl / i / a / x / dd).
 	vimEnabled bool
@@ -103,6 +105,7 @@ type Editor struct {
 
 type editorSnapshot struct {
 	lines [][]rune
+	chips map[rune]string
 	row   int64
 	col   int64
 }
@@ -225,6 +228,7 @@ func (e *Editor) SetPaddingX(n int64) {
 func (e *Editor) SetValue(s string) {
 	e.mu.Lock()
 	e.pushSnapshotLocked()
+	s = e.encodeChipsLocked(s)
 	raw := strings.Split(s, "\n")
 	lines := make([][]rune, 0, len(raw))
 	for _, line := range raw {
@@ -306,9 +310,80 @@ func (e *Editor) GetValue() string {
 func (e *Editor) valueLocked() string {
 	segs := make([]string, len(e.lines))
 	for i, ln := range e.lines {
-		segs[i] = string(ln)
+		segs[i] = e.expandLineLocked(ln)
 	}
 	return strings.Join(segs, "\n")
+}
+
+// EditorDraft is a composer snapshot: buffer, paste-chip map, and cursor.
+type EditorDraft struct {
+	Lines [][]rune
+	Chips map[rune]string
+	Row   int64
+	Col   int64
+}
+
+// Empty reports whether the draft has no buffer content.
+func (d EditorDraft) Empty() bool {
+	if len(d.Lines) == 0 {
+		return true
+	}
+	return len(d.Lines) == 1 && len(d.Lines[0]) == 0
+}
+
+// CaptureDraft copies the current buffer, chips, and cursor.
+func (e *Editor) CaptureDraft() EditorDraft {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return EditorDraft{
+		Lines: cloneRuneLines(e.lines),
+		Chips: cloneChipMap(e.chips),
+		Row:   e.row,
+		Col:   e.col,
+	}
+}
+
+// RestoreDraft replaces the buffer with a previously captured draft.
+func (e *Editor) RestoreDraft(d EditorDraft) {
+	e.mu.Lock()
+	e.pushSnapshotLocked()
+	if d.Empty() {
+		e.lines = [][]rune{{}}
+		e.chips = nil
+		e.nextChip = chipMarkBase
+		e.row = 0
+		e.col = 0
+	} else {
+		e.lines = cloneRuneLines(d.Lines)
+		e.chips = cloneChipMap(d.Chips)
+		e.nextChip = chipMarkBase
+		e.row = d.Row
+		e.col = d.Col
+		if len(e.lines) == 0 {
+			e.lines = [][]rune{{}}
+		}
+		if e.row < 0 {
+			e.row = 0
+		}
+		if e.row >= int64(len(e.lines)) {
+			e.row = int64(len(e.lines) - 1)
+		}
+		if e.col < 0 {
+			e.col = 0
+		}
+		if e.col > int64(len(e.lines[e.row])) {
+			e.col = int64(len(e.lines[e.row]))
+		}
+	}
+	e.allSelected = false
+	e.clearMouseSelectionLocked()
+	e.ghostText = ""
+	fn := e.onChange
+	v := e.valueLocked()
+	e.mu.Unlock()
+	if fn != nil {
+		fn(v)
+	}
 }
 
 // Clear empties the buffer.
@@ -353,7 +428,7 @@ func (e *Editor) GetSelectedText() string {
 		if hi < lo {
 			hi = lo
 		}
-		b.WriteString(string(line[lo:hi]))
+		b.WriteString(e.expandLineLocked(line[lo:hi]))
 		if r != end.row {
 			b.WriteByte('\n')
 		}
@@ -470,7 +545,7 @@ func (e *Editor) hitTestLocked(screenRow, screenCol int64) (row, col int64, ok b
 		segEnd = segStart
 	}
 	seg := line[segStart:segEnd]
-	idx := runeIndexAtCell(seg, innerCol)
+	idx := e.runeIndexAtCellLocked(seg, innerCol)
 	return v.hardRow, segStart + idx, true
 }
 
@@ -595,7 +670,7 @@ func (e *Editor) Render(width int64) []string {
 			if !composerFirst {
 				w = contInner
 			}
-			slice := core.SliceRunesByCells(ln, core.CellWidthOfRunes(ln, 0, offset), core.CellWidthOfRunes(ln, 0, offset)+w)
+			slice := e.sliceByCellsLocked(ln, e.cellWidthLocked(ln, 0, offset), e.cellWidthLocked(ln, 0, offset)+w)
 			if slice.EndR == slice.StartR {
 				// cannot fit any rune (edge case) — just take 1 rune
 				slice.StartR = offset
@@ -626,7 +701,7 @@ func (e *Editor) Render(width int64) []string {
 			segEnd := v.colOffset + segLen
 			if e.col >= v.colOffset && e.col <= segEnd {
 				cursorV = int64(vi)
-				cursorCol = core.CellWidthOfRunes(e.lines[e.row], v.colOffset, e.col)
+				cursorCol = e.cellWidthLocked(e.lines[e.row], v.colOffset, e.col)
 				break
 			}
 		}
@@ -654,21 +729,22 @@ func (e *Editor) Render(width int64) []string {
 			useFirstPrompt: useFirstPrompt,
 		})
 
+		display := e.expandLineLocked(segRunes)
 		var bodyText string
 		switch {
-		case e.allSelected && v.text != "":
-			bodyText = "\x1b[48;5;33m" + core.StripAnsi(textFn(v.text)) + "\x1b[0m"
+		case e.allSelected && display != "":
+			bodyText = "\x1b[48;5;33m" + core.StripAnsi(textFn(display)) + "\x1b[0m"
 		case hasSel:
 			if from, to, ok := selRangeInSegment(v.hardRow, v.colOffset, segLen, selStart, selEnd); ok && from < to {
-				before := string(segRunes[:from])
-				sel := string(segRunes[from:to])
-				after := string(segRunes[to:])
+				before := e.expandLineLocked(segRunes[:from])
+				sel := e.expandLineLocked(segRunes[from:to])
+				after := e.expandLineLocked(segRunes[to:])
 				bodyText = before + "\x1b[48;5;33m" + sel + "\x1b[0m" + after
 			} else {
-				bodyText = textFn(v.text)
+				bodyText = textFn(display)
 			}
 		default:
-			bodyText = textFn(v.text)
+			bodyText = textFn(display)
 		}
 
 		body := core.PadToWidth(bodyText, innerW)
@@ -678,7 +754,7 @@ func (e *Editor) Render(width int64) []string {
 			// after the cursor, only on the first segment of the cursor row.
 			if e.ghostText != "" && v.hardRow == e.ghostRow && v.isFirstSeg {
 				ghostRunes := []rune(e.ghostText)
-				// Truncate ghost to fit remaining width
+				// Truncate ge.cellWidthLocked width
 				usedCells := core.CellWidthOfRunes(e.lines[e.row], 0, e.col)
 				remaining := innerW - usedCells
 				if remaining > 0 && int64(len(ghostRunes)) > 0 {
@@ -1118,9 +1194,6 @@ func (e *Editor) insertRune(r rune) {
 	if e.allSelected {
 		e.clearSelectionContentLocked()
 	}
-	if start, end, ok := chipSpanAtLocked(e.lines, e.row, e.col, 1); ok && e.col != start.col {
-		e.col = end.col
-	}
 	if r == '\n' {
 		cur := e.lines[e.row]
 		before := append([]rune{}, cur[:e.col]...)
@@ -1187,11 +1260,6 @@ func (e *Editor) moveCursor(dRow, dCol int64) {
 				e.col = int64(len(e.lines[e.row]))
 			}
 		}
-		if dCol < 0 {
-			e.skipChipLocked(-1)
-		} else {
-			e.skipChipLocked(1)
-		}
 	}
 	e.lastKill = false
 	e.mu.Unlock()
@@ -1235,9 +1303,7 @@ func (e *Editor) deleteBackward() {
 		}
 		return
 	}
-	if start, end, ok := chipSpanAtLocked(e.lines, e.row, e.col, -1); ok {
-		e.deleteSpanLocked(start, end)
-	} else if e.col == 0 {
+	if e.col == 0 {
 		if e.row == 0 {
 			e.mu.Unlock()
 			return
@@ -1278,21 +1344,17 @@ func (e *Editor) deleteForward() {
 		}
 		return
 	}
-	if start, end, ok := chipSpanAtLocked(e.lines, e.row, e.col, 1); ok {
-		e.deleteSpanLocked(start, end)
-	} else {
-		cur := e.lines[e.row]
-		if e.col >= int64(len(cur)) {
-			if e.row >= int64(len(e.lines)-1) {
-				e.mu.Unlock()
-				return
-			}
-			next := e.lines[e.row+1]
-			e.lines[e.row] = append(cur, next...)
-			e.lines = append(e.lines[:e.row+1], e.lines[e.row+2:]...)
-		} else {
-			e.lines[e.row] = append(cur[:e.col], cur[e.col+1:]...)
+	cur := e.lines[e.row]
+	if e.col >= int64(len(cur)) {
+		if e.row >= int64(len(e.lines)-1) {
+			e.mu.Unlock()
+			return
 		}
+		next := e.lines[e.row+1]
+		e.lines[e.row] = append(cur, next...)
+		e.lines = append(e.lines[:e.row+1], e.lines[e.row+2:]...)
+	} else {
+		e.lines[e.row] = append(cur[:e.col], cur[e.col+1:]...)
 	}
 	fn := e.onChange
 	v := e.valueLocked()
@@ -1505,83 +1567,11 @@ func (e *Editor) yankPop() {
 	}
 }
 
-func (e *Editor) skipChipLocked(dir int64) {
-	start, end, ok := chipSpanAtLocked(e.lines, e.row, e.col, dir)
-	if !ok {
-		return
-	}
-	if dir < 0 {
-		e.col = start.col
-	} else {
-		e.col = end.col
-	}
-}
-
-func (e *Editor) deleteSpanLocked(start, end editorSelPos) {
-	if start.row != end.row || start.row < 0 || start.row >= int64(len(e.lines)) {
-		return
-	}
-	line := e.lines[start.row]
-	if start.col < 0 {
-		start.col = 0
-	}
-	if end.col > int64(len(line)) {
-		end.col = int64(len(line))
-	}
-	if end.col < start.col {
-		return
-	}
-	e.lines[start.row] = append(line[:start.col], line[end.col:]...)
-	e.row = start.row
-	e.col = start.col
-}
-
-const editorPasteChipPrefix = "[Pasted ~"
-
-func chipSpansInLine(line []rune) [][2]int64 {
-	s := string(line)
-	var spans [][2]int64
-	from := 0
-	for {
-		rel := strings.Index(s[from:], editorPasteChipPrefix)
-		if rel < 0 {
-			return spans
-		}
-		i := from + rel
-		j := strings.Index(s[i:], "]")
-		if j < 0 {
-			return spans
-		}
-		j += i + 1
-		start := int64(utf8.RuneCountInString(s[:i]))
-		end := int64(utf8.RuneCountInString(s[:j]))
-		spans = append(spans, [2]int64{start, end})
-		from = j
-	}
-}
-
-func chipSpanAtLocked(lines [][]rune, row, col, dir int64) (start, end editorSelPos, ok bool) {
-	if row < 0 || row >= int64(len(lines)) {
-		return editorSelPos{}, editorSelPos{}, false
-	}
-	for _, sp := range chipSpansInLine(lines[row]) {
-		if dir < 0 {
-			if col > sp[0] && col <= sp[1] {
-				return editorSelPos{row: row, col: sp[0]}, editorSelPos{row: row, col: sp[1]}, true
-			}
-			continue
-		}
-		if col >= sp[0] && col < sp[1] {
-			return editorSelPos{row: row, col: sp[0]}, editorSelPos{row: row, col: sp[1]}, true
-		}
-	}
-	return editorSelPos{}, editorSelPos{}, false
-}
-
 func (e *Editor) insertStringLocked(s string) {
 	if e.allSelected {
 		e.clearSelectionContentLocked()
 	}
+	s = e.encodeChipsLocked(s)
 	for _, r := range s {
 		if r == '\n' {
 			cur := e.lines[e.row]
@@ -1648,6 +1638,7 @@ func (e *Editor) removeBeforeCursorLocked(n int64) {
 
 func (e *Editor) pushSnapshotLocked() {
 	snap := editorSnapshot{
+		chips: cloneChipMap(e.chips),
 		lines: cloneRuneLines(e.lines),
 		row:   e.row,
 		col:   e.col,
@@ -1668,6 +1659,7 @@ func (e *Editor) undo() {
 	}
 	current := editorSnapshot{
 		lines: cloneRuneLines(e.lines),
+		chips: cloneChipMap(e.chips),
 		row:   e.row,
 		col:   e.col,
 	}
@@ -1675,6 +1667,7 @@ func (e *Editor) undo() {
 	e.history = e.history[:len(e.history)-1]
 	e.future = append(e.future, current)
 	e.lines = snap.lines
+	e.chips = cloneChipMap(snap.chips)
 	e.row = snap.row
 	e.col = snap.col
 	e.allSelected = false
@@ -1695,6 +1688,7 @@ func (e *Editor) redo() {
 	}
 	current := editorSnapshot{
 		lines: cloneRuneLines(e.lines),
+		chips: cloneChipMap(e.chips),
 		row:   e.row,
 		col:   e.col,
 	}
@@ -1702,6 +1696,7 @@ func (e *Editor) redo() {
 	e.future = e.future[:len(e.future)-1]
 	e.history = append(e.history, current)
 	e.lines = snap.lines
+	e.chips = cloneChipMap(snap.chips)
 	e.row = snap.row
 	e.col = snap.col
 	e.allSelected = false
@@ -1799,6 +1794,7 @@ func (e *Editor) historyNext() bool {
 
 // setValueLocked overwrites the buffer without pushing an undo snapshot.
 func (e *Editor) setValueLocked(s string) {
+	s = e.encodeChipsLocked(s)
 	raw := strings.Split(s, "\n")
 	lines := make([][]rune, 0, len(raw))
 	for _, line := range raw {

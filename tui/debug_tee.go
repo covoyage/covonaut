@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -24,10 +25,16 @@ import (
 // it and the alerts around that moment.
 // ---------------------------------------------------------------------------
 
+// tee state is shared between the single event-loop goroutine (which writes
+// frames) and any goroutine calling Start/Stop (which opens/closes the file).
+// teeActive is a lock-free fast path for the hot render loop; teeMu guards
+// the teeFile pointer so Close and in-flight frame writes cannot interleave.
 var (
-	teeFile   *os.File
-	teeFrame  atomic.Int64
-	teeActive bool
+	teeMu        sync.RWMutex
+	teeFile      *os.File
+	teeFrame     atomic.Int64
+	teeActive    atomic.Bool
+	lastDSRProbe atomic.Int64
 )
 
 func teeInit() {
@@ -49,13 +56,15 @@ func teeInit() {
 	if err != nil {
 		return
 	}
+	teeMu.Lock()
 	teeFile = f
-	teeActive = true
+	teeMu.Unlock()
+	teeActive.Store(true)
 }
 
 // teeFrame records one frame's metadata and raw byte stream.
 func (t *TUI) teeFrame(mode string, rows int, termRows int64, diffs int, maxDiffRow int64, buf []byte) {
-	if !teeActive {
+	if !teeActive.Load() {
 		return
 	}
 	var alerts []string
@@ -73,22 +82,26 @@ func (t *TUI) teeFrame(mode string, rows int, termRows int64, diffs int, maxDiff
 	var b strings.Builder
 	fmt.Fprintf(&b, "=== frame %d mode=%s rows=%d termRows=%d diffs=%d alerts=%s len=%d\n",
 		n, mode, rows, termRows, diffs, alertStr, len(buf))
+	teeMu.RLock()
 	if teeFile != nil {
 		_, _ = teeFile.WriteString(b.String())
 		_, _ = teeFile.Write(buf)
 		_, _ = teeFile.WriteString("\n")
 	}
+	teeMu.RUnlock()
 	if len(alerts) > 0 {
 		_, _ = fmt.Fprintf(os.Stderr, "covo-tui-debug: %s\n", alertStr)
 	}
 }
 
 func teeClose() {
+	teeMu.Lock()
 	if teeFile != nil {
 		_ = teeFile.Close()
 		teeFile = nil
 	}
-	teeActive = false
+	teeMu.Unlock()
+	teeActive.Store(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -102,16 +115,15 @@ var dsrReplyRe = regexp.MustCompile(`\x1b\[(\d+);(\d+)R`)
 
 const dsrProbeInterval = 2 * time.Second
 
-var lastDSRProbe time.Time
-
 // maybeProbeCursor emits a home-position + DSR query when the probe interval
 // has elapsed. Called from the event loop between frames.
 func (t *TUI) maybeProbeCursor() {
-	if !teeActive {
+	if !teeActive.Load() {
 		return
 	}
-	if now := time.Now(); now.Sub(lastDSRProbe) >= dsrProbeInterval {
-		lastDSRProbe = now
+	now := time.Now().UnixNano()
+	if now-lastDSRProbe.Load() >= int64(dsrProbeInterval) {
+		lastDSRProbe.Store(now)
 		_, _ = t.term.Write([]byte("\x1b[1;1H\x1b[6n"))
 	}
 }
@@ -119,7 +131,7 @@ func (t *TUI) maybeProbeCursor() {
 // interceptDSRReply scans raw input for a DSR cursor-position reply, logs
 // the real-vs-expected offset, and reports whether the bytes were consumed.
 func interceptDSRReply(data []byte) (consumed []byte, handled bool) {
-	if !teeActive {
+	if !teeActive.Load() {
 		return data, false
 	}
 	if m := dsrReplyRe.FindIndex(data); m != nil && m[0] == 0 {
@@ -131,9 +143,11 @@ func interceptDSRReply(data []byte) (consumed []byte, handled bool) {
 		if row != 1 {
 			entry += fmt.Sprintf("!!! SCREEN_SHIFTED rows=%d — terminal grid diverged from model\n", row-1)
 		}
+		teeMu.RLock()
 		if teeFile != nil {
 			_, _ = teeFile.WriteString(entry)
 		}
+		teeMu.RUnlock()
 		_, _ = fmt.Fprint(os.Stderr, "covo-tui-debug: "+entry)
 		rest := data[m[1]:]
 		return rest, true

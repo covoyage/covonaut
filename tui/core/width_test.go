@@ -53,6 +53,13 @@ func TestPadToWidth(t *testing.T) {
 	if VisibleWidth(got) != 5 {
 		t.Errorf("PadToWidth visible width = %d, want 5 (got %q)", VisibleWidth(got), got)
 	}
+	// Torn negative width must not panic (strings.Repeat negative count).
+	if got := PadToWidth("hi", -3); got != "hi" {
+		t.Errorf("PadToWidth(-3) = %q, want unchanged %q", got, "hi")
+	}
+	if got := PadToWidth("hi", 0); got != "hi" {
+		t.Errorf("PadToWidth(0) = %q, want unchanged %q", got, "hi")
+	}
 }
 
 func TestWrapAnsi(t *testing.T) {

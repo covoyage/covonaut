@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/term"
 )
@@ -83,6 +84,14 @@ type ProcessTerminal struct {
 	// only on terminals that advertise support via env variables.
 	enableKittyKeyboard kittyKeyboardMode
 	kittyFlags          int64
+
+	// probeEnable, when true, runs a bounded DA1/DA2/XTVERSION capability
+	// probe during Start (see probe.go). Replies are parsed in the read loop;
+	// the env fast path is honored — terminals that already advertise support
+	// skip the probe.
+	probeEnable bool
+	probe       *probeState // guarded by mu; nil unless probing
+	caps        atomic.Pointer[Capabilities]
 }
 
 type kittyKeyboardMode int64
@@ -119,6 +128,26 @@ func (t *ProcessTerminal) SetKittyKeyboardMode(mode string) {
 	default:
 		t.enableKittyKeyboard = kittyKbdAuto
 	}
+}
+
+// SetTerminalProbe enables or disables the active capability probe. When
+// enabled, Start emits DA1/DA2/XTVERSION queries and the read loop parses the
+// replies in-band until the probe deadline (ProbeTimeout). Terminals that
+// advertise kitty keyboard support via env vars skip the probe.
+func (t *ProcessTerminal) SetTerminalProbe(enable bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.probeEnable = enable
+}
+
+// Capabilities returns the resolved terminal capabilities. If the probe has
+// not completed yet (or was disabled), an env-derived result is returned.
+// Safe to call from any goroutine.
+func (t *ProcessTerminal) Capabilities() Capabilities {
+	if c := t.caps.Load(); c != nil {
+		return *c
+	}
+	return capabilitiesFromEnv()
 }
 
 // SetKittyKeyboardFlags overrides the progressive-enhancement flags pushed
@@ -189,9 +218,27 @@ func (t *ProcessTerminal) Start(onInput func(data []byte), onResize func()) erro
 		SetKittyProtocolActive(true)
 	}
 
+	// Capability probe: emit the queries now; replies are parsed in-band by
+	// the read loop (input is never lost — unmatched bytes are forwarded).
+	var probe *probeState
+	startProbe := t.probeEnable
+	if startProbe && t.enableKittyKeyboard == kittyKbdAuto && TerminalSupportsKittyKeyboard() {
+		// Env fast path: the terminal already advertises kitty keyboard
+		// support, so a probe would add latency without new information.
+		startProbe = false
+	}
+	if startProbe {
+		probe = newProbeState(time.Now().Add(ProbeTimeout))
+		t.probe = probe
+		_, _ = t.out.WriteString(terminalCapabilityQueries())
+	}
+
 	t.mu.Unlock()
 
 	go t.readLoop()
+	if startProbe {
+		go t.finishProbeAfterTimeout(probe)
+	}
 	go t.resizeLoop()
 	return nil
 }
@@ -233,10 +280,14 @@ func (t *ProcessTerminal) Stop() error {
 		_ = readFile.Close()
 	}
 
-	// Closing the private input handle interrupts any pending read.
-	<-t.readDone
-	// Wait for the resize loop to observe the closed resizeSig and exit.
-	<-t.resizeDone
+	select {
+	case <-t.readDone:
+	case <-time.After(300 * time.Millisecond):
+	}
+	select {
+	case <-t.resizeDone:
+	case <-time.After(300 * time.Millisecond):
+	}
 
 	_, _ = t.out.WriteString("\x1b[?2004l") // disable bracketed paste
 	if kittyKbdOn {
@@ -335,11 +386,80 @@ func (t *ProcessTerminal) readLoop() {
 		}
 		n, err := readFile.Read(buf)
 		if n > 0 && t.onInput != nil {
-			cp := make([]byte, n)
-			copy(cp, buf[:n])
-			t.onInput(cp)
+			chunk := make([]byte, n)
+			copy(chunk, buf[:n])
+			t.mu.Lock()
+			var toInput []byte
+			if p := t.probe; p != nil {
+				// Fast path: no reply frame is mid-assembly and this chunk
+				// cannot start one (reply frames always begin with ESC), so
+				// hand it straight through. The long-lived lax probe must not
+				// add per-keystroke cost on the common hot path.
+				if len(p.buf) == 0 && chunk[0] != 0x1b {
+					toInput = chunk
+				} else {
+					toInput = t.routeProbeLocked(p, chunk)
+				}
+			} else {
+				toInput = chunk
+			}
+			t.mu.Unlock()
+			if len(toInput) > 0 {
+				t.onInput(toInput)
+			}
 		}
 		if err != nil {
+			return
+		}
+	}
+}
+
+// routeProbeLocked feeds a stdin chunk to the active probe, returning the
+// bytes that belong to the user (not the probe). When the probe completes — a
+// reply arrived or the deadline passed — capabilities are stored once and the
+// probe transitions to lax mode: it stays installed to swallow any late or
+// fragmented reply frames (see probeState.lax) rather than being torn down.
+// Callers hold t.mu.
+func (t *ProcessTerminal) routeProbeLocked(p *probeState, chunk []byte) []byte {
+	toInput, done := p.feed(chunk)
+	if done || (!p.lax && time.Now().After(p.deadline)) {
+		toInput = append(toInput, p.drain()...)
+		p.lax = true
+		caps := capabilitiesFromProbe(p, capabilitiesFromEnv())
+		t.caps.Store(&caps)
+		// A probe-verified kitty-capable terminal that the env fast path
+		// missed: push the kitty keyboard protocol now that we know.
+		if caps.KittyKeyboard && t.enableKittyKeyboard == kittyKbdAuto && !t.kittyKbdOn {
+			fmt.Fprintf(t.out, "\x1b[>%du", t.kittyFlags)
+			t.kittyKbdOn = true
+			SetKittyProtocolActive(true)
+		}
+	}
+	return toInput
+}
+
+// finishProbeAfterTimeout finalizes the probe even when the terminal never
+// responds (e.g. stdin is a pipe or the reply was lost). Keeps Start
+// non-blocking: this runs up to ProbeTimeout after Start returns.
+func (t *ProcessTerminal) finishProbeAfterTimeout(p *probeState) {
+	timer := time.NewTimer(ProbeTimeout + 20*time.Millisecond)
+	defer timer.Stop()
+	for {
+		select {
+		case <-timer.C:
+			t.mu.Lock()
+			if t.probe == p {
+				leftover := t.routeProbeLocked(p, nil)
+				t.mu.Unlock()
+				if len(leftover) > 0 && t.onInput != nil {
+					t.onInput(leftover)
+				}
+			} else {
+				// Already finalized by the read loop.
+				t.mu.Unlock()
+			}
+			return
+		case <-t.stopRead:
 			return
 		}
 	}

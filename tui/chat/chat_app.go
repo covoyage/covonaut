@@ -34,6 +34,12 @@ type AppHost interface {
 	// native right-click menu can appear.
 	EnableMouse(mode string)
 	DisableMouse()
+
+	// WriteScrollback writes rendered lines directly to the terminal's
+	// native scrollback buffer (main screen). Used by ChatHistory in
+	// scrollback mode to finalize completed messages without keeping
+	// them in the live viewport.
+	WriteScrollback(lines []string)
 }
 
 type OverlayRef interface {
@@ -57,6 +63,21 @@ type ChatAppConfig struct {
 	DisableBracketedPaste bool
 	AltScreen             bool
 	MouseMode             string
+
+	// ProbeTerminal runs a bounded DA1/DA2/XTVERSION capability probe at
+	// startup so the engine can detect terminals that don't advertise
+	// support via env vars (e.g. foot, remote hosts under tmux passthrough).
+	// Terminals already detected via env skip the probe.
+	ProbeTerminal bool
+
+	// Scrollback enables native scrollback mode: completed assistant
+	// messages are written directly to terminal scrollback (via
+	// AppHost.WriteScrollback) and excluded from the live viewport.
+	// The live area shows only pending content pinned at the bottom.
+	// Default is false: ChatHistory virtualizes the in-app viewport
+	// (per-message line cache, assemble only the visible window) and
+	// keeps the full transcript in the component tree.
+	Scrollback bool
 
 	EditorMinRows int64
 	EditorMaxRows int64
@@ -367,6 +388,13 @@ func (a *ChatApp) SetHost(host AppHost) {
 	a.loader = component.NewLoader(host.RequestRender, theme.CurrentPalette().Dim.Render("thinking..."))
 	a.layout.loader = a.loader
 	a.history.SetOnInvalidate(host.RequestRender)
+	// Native scrollback mode: completed assistant messages are emitted to
+	// terminal scrollback and left out of the live viewport.
+	if a.cfg.Scrollback {
+		a.history.SetScrollback(true, func(lines []string) {
+			host.WriteScrollback(lines)
+		})
+	}
 }
 
 func (a *ChatApp) Host() AppHost { return a.host }
@@ -402,6 +430,7 @@ func (a *ChatApp) Footer() core.Component {
 
 func (a *ChatApp) Start() error {
 	a.host.AddChild(a.layout)
+	a.host.Focus(a.editor)
 	if err := a.host.Start(); err != nil {
 		return err
 	}
@@ -626,11 +655,18 @@ func (a *ChatApp) prepareComposerValue(value string) string {
 }
 
 func (a *ChatApp) onEditorSubmit(value string) {
-	a.commitComposer(value, false)
+	a.commitComposer(a.liveComposerValue(value), false)
 }
 
 func (a *ChatApp) onEditorQueue(value string) {
-	a.commitComposer(value, true)
+	a.commitComposer(a.liveComposerValue(value), true)
+}
+
+func (a *ChatApp) liveComposerValue(fallback string) string {
+	if a.editor == nil {
+		return fallback
+	}
+	return a.editor.GetValue()
 }
 
 func (a *ChatApp) commitComposer(value string, queue bool) {
@@ -641,9 +677,14 @@ func (a *ChatApp) commitComposer(value string, queue bool) {
 		return
 	}
 	if a.ac != nil && a.ac.Active() {
-		// Autocomplete is active — let chatLayout forward the key to it.
-		a.mu.Unlock()
-		return
+		if strings.HasPrefix(strings.TrimSpace(value), "/") {
+			if next, ok := a.ac.ApplyCurrent(); ok {
+				value = next
+			}
+		} else {
+			a.mu.Unlock()
+			return
+		}
 	}
 	if a.ac != nil {
 		a.ac.Hide()
@@ -1084,6 +1125,9 @@ func (a *ChatApp) finalizeStreamLocked() {
 	if id != "" {
 		a.history.Finalize(id)
 	}
+	// Always try to emit any remaining un-emitted user prompts, covering
+	// the case where the agent produced only tool calls with no text.
+	a.history.emitPendingTurn()
 }
 
 func (a *ChatApp) TerminalSize() (cols, rows int64) {

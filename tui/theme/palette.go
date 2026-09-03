@@ -21,6 +21,15 @@ type Palette struct {
 
 var atomicPalette atomic.Pointer[Palette]
 
+// paletteRevision ticks every time the palette is swapped. Render caches
+// (markdown checkpoints) key their freshness on it so a theme change
+// invalidates them without a full source comparison.
+var paletteRevision atomic.Uint64
+
+// PaletteRevision returns the current palette generation number. Any render
+// memo keyed on this value is stale once it changes.
+func PaletteRevision() uint64 { return paletteRevision.Load() }
+
 func CurrentPalette() *Palette {
 	p := atomicPalette.Load()
 	if p == nil {
@@ -181,6 +190,7 @@ func BuildPalette(sem *SemanticTheme, mode ColorMode) *Palette {
 func SyncPaletteGlobals(sem *SemanticTheme, mode ColorMode) {
 	p := BuildPalette(sem, mode)
 	atomicPalette.Store(p)
+	paletteRevision.Add(1)
 	StyleUser = p.User
 	StyleAssistant = p.Assistant
 	StyleSystem = p.System

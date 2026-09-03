@@ -4,6 +4,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/covoyage/covonaut/tui/component"
+	"github.com/covoyage/covonaut/tui/terminal"
 )
 
 // recordingTerminal captures the order of escape sequences written to it and
@@ -44,12 +47,12 @@ func (r *recordingTerminal) Write(p []byte) (int, error) {
 
 func (r *recordingTerminal) Size() (int64, int64) { return 80, 24 }
 
-func (r *recordingTerminal) HideCursor()      {}
-func (r *recordingTerminal) ShowCursor()       {}
-func (r *recordingTerminal) ClearLine()       {}
-func (r *recordingTerminal) ClearFromCursor() {}
-func (r *recordingTerminal) ClearScreen()     {}
-func (r *recordingTerminal) MoveBy(int64)     {}
+func (r *recordingTerminal) HideCursor()         {}
+func (r *recordingTerminal) ShowCursor()         {}
+func (r *recordingTerminal) ClearLine()          {}
+func (r *recordingTerminal) ClearFromCursor()    {}
+func (r *recordingTerminal) ClearScreen()        {}
+func (r *recordingTerminal) MoveBy(int64)        {}
 func (r *recordingTerminal) MoveTo(int64, int64) {}
 func (r *recordingTerminal) PushKittyKeyboard() {
 	r.mu.Lock()
@@ -153,4 +156,45 @@ func indexOf(slice []string, want string) int {
 		}
 	}
 	return -1
+}
+
+func TestWriteNativeScrollbackRequiresOption(t *testing.T) {
+	term := terminal.NewVirtualTerminal(80, 24)
+	tui := NewTUI(term, TUIOptions{})
+	tui.WriteNativeScrollback([]string{"final answer"})
+	if got := term.OutputString(); strings.Contains(got, "final answer") {
+		t.Fatalf("wrote without scrollback option: %q", got)
+	}
+}
+
+func TestWriteNativeScrollbackWritesWhenEnabled(t *testing.T) {
+	term := terminal.NewVirtualTerminal(80, 24)
+	tui := NewTUI(term, TUIOptions{Scrollback: true})
+	tui.outMu.Lock()
+	tui.liveRows = 10
+	tui.outMu.Unlock()
+	tui.WriteNativeScrollback([]string{"final answer"})
+	if got := term.OutputString(); !strings.Contains(got, "final answer") {
+		t.Fatalf("expected native scrollback write, got %q", got)
+	}
+}
+
+func TestScrollbackCursorAfterDECSTBM(t *testing.T) {
+	vt := terminal.NewVirtualTerminal(40, 10)
+	tui := NewTUI(vt, TUIOptions{Scrollback: true, DisableSynchronizedOutput: true})
+	ed := component.NewEditor(nil)
+	ed.SetFocused(true)
+	tui.AddChild(ed)
+	tui.Focus(ed)
+	if err := tui.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tui.Stop()
+	tui.renderFrame()
+	out := vt.OutputString()
+	reset := strings.LastIndex(out, "\x1b[r")
+	show := strings.LastIndex(out, "\x1b[?25h")
+	if reset < 0 || show < 0 || show < reset {
+		t.Fatalf("cursor show should follow DECSTBM reset; reset=%d show=%d out=%q", reset, show, out)
+	}
 }

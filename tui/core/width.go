@@ -390,6 +390,11 @@ func TruncateToWidth(s string, maxWidth int64, ellipsis string) string {
 // PadToWidth right-pads s with spaces until its visible width equals width.
 // If s is already wider it is returned unchanged.
 func PadToWidth(s string, width int64) string {
+	if width <= 0 {
+		// Guard against a negative width: strings.Repeat would panic with
+		// "negative Repeat count" on mid-resize viewport tears.
+		return s
+	}
 	vw := VisibleWidth(s)
 	if vw >= width {
 		return s

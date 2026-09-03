@@ -53,6 +53,7 @@ func (h *testAppHost) RemoveOverlay(ov OverlayRef) bool {
 func (h *testAppHost) TerminalSize() (cols, rows int64) { return h.vt.Size() }
 func (h *testAppHost) EnableMouse(mode string)          {}
 func (h *testAppHost) DisableMouse()                    {}
+func (h *testAppHost) WriteScrollback(lines []string)   {}
 
 type stubComp struct{ lines []string }
 
@@ -107,6 +108,38 @@ func TestChatAppMessageDeltaStream(t *testing.T) {
 	msgs = app.History().Messages()
 	if msgs[0].Pending {
 		t.Fatalf("agent_end should finalize streaming message")
+	}
+}
+
+func TestChatAppSlashSubmitWhileAutocompleteActive(t *testing.T) {
+	submitted := make(chan string, 1)
+	app, _ := newTestChatApp(t, ChatAppConfig{
+		Providers: []core.AutocompleteProvider{
+			&component.StaticProvider{
+				TriggerStr: "/",
+				Suggestions: []core.Suggestion{
+					{Label: "/quit", InsertText: "quit"},
+					{Label: "/queue", InsertText: "queue"},
+				},
+			},
+		},
+		OnSubmit: func(_ context.Context, input string) {
+			submitted <- input
+		},
+	})
+	app.editor.SetValue("/quit")
+	app.ac.Refresh("/quit", int64(len([]rune("/quit"))))
+	if !app.ac.Active() {
+		t.Fatal("expected slash autocomplete to be active")
+	}
+	app.onEditorSubmit("/quit")
+	select {
+	case got := <-submitted:
+		if got != "/quit" {
+			t.Fatalf("submitted %q, want /quit", got)
+		}
+	default:
+		t.Fatal("slash command was swallowed while autocomplete was active")
 	}
 }
 

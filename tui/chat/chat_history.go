@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/covoyage/covonaut/tui/component"
@@ -11,12 +12,29 @@ import (
 	"github.com/covoyage/covonaut/tui/theme"
 )
 
+// messageIDCounter seeds message IDs. time.UnixNano() on macOS is quantized,
+// so two calls inside the same clock quantum used to collide — Finalize/Patch
+// by ID then silently targeted the wrong message (the reason stream-finalize
+// tests flaked). A monotonic counter disambiguates without changing the
+// "msg-…" prefix.
+var messageIDCounter atomic.Uint64
+
+func newMessageID() string {
+	return fmt.Sprintf("msg-%d-%d", time.Now().UnixNano(), messageIDCounter.Add(1))
+}
+
 // ---------------------------------------------------------------------------
-// ChatHistory — a viewport-clipped list of chat messages.
+// ChatHistory — a virtualized list of chat messages.
 //
 // Each entry is a ChatMessage with a role, optional ID (for streaming
 // updates), a body rendered as Markdown, and metadata. Append/Update are
-// thread-safe and invalidate the render cache.
+// thread-safe and invalidate the per-message line cache.
+//
+// Layout:
+//   - Per-message wrapped lines are cached independently (cachedLines).
+//   - Render walks the layout index and copies only the visible window.
+//   - Native scrollback remains an optional archive path; it is not the
+//     default display strategy.
 //
 // Viewport behaviour:
 //   - The caller sets MaxRows (typically recomputed on resize by ChatLayout).
@@ -67,7 +85,25 @@ type ChatMessage struct {
 
 	// Internal: last delta dedup to suppress streaming repetition loops.
 	lastDelta string
+	// Internal: checkpoint render memo for streaming markdown. Mutated only
+	// under ChatHistory.mu (see renderMessage / mdLines).
+	mdCheckpoint *component.MarkdownState
+	// Internal: last wrapped lines for this message at cachedWidth. Mutated
+	// only under ChatHistory.mu by ensureLayoutLocked / renderMessage.
+	cachedLines []string
 }
+
+// mdLines renders markdown through the per-message checkpoint memo so a
+// frame never re-parses completed blocks of a message whose checkpoint
+// prefix is unchanged. rev invalidates the memo on palette/theme swaps.
+func (m *ChatMessage) mdLines(src string, width int64, theme component.MarkdownTheme, rev uint64) []string {
+	if m.mdCheckpoint == nil {
+		m.mdCheckpoint = &component.MarkdownState{}
+	}
+	return m.mdCheckpoint.Render(src, width, theme, rev)
+}
+
+func currentPaletteRevision() uint64 { return theme.PaletteRevision() }
 
 // ThinkingSegment holds a chunk of thinking text.
 type ThinkingSegment struct {
@@ -133,7 +169,7 @@ type msgRange struct {
 }
 
 type selectionPos struct {
-	line int64 // absolute line index in cachedAll
+	line int64 // absolute line index in the virtual layout
 	col  int64 // visible column within the line
 }
 
@@ -147,14 +183,22 @@ type ChatHistory struct {
 
 	reasoningRenderer ReasoningRenderer
 
-	// render cache keyed on width + invalidation counter.
+	// layout cache keyed on width + invalidation counter.
+	// cachedAll holds the current viewport window (absolute startLine..),
+	// not the full transcript. cachedTotal is the virtual line count.
 	cachedWidth     int64
 	cachedAll       []string
 	cachedMsgRanges []msgRange
+	layoutLines     [][]string // per-span lines parallel to cachedMsgRanges
+	cachedTotal     int64
+	startLine       int64
 	dirty           bool
 	expandedGroups  map[int]bool // group message indices that are expanded
 	verbose         bool         // global verbose mode: expand everything, show full tool output
 	limits          DisplayLimits
+	// themeRev ticks on every SetTheme so per-message checkpoint render memos
+	// are invalidated even when the palette revision is unchanged.
+	themeRev uint64
 
 	// optional invalidate callback (usually TUI.RequestRender).
 	onInvalidate func()
@@ -162,7 +206,17 @@ type ChatHistory struct {
 	// callback invoked when a message is copied
 	onCopy func(text string)
 
-	// text selection state — stored as absolute line indices in cachedAll
+	// Scrollback mode: previous turns' user/assistant messages are written
+	// to native terminal scrollback via emitFn and excluded from subsequent
+	// renders. The live area keeps the current turn (prompt, tools, and the
+	// just-finished reply) so the answer does not vanish into off-screen
+	// history the moment it finalizes. Older turns are archived when the
+	// next user prompt arrives.
+	scrollback bool
+	emitFn     func(lines []string)
+	emittedIDs map[string]bool
+
+	// text selection state — stored as absolute line indices in the layout
 	selActive   bool
 	selStart    selectionPos
 	selEnd      selectionPos
@@ -175,7 +229,7 @@ type ChatHistory struct {
 	lastWheelAt     time.Time
 	suppressGesture bool
 
-	// pendingJump is an absolute cachedAll line to reveal on the next Render
+	// pendingJump is an absolute layout line to reveal on the next Render
 	// when the cache was empty at JumpToAbsoluteLine time.
 	pendingJump int64
 	hasJump     bool
@@ -200,6 +254,8 @@ func (h *ChatHistory) SetTheme(t ChatHistoryTheme) {
 	h.mu.Lock()
 	h.theme = t
 	h.dirty = true
+	h.themeRev++
+	h.clearLineCacheLocked()
 	h.mu.Unlock()
 	h.invalidate()
 }
@@ -214,6 +270,7 @@ func (h *ChatHistory) SetReasoningRenderer(r ReasoningRenderer) {
 	}
 	h.reasoningRenderer = r
 	h.dirty = true
+	h.clearLineCacheLocked()
 	h.mu.Unlock()
 	h.invalidate()
 }
@@ -229,6 +286,22 @@ func (h *ChatHistory) SetOnInvalidate(fn func()) {
 func (h *ChatHistory) SetOnCopy(fn func(text string)) {
 	h.mu.Lock()
 	h.onCopy = fn
+	h.mu.Unlock()
+}
+
+// SetScrollback enables or disables scrollback mode. When enabled, completed
+// turns are archived to terminal scrollback when the next user prompt arrives.
+// The live area keeps the current turn visible.
+func (h *ChatHistory) SetScrollback(on bool, emitFn func(lines []string)) {
+	h.mu.Lock()
+	h.scrollback = on
+	h.emitFn = emitFn
+	if !on {
+		h.emittedIDs = nil
+	} else if h.emittedIDs == nil {
+		h.emittedIDs = make(map[string]bool)
+	}
+	h.dirty = true
 	h.mu.Unlock()
 }
 
@@ -258,6 +331,7 @@ func (h *ChatHistory) SetDisplayLimits(l DisplayLimits) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.limits = l.withDefaults()
+	h.clearLineCacheLocked()
 	h.dirty = true
 }
 
@@ -267,6 +341,7 @@ func (h *ChatHistory) ToggleVerbose() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.verbose = !h.verbose
+	h.clearLineCacheLocked()
 	h.dirty = true
 	return h.verbose
 }
@@ -314,8 +389,14 @@ func (h *ChatHistory) CollapseConsecutiveTools() {
 // is enabled. If m.ID is empty, a new unique ID is generated and returned.
 func (h *ChatHistory) Append(m ChatMessage) string {
 	h.mu.Lock()
+	var emitLines []string
+	emitFn := h.emitFn
+	// Archive the previous turn before a new prompt takes over the live area.
+	if h.scrollback && emitFn != nil && m.Role == RoleUser && len(h.messages) > 0 {
+		emitLines = h.emitTurnLocked(len(h.messages) - 1)
+	}
 	if m.ID == "" {
-		m.ID = fmt.Sprintf("msg-%d", time.Now().UnixNano())
+		m.ID = newMessageID()
 	}
 	if m.At.IsZero() {
 		m.At = time.Now()
@@ -330,6 +411,9 @@ func (h *ChatHistory) Append(m ChatMessage) string {
 	}
 	id := m.ID
 	h.mu.Unlock()
+	if len(emitLines) > 0 && emitFn != nil {
+		emitFn(emitLines)
+	}
 	h.invalidate()
 	return id
 }
@@ -344,6 +428,7 @@ func (h *ChatHistory) PatchMessage(id string, fn func(m *ChatMessage)) bool {
 	for i := range h.messages {
 		if h.messages[i].ID == id {
 			fn(&h.messages[i])
+			h.messages[i].cachedLines = nil
 			h.dirty = true
 			h.selActive = false
 			h.selDragging = false
@@ -373,6 +458,7 @@ func (h *ChatHistory) PatchLastAssistantReply(fn func(m *ChatMessage)) bool {
 			continue
 		}
 		fn(m)
+		m.cachedLines = nil
 		h.dirty = true
 		h.mu.Unlock()
 		h.invalidate()
@@ -419,6 +505,7 @@ func (h *ChatHistory) AppendDeltaWithKind(id, delta, kind string) string {
 					h.messages[i].Text += delta
 				}
 				h.messages[i].Pending = true
+				h.messages[i].cachedLines = nil
 				h.dirty = true
 				h.selActive = false
 				h.selDragging = false
@@ -431,7 +518,7 @@ func (h *ChatHistory) AppendDeltaWithKind(id, delta, kind string) string {
 			}
 		}
 	}
-	newID := fmt.Sprintf("msg-%d", time.Now().UnixNano())
+	newID := newMessageID()
 	msg := ChatMessage{
 		ID:      newID,
 		Role:    RoleAssistant,
@@ -458,6 +545,11 @@ func (h *ChatHistory) AppendDeltaWithKind(id, delta, kind string) string {
 // Finalize clears the Pending flag on the given id. An assistant bubble
 // with no text and no thinking is dropped so the streaming placeholder
 // does not linger after tools start.
+//
+// The current turn stays in the live viewport after finalize so the reply
+// remains on screen. Native scrollback archival happens when the next user
+// prompt arrives (see Append), not here — emitting immediately would drop
+// the answer from live while the live region still fills the terminal.
 func (h *ChatHistory) Finalize(id string) {
 	if id == "" {
 		return
@@ -469,8 +561,11 @@ func (h *ChatHistory) Finalize(id string) {
 		}
 		m := &h.messages[i]
 		m.Pending = false
+
 		if m.Role == RoleAssistant && strings.TrimSpace(m.Text) == "" && !thinkingHasText(m.ThinkingSegments) {
 			h.messages = append(h.messages[:i], h.messages[i+1:]...)
+		} else {
+			m.cachedLines = nil
 		}
 		h.dirty = true
 		h.selActive = false
@@ -480,6 +575,83 @@ func (h *ChatHistory) Finalize(id string) {
 		return
 	}
 	h.mu.Unlock()
+}
+
+// emitTurnLocked renders every un-emitted user prompt and assistant message
+// at or before index `through` into a single batch for native scrollback
+// emission, preserving message order (prompts before their answers), and marks
+// each emitted so the live viewport stops rendering them. Returns nil when
+// there is nothing new to emit. Caller holds h.mu.
+func (h *ChatHistory) emitTurnLocked(through int) []string {
+	if h.emitFn == nil || len(h.messages) == 0 {
+		return nil
+	}
+	if through >= len(h.messages) {
+		through = len(h.messages) - 1
+	}
+	if through < 0 {
+		return nil
+	}
+	if h.emittedIDs == nil {
+		h.emittedIDs = make(map[string]bool)
+	}
+	width := h.cachedWidth
+	if width <= 0 {
+		width = 80
+	}
+	var lines []string
+	for i := 0; i <= through; i++ {
+		m := h.messages[i]
+		if h.emittedIDs[m.ID] {
+			continue
+		}
+		if m.Role != RoleUser && m.Role != RoleAssistant {
+			continue
+		}
+		rendered := trimBlankEdges(h.renderMessage(&m, h.theme, width))
+		if len(rendered) == 0 {
+			continue
+		}
+		lines = append(lines, rendered...)
+		h.emittedIDs[m.ID] = true
+	}
+	return lines
+}
+
+// emitPendingTurn archives completed turns before the latest user prompt.
+// The current turn stays in the live viewport until the next prompt arrives.
+func (h *ChatHistory) emitPendingTurn() {
+	if !h.scrollback || h.emitFn == nil {
+		return
+	}
+	h.mu.Lock()
+	if lines := h.emitPreviousTurnsLocked(); len(lines) > 0 {
+		h.dirty = true
+		h.mu.Unlock()
+		h.emitFn(lines)
+		h.mu.Lock()
+	}
+	h.mu.Unlock()
+	h.invalidate()
+}
+
+// emitPreviousTurnsLocked emits un-emitted user+assistant messages that
+// belong to turns before the latest user prompt. Caller holds h.mu.
+func (h *ChatHistory) emitPreviousTurnsLocked() []string {
+	if h.emitFn == nil || len(h.messages) == 0 {
+		return nil
+	}
+	lastUser := -1
+	for i := len(h.messages) - 1; i >= 0; i-- {
+		if h.messages[i].Role == RoleUser {
+			lastUser = i
+			break
+		}
+	}
+	if lastUser < 1 {
+		return nil
+	}
+	return h.emitTurnLocked(lastUser - 1)
 }
 
 func thinkingHasText(segs []ThinkingSegment) bool {
@@ -521,6 +693,11 @@ func (h *ChatHistory) Clear() {
 	h.mu.Lock()
 	h.messages = nil
 	h.offset = 0
+	h.cachedAll = nil
+	h.cachedMsgRanges = nil
+	h.layoutLines = nil
+	h.cachedTotal = 0
+	h.startLine = 0
 	h.dirty = true
 	h.selActive = false
 	h.selDragging = false
@@ -547,7 +724,7 @@ func (h *ChatHistory) ScrollBy(n int64) {
 }
 
 func (h *ChatHistory) scrollByLocked(n int64) {
-	total := int64(len(h.cachedAll))
+	total := h.cachedTotal
 	h.offset += n
 	if h.offset < 0 {
 		h.offset = 0
@@ -588,11 +765,11 @@ func (h *ChatHistory) ViewportHeight() int64 {
 	return h.maxRows
 }
 
-// LineCount returns the cached rendered line count (0 if never rendered).
+// LineCount returns the virtual rendered line count (0 if never rendered).
 func (h *ChatHistory) LineCount() int64 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return int64(len(h.cachedAll))
+	return h.cachedTotal
 }
 
 // ScrollToOffset sets the viewport offset from the tail.
@@ -608,10 +785,10 @@ func (h *ChatHistory) ScrollToOffset(n int64) {
 	h.invalidate()
 }
 
-// JumpToAbsoluteLine reveals an absolute cachedAll line near the top of the viewport.
+// JumpToAbsoluteLine reveals an absolute layout line near the top of the viewport.
 func (h *ChatHistory) JumpToAbsoluteLine(line int64) {
 	h.mu.Lock()
-	total := int64(len(h.cachedAll))
+	total := h.cachedTotal
 	if total == 0 {
 		h.pendingJump = line
 		h.hasJump = true
@@ -666,7 +843,7 @@ func (h *ChatHistory) MessageLineRange(msgIndex int) (start, end int, ok bool) {
 	return 0, 0, false
 }
 
-// Render draws the transcript, clipping to MaxRows when set.
+// Render draws the transcript, assembling only the visible window.
 func (h *ChatHistory) Render(width int64) []string {
 	if width < 1 {
 		width = 1
@@ -674,62 +851,62 @@ func (h *ChatHistory) Render(width int64) []string {
 	h.mu.Lock()
 	wasDirty := h.dirty
 	if h.dirty || h.cachedWidth != width {
-		h.cachedAll = h.renderAll(width)
+		if h.cachedWidth != width {
+			h.clearLineCacheLocked()
+		}
+		h.rebuildLayoutLocked(width)
 		h.cachedWidth = width
 		h.dirty = false
-		// If content changed (was dirty), reset scroll if following tail.
 		if wasDirty && h.follow {
 			h.offset = 0
 		}
-		// Also clamp if old offset is now past the content end.
-		if len(h.cachedAll) > 0 && h.offset > 0 {
-			maxLines := int64(len(h.cachedAll))
-			if maxLines > h.maxRows && h.maxRows > 0 && h.offset > maxLines-h.maxRows {
-				h.offset = maxLines - h.maxRows
-				if h.offset < 0 {
-					h.offset = 0
-				}
-			} else if h.maxRows <= 0 || maxLines <= h.maxRows {
+	}
+	total := h.cachedTotal
+	if total > 0 && h.offset > 0 {
+		if h.maxRows > 0 && total > h.maxRows && h.offset > total-h.maxRows {
+			h.offset = total - h.maxRows
+			if h.offset < 0 {
 				h.offset = 0
 			}
+		} else if h.maxRows <= 0 || total <= h.maxRows {
+			h.offset = 0
 		}
 	}
 	if h.hasJump {
-		h.applyJumpLocked(h.pendingJump, int64(len(h.cachedAll)))
+		h.applyJumpLocked(h.pendingJump, total)
 	}
-	all := h.cachedAll
 	maxRows := h.maxRows
 	offset := h.offset
 	follow := h.follow
-	sticky := ""
-	if !follow && offset > 0 {
-		sticky = h.stickyUserPromptLocked(all, maxRows, offset)
-	}
-	h.mu.Unlock()
 
-	visible := all
-	if maxRows > 0 && int64(len(all)) > maxRows {
-		end := int64(len(all)) - offset
-		if end > int64(len(all)) {
-			end = int64(len(all))
+	start, end := int64(0), total
+	if maxRows > 0 && total > maxRows {
+		end = total - offset
+		if end > total {
+			end = total
 		}
-		start := end - maxRows
+		start = end - maxRows
 		if start < 0 {
 			start = 0
 			end = maxRows
 		}
-		visible = all[start:end]
+	}
+	visible := h.assembleViewportLocked(start, end)
+	if h.selActive && !h.isSelectionEmptyLocked() {
+		h.applySelectionHighlightLocked(visible, width)
+	}
+	sticky := ""
+	if !follow && offset > 0 {
+		sticky = h.stickyUserPromptLocked(maxRows, offset)
+	}
+	h.mu.Unlock()
 
-		// Add scroll indicator when not auto-following
-		if !follow && end < int64(len(all)) {
-			indicator := h.theme.DimStyle.Render(fmt.Sprintf("^ %d more lines — End to follow", int64(len(all))-end))
-			// Drop last visible line to keep within maxRows, prevent pushing
-			// status bar off-screen.
-			if int64(len(visible)) >= maxRows && len(visible) > 0 {
-				visible = visible[:len(visible)-1]
-			}
-			visible = append([]string{indicator}, visible...)
+	if maxRows > 0 && total > maxRows && !follow && end < total {
+		indicator := h.theme.DimStyle.Render(fmt.Sprintf("^ %d more lines — End to follow", total-end))
+		if int64(len(visible)) >= maxRows && len(visible) > 0 {
+			visible = visible[:len(visible)-1]
 		}
+		visible = append([]string{indicator}, visible...)
 	}
 	if sticky != "" && maxRows > 0 {
 		if int64(len(visible)) >= maxRows && len(visible) > 0 {
@@ -746,11 +923,11 @@ func (h *ChatHistory) Render(width int64) []string {
 	return fitHistoryLines(visible, width)
 }
 
-func (h *ChatHistory) stickyUserPromptLocked(all []string, maxRows, offset int64) string {
+func (h *ChatHistory) stickyUserPromptLocked(maxRows, offset int64) string {
 	if len(h.cachedMsgRanges) == 0 || len(h.messages) == 0 || maxRows <= 0 {
 		return ""
 	}
-	total := int64(len(all))
+	total := h.cachedTotal
 	end := total - offset
 	if end > total {
 		end = total
@@ -866,6 +1043,7 @@ func (h *ChatHistory) tryToggleToolDetailAtLineLocked(absLine int64) bool {
 			return false
 		}
 		m.DetailVisible = !m.DetailVisible
+		m.cachedLines = nil
 		return true
 	}
 	return false
@@ -1030,9 +1208,9 @@ func (h *ChatHistory) handleMouse(m core.MouseMsg) {
 }
 
 // viewportRowToAbsoluteLocked converts a viewport-relative row to an absolute
-// line index in cachedAll. Returns -1 if the row is out of range.
+// line index in the virtual layout. Returns -1 if the row is out of range.
 func (h *ChatHistory) viewportRowToAbsoluteLocked(viewportRow int64) int64 {
-	total := int64(len(h.cachedAll))
+	total := h.cachedTotal
 	if total == 0 || h.maxRows <= 0 || viewportRow < 0 {
 		return -1
 	}
@@ -1072,13 +1250,13 @@ func (h *ChatHistory) viewportRowToAbsoluteLocked(viewportRow int64) int64 {
 // visible-column coordinate for the target line. Continuation cells (the
 // right half of a wide rune) are mapped back to the wide rune's start.
 func (h *ChatHistory) mapMouseColToVisibleColLocked(absLine, mouseCol int64) int64 {
-	if absLine < 0 || absLine >= int64(len(h.cachedAll)) {
+	line, ok := h.lineAtLocked(absLine)
+	if !ok {
 		if mouseCol < 0 {
 			return 0
 		}
 		return mouseCol
 	}
-	line := h.cachedAll[absLine]
 	row := core.ParseLine(line)
 	lineWidth := row.VisibleWidth()
 	if mouseCol < 0 {
@@ -1156,18 +1334,22 @@ func (h *ChatHistory) tryToggleThinkingAtLineLocked(absLine int64) bool {
 	msg := &h.messages[msgRange.msgIndex]
 	if msg.Role == RoleTool && msg.Collapsed {
 		msg.Collapsed = false
+		msg.cachedLines = nil
 		return true
 	}
 	if msg.Role == RoleTool && !msg.Collapsed {
 		msg.Collapsed = true
+		msg.cachedLines = nil
 		return true
 	}
 	if msg.Role == RoleAssistant && msg.Collapsed {
 		msg.Collapsed = false
+		msg.cachedLines = nil
 		return true
 	}
 	if msg.Role == RoleAssistant && !msg.Collapsed && msg.Meta == "diff" {
 		msg.Collapsed = true
+		msg.cachedLines = nil
 		return true
 	}
 	if msg.Role != RoleAssistant || len(msg.ThinkingSegments) == 0 {
@@ -1189,6 +1371,7 @@ func (h *ChatHistory) tryToggleThinkingAtLineLocked(absLine int64) bool {
 		// Header line (e.g., "◐ thinking")
 		if lineOffset == currentLine {
 			seg.Collapsed = !seg.Collapsed
+			msg.cachedLines = nil
 			return true
 		}
 		currentLine++
@@ -1198,6 +1381,7 @@ func (h *ChatHistory) tryToggleThinkingAtLineLocked(absLine int64) bool {
 			contentLines := int64(len(core.WrapAnsi(seg.Text, h.cachedWidth)))
 			if lineOffset > currentLine && lineOffset <= currentLine+contentLines {
 				seg.Collapsed = !seg.Collapsed
+				msg.cachedLines = nil
 				return true
 			}
 			currentLine += contentLines + 1 // +1 for separator
@@ -1205,6 +1389,7 @@ func (h *ChatHistory) tryToggleThinkingAtLineLocked(absLine int64) bool {
 			// Collapsed line (summary)
 			if lineOffset == currentLine {
 				seg.Collapsed = !seg.Collapsed
+				msg.cachedLines = nil
 				return true
 			}
 			currentLine++
@@ -1230,7 +1415,7 @@ func (h *ChatHistory) messageAtViewportRow(row int64) *ChatMessage {
 }
 
 func (h *ChatHistory) messageAtViewportRowLocked(row int64) *ChatMessage {
-	total := int64(len(h.cachedAll))
+	total := h.cachedTotal
 	if total == 0 || h.maxRows <= 0 || row < 0 {
 		return nil
 	}
@@ -1283,7 +1468,7 @@ func (h *ChatHistory) getSelectedTextLocked() string {
 		return ""
 	}
 
-	total := int64(len(h.cachedAll))
+	total := h.cachedTotal
 	if total == 0 {
 		return ""
 	}
@@ -1305,7 +1490,10 @@ func (h *ChatHistory) getSelectedTextLocked() string {
 
 	var result []string
 	for i := topLine; i <= botLine && i < total; i++ {
-		line := h.cachedAll[i]
+		line, ok := h.lineAtLocked(i)
+		if !ok {
+			continue
+		}
 		var part string
 		if i == topLine && i == botLine {
 			part = core.SliceByColumn(line, topCol, botCol)
@@ -1322,23 +1510,68 @@ func (h *ChatHistory) getSelectedTextLocked() string {
 	return strings.Join(result, "\n")
 }
 
-func (h *ChatHistory) renderAll(width int64) []string {
-	theme := h.theme
-	var out []string
-	var ranges []msgRange
-	var lastRole ChatRole
+func (h *ChatHistory) clearLineCacheLocked() {
+	for i := range h.messages {
+		h.messages[i].cachedLines = nil
+	}
+}
+
+func (h *ChatHistory) messageLinesLocked(i int, width int64) []string {
+	m := &h.messages[i]
+	if m.cachedLines != nil {
+		return m.cachedLines
+	}
+	lines := trimBlankEdges(h.renderMessage(m, h.theme, width))
+	m.cachedLines = lines
+	return lines
+}
+
+func (h *ChatHistory) appendSpanLocked(lines []string, r msgRange) {
+	start := int(h.cachedTotal)
+	r.startLine = start
+	r.endLine = start + len(lines)
+	h.cachedMsgRanges = append(h.cachedMsgRanges, r)
+	h.layoutLines = append(h.layoutLines, lines)
+	h.cachedTotal = int64(r.endLine)
+}
+
+func (h *ChatHistory) turnGapLocked(lastRole, role ChatRole, width int64) []string {
+	if lastRole == 0 {
+		return nil
+	}
+	if (lastRole == RoleUser && role == RoleAssistant) ||
+		(lastRole == RoleAssistant && role == RoleUser) {
+		sep := h.theme.DimStyle.Render(strings.Repeat("─", int(width)))
+		return []string{"", sep, ""}
+	}
+	if lastRole == RoleTool || role == RoleTool {
+		return nil
+	}
+	return []string{"", ""}
+}
+
+func (h *ChatHistory) rebuildLayoutLocked(width int64) {
+	h.cachedMsgRanges = h.cachedMsgRanges[:0]
+	h.layoutLines = h.layoutLines[:0]
+	h.cachedTotal = 0
+	h.startLine = 0
+	h.cachedAll = nil
 
 	if len(h.messages) == 0 {
-		// Empty history — show welcome
 		pal := h.theme.UserStyle
 		welcome := pal.Render("▌ ") + h.theme.SystemStyle.Render("Ready — type a message")
-		return []string{"", "", "", welcome, "", "", ""}
+		h.appendSpanLocked([]string{"", "", "", welcome, "", "", ""}, msgRange{msgIndex: -1})
+		return
 	}
 
+	theme := h.theme
+	var lastRole ChatRole
 	for i := 0; i < len(h.messages); i++ {
-		m := h.messages[i]
+		m := &h.messages[i]
+		if h.scrollback && h.emittedIDs[m.ID] {
+			continue
+		}
 
-		// Detect a run of consecutive tool/system messages starting at i.
 		if m.Role == RoleTool || m.Role == RoleSystem {
 			groupEnd := i
 			for j := i + 1; j < len(h.messages); j++ {
@@ -1349,11 +1582,8 @@ func (h *ChatHistory) renderAll(width int64) []string {
 					break
 				}
 			}
-			// Group 2+ consecutive tools UNLESS we're still mid-turn:
-			// the group extends to the end AND the last non-tool msg is pending.
 			midTurn := groupEnd == len(h.messages)-1
 			if midTurn {
-				// Check if the last non-tool message is still streaming.
 				for j := i - 1; j >= 0; j-- {
 					if h.messages[j].Role != RoleTool && h.messages[j].Role != RoleSystem {
 						midTurn = h.messages[j].Pending
@@ -1362,7 +1592,6 @@ func (h *ChatHistory) renderAll(width int64) []string {
 				}
 			}
 			if groupEnd > i && !midTurn {
-				// Render collapsed or expanded group
 				bar := theme.ToolBorder.Render("▌ ")
 				toolCount, sysCount := 0, 0
 				for j := i; j <= groupEnd; j++ {
@@ -1372,45 +1601,38 @@ func (h *ChatHistory) renderAll(width int64) []string {
 						sysCount++
 					}
 				}
-
 				expanded, ok := h.expandedGroups[i]
 				if !ok {
-					expanded = true // 默认展开
+					expanded = true
 				}
 				if h.verbose {
 					expanded = true
 				}
 				if expanded {
-					start := len(out)
 					summary := fmt.Sprintf("[-] %d tools · %d msgs", toolCount, sysCount)
 					if sysCount == 0 {
 						summary = fmt.Sprintf("[-] %d tools", toolCount)
 					}
-					out = append(out, core.PadToWidth(bar+theme.DimStyle.Render(summary), width))
-					// Header range — clicking this collapses the group
-					ranges = append(ranges, msgRange{
-						startLine: start, endLine: len(out), msgIndex: i,
-						toolGroup: true, groupFrom: i, groupTo: groupEnd,
-						groupHeader: true,
-					})
+					h.appendSpanLocked(
+						[]string{core.PadToWidth(bar+theme.DimStyle.Render(summary), width)},
+						msgRange{
+							msgIndex: i, toolGroup: true, groupFrom: i, groupTo: groupEnd, groupHeader: true,
+						},
+					)
 					for j := i; j <= groupEnd; j++ {
-						start := len(out)
-						out = append(out, h.renderMessage(h.messages[j], theme, width)...)
-						ranges = append(ranges, msgRange{
-							startLine: start, endLine: len(out), msgIndex: j,
-						})
+						h.appendSpanLocked(h.messageLinesLocked(j, width), msgRange{msgIndex: j})
 					}
 				} else {
-					start := len(out)
 					summary := fmt.Sprintf("[+] %d tools · %d msgs", toolCount, sysCount)
 					if sysCount == 0 {
 						summary = fmt.Sprintf("[+] %d tools", toolCount)
 					}
-					out = append(out, bar+theme.DimStyle.Render(summary))
-					ranges = append(ranges, msgRange{
-						startLine: start, endLine: len(out), msgIndex: i,
-						toolGroup: true, groupFrom: i, groupTo: groupEnd,
-					})
+					h.appendSpanLocked(
+						[]string{bar + theme.DimStyle.Render(summary)},
+						msgRange{
+							msgIndex: i, toolGroup: true, groupFrom: i, groupTo: groupEnd,
+						},
+					)
 				}
 				i = groupEnd
 				lastRole = RoleTool
@@ -1418,49 +1640,88 @@ func (h *ChatHistory) renderAll(width int64) []string {
 			}
 		}
 
-		lines := trimBlankEdges(h.renderMessage(m, theme, width))
+		lines := h.messageLinesLocked(i, width)
 		if len(lines) == 0 {
 			continue
 		}
-		if lastRole != 0 {
-			// Add spacing. Use a subtle separator between user/assistant turns.
-			if (lastRole == RoleUser && m.Role == RoleAssistant) ||
-				(lastRole == RoleAssistant && m.Role == RoleUser) {
-				sep := theme.DimStyle.Render(strings.Repeat("─", int(width)))
-				out = append(out, "", sep, "")
-			} else if lastRole == RoleTool || m.Role == RoleTool {
-				// Tools are compact — no extra blank line.
-			} else {
-				out = append(out, "", "")
-			}
+		if gap := h.turnGapLocked(lastRole, m.Role, width); len(gap) > 0 {
+			h.appendSpanLocked(gap, msgRange{msgIndex: -1})
 		}
-		start := len(out)
-		out = append(out, lines...)
-		ranges = append(ranges, msgRange{startLine: start, endLine: len(out), msgIndex: i})
+		h.appendSpanLocked(lines, msgRange{msgIndex: i})
 		lastRole = m.Role
 	}
-	h.cachedMsgRanges = ranges
-
-	// Apply selection highlight
-	if h.selActive && !h.isSelectionEmptyLocked() {
-		h.applySelectionHighlightLocked(out, width)
-	}
-
-	return out
 }
 
-func (h *ChatHistory) applySelectionHighlightLocked(lines []string, width int64) {
-	total := int64(len(lines))
-	if total == 0 || h.maxRows <= 0 {
-		return
-	}
-
-	// Compute the visible viewport range in absolute indices
-	end := total - h.offset
-	start := end - h.maxRows
+func (h *ChatHistory) assembleViewportLocked(start, end int64) []string {
 	if start < 0 {
 		start = 0
 	}
+	if end > h.cachedTotal {
+		end = h.cachedTotal
+	}
+	if end < start {
+		end = start
+	}
+	h.startLine = start
+	n := int(end - start)
+	out := make([]string, 0, n)
+	for i, r := range h.cachedMsgRanges {
+		if int64(r.endLine) <= start {
+			continue
+		}
+		if int64(r.startLine) >= end {
+			break
+		}
+		lines := h.layoutLines[i]
+		from := 0
+		if int64(r.startLine) < start {
+			from = int(start - int64(r.startLine))
+		}
+		to := len(lines)
+		if int64(r.endLine) > end {
+			to = int(end - int64(r.startLine))
+		}
+		if from < 0 {
+			from = 0
+		}
+		if to > len(lines) {
+			to = len(lines)
+		}
+		if from < to {
+			out = append(out, lines[from:to]...)
+		}
+	}
+	h.cachedAll = out
+	return out
+}
+
+func (h *ChatHistory) lineAtLocked(absLine int64) (string, bool) {
+	if absLine < 0 || absLine >= h.cachedTotal {
+		return "", false
+	}
+	local := absLine - h.startLine
+	if local >= 0 && local < int64(len(h.cachedAll)) {
+		return h.cachedAll[local], true
+	}
+	for i, r := range h.cachedMsgRanges {
+		if absLine >= int64(r.startLine) && absLine < int64(r.endLine) {
+			idx := int(absLine - int64(r.startLine))
+			if idx >= 0 && idx < len(h.layoutLines[i]) {
+				return h.layoutLines[i][idx], true
+			}
+			return "", false
+		}
+	}
+	return "", false
+}
+
+func (h *ChatHistory) applySelectionHighlightLocked(lines []string, width int64) {
+	if len(lines) == 0 || h.maxRows <= 0 {
+		return
+	}
+
+	viewStart := h.startLine
+	viewEnd := viewStart + int64(len(lines))
 
 	topLine := h.selStart.line
 	botLine := h.selEnd.line
@@ -1473,17 +1734,17 @@ func (h *ChatHistory) applySelectionHighlightLocked(lines []string, width int64)
 		topCol, botCol = botCol, topCol
 	}
 
-	// Clamp selection to visible viewport
-	if botLine < start || topLine >= end {
+	// Clamp selection to the assembled viewport window.
+	if botLine < viewStart || topLine >= viewEnd {
 		return
 	}
-	if topLine < start {
-		topLine = start
+	if topLine < viewStart {
+		topLine = viewStart
 		topCol = 0
 	}
-	if botLine >= end {
-		botLine = end - 1
-		botCol = core.VisibleWidth(lines[botLine])
+	if botLine >= viewEnd {
+		botLine = viewEnd - 1
+		botCol = core.VisibleWidth(lines[botLine-viewStart])
 	}
 
 	selBg := h.theme.SelectedBg
@@ -1499,11 +1760,12 @@ func (h *ChatHistory) applySelectionHighlightLocked(lines []string, width int64)
 		return
 	}
 
-	for i := topLine; i <= botLine && i < end; i++ {
-		if i < 0 || i >= total {
+	for i := topLine; i <= botLine && i < viewEnd; i++ {
+		local := i - viewStart
+		if local < 0 || local >= int64(len(lines)) {
 			continue
 		}
-		line := lines[i]
+		line := lines[local]
 		row := core.ParseLine(line)
 		if row.IsRaw() {
 			continue
@@ -1557,7 +1819,7 @@ func (h *ChatHistory) applySelectionHighlightLocked(lines []string, width int64)
 
 		highlighted := core.SerializeRow(row)
 		// Keep each highlighted row width-stable across drag updates.
-		lines[i] = core.PadToWidth(core.TruncateToWidth(highlighted, lineWidth, ""), lineWidth)
+		lines[local] = core.PadToWidth(core.TruncateToWidth(highlighted, lineWidth, ""), lineWidth)
 	}
 }
 
@@ -1577,7 +1839,10 @@ func trimBlankEdges(lines []string) []string {
 	return lines[start:end]
 }
 
-func (h *ChatHistory) renderMessage(m ChatMessage, theme ChatHistoryTheme, width int64) []string {
+func (h *ChatHistory) renderMessage(m *ChatMessage, theme ChatHistoryTheme, width int64) []string {
+	// Can't name the theme package here (shadowed by the param) — route
+	// through a package-level helper for the palette generation counter.
+	rev := h.themeRev + currentPaletteRevision()
 	switch m.Role {
 	case RoleUser:
 		bar := theme.UserStyle.Render("▌ ")
@@ -1589,9 +1854,7 @@ func (h *ChatHistory) renderMessage(m ChatMessage, theme ChatHistoryTheme, width
 				innerW = 1
 			}
 		}
-		md := component.NewMarkdown(m.Text)
-		md.SetTheme(theme.MarkdownTheme)
-		body := md.Render(innerW)
+		body := m.mdLines(m.Text, innerW, theme.MarkdownTheme, rev)
 		if len(body) == 0 {
 			return []string{core.PadToWidth(bar, width)}
 		}
@@ -1624,20 +1887,18 @@ func (h *ChatHistory) renderMessage(m ChatMessage, theme ChatHistoryTheme, width
 		// legacy Show/Mode policy; custom renderers can draw reasoning
 		// anywhere (sidebar, overlay, etc.).
 		if h.reasoningRenderer != nil {
-			if rendered := h.reasoningRenderer.RenderThinking(m, width); len(rendered) > 0 {
+			if rendered := h.reasoningRenderer.RenderThinking(*m, width); len(rendered) > 0 {
 				allLines = append(allLines, rendered...)
 			}
 		}
 
 		// Render text content
 		if m.Text != "" {
-			md := component.NewMarkdown(m.Text)
 			mdTheme := theme.MarkdownTheme
 			if m.Pending {
 				mdTheme.SkipIncomplete = true
 			}
-			md.SetTheme(mdTheme)
-			lines := md.Render(width)
+			lines := m.mdLines(m.Text, width, mdTheme, rev)
 			if m.Pending {
 				if len(lines) == 0 {
 					lines = []string{theme.DimStyle.Render("…")}
@@ -1692,7 +1953,7 @@ func (h *ChatHistory) renderMessage(m ChatMessage, theme ChatHistoryTheme, width
 			}
 			return used
 		}
-		argPart := h.toolArgPart(m, argUsed(), width, theme)
+		argPart := h.toolArgPart(*m, argUsed(), width, theme)
 
 		if m.Collapsed && !h.verbose && !m.DetailVisible {
 			summary := core.TruncateToWidth(m.Text, h.limits.ToolStatusMaxWidth, "...")

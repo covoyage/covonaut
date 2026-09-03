@@ -93,7 +93,7 @@ func makeRaw(orig termios) termios {
 	t.Cflag &^= cCSIZE | cPARENB
 	t.Cflag |= cCS8
 	t.Cc[vmin] = 0
-	t.Cc[vtime] = 1 // 100ms read timeout so the read loop can check stopRead
+	t.Cc[vtime] = 1
 	return t
 }
 

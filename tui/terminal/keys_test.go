@@ -55,3 +55,85 @@ func TestParseKeysPrintable(t *testing.T) {
 		t.Errorf("unexpected names: %v %v %v", keys[0].Name, keys[1].Name, keys[2].Name)
 	}
 }
+
+// Modifier-noise tolerance: Caps/NumLk/Meta/Hyper bits reported by macOS
+// terminals and exotic emulators must not break a clean shortcut match.
+func TestMatchesKeyModifierNoise(t *testing.T) {
+	// CSI <code>;<mod+1>u — the listed mod codes include noise bits.
+	pos := []struct {
+		data string
+		key  KeyID
+	}{
+		{"\x1b[99;5u", "ctrl+c"},    // kitty ctrl+c, no noise
+		{"\x1b[99;69u", "ctrl+c"},   // + caps lock (64)
+		{"\x1b[99;133u", "ctrl+c"},  // + num lock (128)
+		{"\x1b[99;37u", "ctrl+c"},   // + meta (32)
+		{"\x1b[99;21u", "ctrl+c"},   // + hyper (16)
+		{"\x1b[99;85u", "ctrl+c"},   // + caps(64)+hyper(16)
+	}
+	for _, c := range pos {
+		if !MatchesKey(c.data, c.key) {
+			t.Errorf("MatchesKey(%q, %q) = false, want true", c.data, c.key)
+		}
+	}
+	// Real modifier differences must still be enforced (multi-char names,
+	// where Shift is not folded into the rune case).
+	neg := []struct {
+		data string
+		key  KeyID
+	}{
+		{"\x1b[13;3u", "enter"},     // alt+enter, not enter
+		{"\x1b[13;6u", "ctrl+enter"}, // ctrl+shift+enter, not ctrl+enter
+		{"\x1b[9;2u", "tab"},         // shift+tab, not tab
+		{"\x1b[1;5p", "ctrl+p"},      // unknown final byte, no Name match
+	}
+	for _, c := range neg {
+		if MatchesKey(c.data, c.key) {
+			t.Errorf("MatchesKey(%q, %q) = true, want false", c.data, c.key)
+		}
+	}
+	// A pure caps-lock bit collapses to the plain key.
+	if !MatchesKey("\x1b[99;65u", "c") {
+		t.Error("caps-lock-bit-only codepoint 99 must match plain \"c\"")
+	}
+	if MatchesKey("\x1b[99;65u", "ctrl+c") {
+		t.Error("caps-lock-bit-only must not match ctrl+c")
+	}
+}
+
+// C0 canonical mapping: the rare control bytes beyond ctrl+a..z resolve to
+// their canonical escape names.
+func TestParseC0Controls(t *testing.T) {
+	cases := []struct {
+		byte rune
+		key  KeyID
+	}{
+		{0x1C, "ctrl+\\"},
+		{0x1D, "ctrl+]"},
+		{0x1E, "ctrl+^"},
+		{0x1F, "ctrl+_"},
+		{0x00, "ctrl+ "},
+		{0x14, "ctrl+t"},
+		{0x01, "ctrl+a"},
+		{0x1A, "ctrl+z"},
+	}
+	for _, c := range cases {
+		if !MatchesKey(string(c.byte), c.key) {
+			t.Errorf("MatchesKey(%U, %q) = false, want true", c.byte, c.key)
+		}
+	}
+}
+
+// macOS terminals sometimes deliver Alt+Enter as \x1b\r and Alt+backspace as
+// \x1b\x7f; both must stay predictable.
+func TestParseMetaControlEscapes(t *testing.T) {
+	if !MatchesKey("\x1b\r", "alt+enter") {
+		t.Error("\\x1b\\r must match alt+enter")
+	}
+	if !MatchesKey("\x1b\x7f", "alt+backspace") {
+		t.Error("\\x1b\\x7f must match alt+backspace")
+	}
+	if !MatchesKey("\x1b\x1c", "alt+ctrl+\\") {
+		t.Error("\\x1b\\x1c must match alt+ctrl+\\")
+	}
+}

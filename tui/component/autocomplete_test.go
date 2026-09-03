@@ -50,3 +50,23 @@ func TestAutocompleteNoTrigger(t *testing.T) {
 		t.Fatalf("should not activate without trigger")
 	}
 }
+
+func TestAutocompleteApplyCurrent(t *testing.T) {
+	ac := NewAutocomplete(&StaticProvider{
+		TriggerStr: "/",
+		Suggestions: []core.Suggestion{
+			{Label: "/quit", InsertText: "quit"},
+		},
+	})
+	ac.Refresh("/q", 2)
+	if !ac.Active() {
+		t.Fatal("expected autocomplete active")
+	}
+	got, ok := ac.ApplyCurrent()
+	if !ok || got != "/quit" {
+		t.Fatalf("ApplyCurrent = %q, %v; want /quit, true", got, ok)
+	}
+	if ac.Active() {
+		t.Fatal("ApplyCurrent should dismiss the popup")
+	}
+}
