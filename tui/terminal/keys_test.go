@@ -101,6 +101,44 @@ func TestMatchesKeyModifierNoise(t *testing.T) {
 	}
 }
 
+// Bindings that explicitly request Meta must not collapse to the unchorded
+// key. Stripping Meta from both sides made "meta+a" match "a" and
+// "ctrl+meta+a" match ctrl+a, which stole typing and emacs line-start.
+func TestMatchesKeyExplicitMetaNotPlain(t *testing.T) {
+	neg := []struct {
+		data string
+		key  KeyID
+	}{
+		{"a", "meta+a"},
+		{"a", "alt+a"},
+		{"a", "super+a"},
+		{"\x01", "ctrl+meta+a"}, // ctrl+a must stay line-start, not select-all
+		{"\x01", "meta+a"},
+		{"\x01", "alt+a"},
+	}
+	for _, c := range neg {
+		if MatchesKey(c.data, c.key) {
+			t.Errorf("MatchesKey(%q, %q) = true, want false", c.data, c.key)
+		}
+	}
+	pos := []struct {
+		data string
+		key  KeyID
+	}{
+		{"a", "a"},
+		{"\x01", "ctrl+a"},
+		{"\x1ba", "alt+a"},
+		{"\x1b[97;33u", "meta+a"},      // kitty 'a' + meta
+		{"\x1b[97;37u", "ctrl+meta+a"}, // kitty 'a' + ctrl+meta
+		{"\x1b[97;9u", "super+a"},      // kitty 'a' + super
+	}
+	for _, c := range pos {
+		if !MatchesKey(c.data, c.key) {
+			t.Errorf("MatchesKey(%q, %q) = false, want true", c.data, c.key)
+		}
+	}
+}
+
 // C0 canonical mapping: the rare control bytes beyond ctrl+a..z resolve to
 // their canonical escape names.
 func TestParseC0Controls(t *testing.T) {

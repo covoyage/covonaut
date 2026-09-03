@@ -432,12 +432,21 @@ type parsedKeyID struct {
 	mods Modifier
 }
 
-// meaningfulMods strips modifier bits that should never participate in a
-// shortcut match. macOS terminals set Caps/NumLk from OS lock state, and
-// several emulators report Meta/Hyper spuriously (or alias them to Super);
-// a stray bit must not turn a clean "ctrl+p" into a different shortcut.
-func meaningfulMods(m Modifier) Modifier {
-	return m &^ (ModMeta | ModHyper | ModCaps | ModNumLk)
+// matchableMods strips incoming modifier bits that should not participate
+// in a shortcut match. Caps/NumLk are lock-state noise and are always
+// ignored. Meta/Hyper are ignored only when the binding does not ask for
+// them — so a clean "ctrl+c" still matches when the terminal also reported
+// a spurious Meta bit, but a binding of "meta+a" still requires Meta and
+// must not steal a plain "a".
+func matchableMods(got, want Modifier) Modifier {
+	got &^= ModCaps | ModNumLk
+	if want&ModMeta == 0 {
+		got &^= ModMeta
+	}
+	if want&ModHyper == 0 {
+		got &^= ModHyper
+	}
+	return got
 }
 
 func keysEqual(got Key, want parsedKeyID) bool {
@@ -447,12 +456,15 @@ func keysEqual(got Key, want parsedKeyID) bool {
 	if !strings.EqualFold(got.Name, want.name) {
 		return false
 	}
+	gotMods := matchableMods(got.Mods, want.mods)
+	wantMods := want.mods
 	// For printable keys, Shift is encoded in the case of the rune, so we
 	// compare mods *excluding* Shift.
 	if len(got.Name) == 1 {
-		return (meaningfulMods(got.Mods)&^ModShift) == (meaningfulMods(want.mods)&^ModShift)
+		gotMods &^= ModShift
+		wantMods &^= ModShift
 	}
-	return meaningfulMods(got.Mods) == meaningfulMods(want.mods)
+	return gotMods == wantMods
 }
 
 func parseKeyID(id string) parsedKeyID {
