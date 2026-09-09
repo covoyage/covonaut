@@ -108,9 +108,13 @@ type ChatAppConfig struct {
 	// context here so in-flight submissions are cancelled on Stop.
 	Context context.Context
 
-	OnSubmit     func(ctx context.Context, input string)
-	OnQuit       func()
-	OnInterrupt  func()
+	OnSubmit    func(ctx context.Context, input string)
+	OnQuit      func()
+	OnInterrupt func()
+	// CanInterrupt reports extra interrupt targets beyond the main agent
+	// turn (e.g. a side question). When true, Esc/Ctrl+C still fire
+	// OnInterrupt even if the main agent is idle.
+	CanInterrupt func() bool
 	OnImagePaste func()                                  // called when an image paste is detected (clipboard image, empty text)
 	OnQueue      func(ctx context.Context, input string) // Tab while the agent is running
 
@@ -495,6 +499,16 @@ func (a *ChatApp) isRunning() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.model.Running
+}
+
+func (a *ChatApp) shouldInterrupt() bool {
+	if a.cfg.OnInterrupt == nil {
+		return false
+	}
+	if a.isRunning() {
+		return true
+	}
+	return a.cfg.CanInterrupt != nil && a.cfg.CanInterrupt()
 }
 
 func (a *ChatApp) Subscribe(sub EventSubscriber) {
@@ -1377,15 +1391,13 @@ func (l *chatLayout) Update(msg core.Msg) core.Cmd {
 						}
 						return nil
 					}
-					// ESC while the agent is running interrupts the current turn
-					// (and drops any stale ghost preview).
-					if l.app.isRunning() && l.app.cfg.OnInterrupt != nil {
+					// ESC while the agent (or a side question) is running
+					// interrupts the current turn and drops any stale ghost.
+					if l.app.shouldInterrupt() {
 						if l.app.editor.GhostText() != "" {
 							l.app.editor.ClearGhost()
 						}
-						if l.app.cfg.OnInterrupt != nil {
-							l.app.cfg.OnInterrupt()
-						}
+						l.app.cfg.OnInterrupt()
 						return nil
 					}
 					// ESC also clears ghost text
@@ -1432,8 +1444,8 @@ func (l *chatLayout) Update(msg core.Msg) core.Cmd {
 							doCopy(l)
 							return nil
 						}
-						// Ctrl+C while agent is running: interrupt
-						if k.Mods&terminal.ModCtrl != 0 && l.app.cfg.OnInterrupt != nil && l.app.isRunning() {
+						// Ctrl+C while agent or side question is running: interrupt
+						if k.Mods&terminal.ModCtrl != 0 && l.app.shouldInterrupt() {
 							l.app.cfg.OnInterrupt()
 							return nil
 						}

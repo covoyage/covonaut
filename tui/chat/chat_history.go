@@ -194,7 +194,9 @@ type ChatHistory struct {
 	startLine       int64
 	dirty           bool
 	expandedGroups  map[int]bool // group message indices that are expanded
-	verbose         bool         // global verbose mode: expand everything, show full tool output
+	verbose         bool         // legacy: true when VerboseLevel=="full"
+	verboseLevel    string       // off | on | full; empty means "on"
+	revealUntil     int          // temporarily expand hidden tools through this message index; -1 = none
 	limits          DisplayLimits
 	// themeRev ticks on every SetTheme so per-message checkpoint render memos
 	// are invalidated even when the palette revision is unchanged.
@@ -244,6 +246,7 @@ func NewChatHistory() *ChatHistory {
 		follow:            true,
 		dirty:             true,
 		expandedGroups:    make(map[int]bool),
+		revealUntil:       -1,
 		limits:            DisplayLimits{}.withDefaults(),
 		reasoningRenderer: HiddenReasoningRenderer{},
 	}
@@ -273,6 +276,13 @@ func (h *ChatHistory) SetReasoningRenderer(r ReasoningRenderer) {
 	h.clearLineCacheLocked()
 	h.mu.Unlock()
 	h.invalidate()
+}
+
+// ReasoningRenderer returns the current thinking renderer.
+func (h *ChatHistory) ReasoningRenderer() ReasoningRenderer {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.reasoningRenderer
 }
 
 // SetOnInvalidate wires a callback invoked on any mutation (typically
@@ -335,22 +345,75 @@ func (h *ChatHistory) SetDisplayLimits(l DisplayLimits) {
 	h.dirty = true
 }
 
-// ToggleVerbose flips the global verbose mode (expand all collapsed tool
-// blocks and reveal full stored output). Returns the new state.
+func normalizeVerboseLevel(level string) string {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "off":
+		return "off"
+	case "full":
+		return "full"
+	default:
+		return "on"
+	}
+}
+
+func (h *ChatHistory) verboseLevelLocked() string {
+	if h.verboseLevel == "" {
+		if h.verbose {
+			return "full"
+		}
+		return "on"
+	}
+	return h.verboseLevel
+}
+
+func (h *ChatHistory) toolsHiddenLocked() bool {
+	return h.verboseLevelLocked() == "off"
+}
+
+func (h *ChatHistory) toolsFullLocked() bool {
+	return h.verboseLevelLocked() == "full"
+}
+
+// ToggleVerbose cycles on ↔ full (the high-frequency Ctrl+R path).
+// Off is only reachable via SetVerboseLevel.
 func (h *ChatHistory) ToggleVerbose() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.verbose = !h.verbose
+	if h.verboseLevelLocked() == "full" {
+		h.verboseLevel = "on"
+		h.verbose = false
+	} else {
+		h.verboseLevel = "full"
+		h.verbose = true
+	}
 	h.clearLineCacheLocked()
 	h.dirty = true
 	return h.verbose
 }
 
-// Verbose reports the current verbose mode.
+// SetVerboseLevel sets the global tool-output policy: off, on, or full.
+func (h *ChatHistory) SetVerboseLevel(level string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.verboseLevel = normalizeVerboseLevel(level)
+	h.verbose = h.verboseLevel == "full"
+	h.clearLineCacheLocked()
+	h.dirty = true
+	return h.verboseLevel
+}
+
+// VerboseLevel reports off, on, or full.
+func (h *ChatHistory) VerboseLevel() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.verboseLevelLocked()
+}
+
+// Verbose reports whether full tool output is shown.
 func (h *ChatHistory) Verbose() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.verbose
+	return h.toolsFullLocked()
 }
 
 // CollapseConsecutiveTools collapses consecutive tool/system messages
@@ -701,6 +764,7 @@ func (h *ChatHistory) Clear() {
 	h.dirty = true
 	h.selActive = false
 	h.selDragging = false
+	h.revealUntil = -1
 	h.mu.Unlock()
 	h.invalidate()
 }
@@ -824,6 +888,16 @@ func (h *ChatHistory) applyJumpLocked(line, total int64) {
 	h.offset = offset
 	h.follow = offset == 0
 	h.hasJump = false
+}
+
+// RevealThroughMessage temporarily expands collapsed tool groups so a
+// search hit inside a verbose-off transcript can be jumped to. Pass -1 to clear.
+func (h *ChatHistory) RevealThroughMessage(msgIndex int) {
+	h.mu.Lock()
+	h.revealUntil = msgIndex
+	h.dirty = true
+	h.mu.Unlock()
+	h.invalidate()
 }
 
 // MessageLineRange returns the cachedAll [start, end) range for message idx.
@@ -1008,7 +1082,7 @@ func (h *ChatHistory) toolArgPart(m ChatMessage, used, width int64, theme ChatHi
 	if m.ArgPreview == "" {
 		return ""
 	}
-	if h.verbose {
+	if h.toolsFullLocked() {
 		return " " + theme.DimStyle.Render("("+m.ArgPreview+")")
 	}
 	avail := width - used - 3 // " (" prefix + ")" suffix
@@ -1591,7 +1665,9 @@ func (h *ChatHistory) rebuildLayoutLocked(width int64) {
 					}
 				}
 			}
-			if groupEnd > i && !midTurn {
+			revealed := h.revealUntil >= 0 && i <= h.revealUntil && groupEnd >= h.revealUntil
+			hiddenOverride := h.toolsHiddenLocked() && !revealed
+			if (groupEnd > i || hiddenOverride) && !midTurn {
 				bar := theme.ToolBorder.Render("▌ ")
 				toolCount, sysCount := 0, 0
 				for j := i; j <= groupEnd; j++ {
@@ -1605,8 +1681,11 @@ func (h *ChatHistory) rebuildLayoutLocked(width int64) {
 				if !ok {
 					expanded = true
 				}
-				if h.verbose {
+				if h.toolsFullLocked() {
 					expanded = true
+				}
+				if hiddenOverride {
+					expanded = false
 				}
 				if expanded {
 					summary := fmt.Sprintf("[-] %d tools · %d msgs", toolCount, sysCount)
@@ -1845,6 +1924,26 @@ func (h *ChatHistory) renderMessage(m *ChatMessage, theme ChatHistoryTheme, widt
 	rev := h.themeRev + currentPaletteRevision()
 	switch m.Role {
 	case RoleUser:
+		if m.Meta == "side" {
+			bar := theme.DimStyle.Render("side ▌ ")
+			barW := core.VisibleWidth("side ▌ ")
+			innerW := width
+			if width > 0 {
+				innerW = width - barW
+				if innerW < 1 {
+					innerW = 1
+				}
+			}
+			body := m.mdLines(m.Text, innerW, theme.MarkdownTheme, rev)
+			if len(body) == 0 {
+				return []string{core.PadToWidth(bar, width)}
+			}
+			out := make([]string, len(body))
+			for i, ln := range body {
+				out[i] = core.PadToWidth(bar+ln, width)
+			}
+			return out
+		}
 		bar := theme.UserStyle.Render("▌ ")
 		barW := core.VisibleWidth("▌ ")
 		innerW := width
@@ -1864,6 +1963,24 @@ func (h *ChatHistory) renderMessage(m *ChatMessage, theme ChatHistoryTheme, widt
 		}
 		return out
 	case RoleAssistant:
+		if m.Meta == "side" {
+			prefix := theme.DimStyle.Render("side ")
+			var lines []string
+			if m.Pending && strings.TrimSpace(m.Text) != "" {
+				lines = core.WrapAnsi(prefix+theme.DimStyle.Render(m.Text), width)
+			} else {
+				body := m.mdLines(m.Text, width, theme.MarkdownTheme, rev)
+				if len(body) == 0 {
+					lines = []string{prefix}
+				} else {
+					lines = append([]string{prefix + body[0]}, body[1:]...)
+				}
+			}
+			if chip := strings.TrimSpace(m.FooterChip); chip != "" && !m.Pending {
+				lines = append(lines, theme.DimStyle.Render("  ▸ "+chip))
+			}
+			return lines
+		}
 		// Collapsed assistant messages (e.g. collapsed diffs)
 		if m.Collapsed && m.Text != "" {
 			// Show first line as summary + expand hint
@@ -1943,7 +2060,7 @@ func (h *ChatHistory) renderMessage(m *ChatMessage, theme ChatHistoryTheme, widt
 		}
 		bar := barColor.Render("▌")
 
-		detailShown := m.DetailVisible || h.verbose
+		detailShown := m.DetailVisible || h.toolsFullLocked()
 		argUsed := func() int64 {
 			used := int64(1) + 1 + core.VisibleWidth(theme.ToolPrefix+m.Meta) + 1
 			if detailShown {
@@ -1955,7 +2072,7 @@ func (h *ChatHistory) renderMessage(m *ChatMessage, theme ChatHistoryTheme, widt
 		}
 		argPart := h.toolArgPart(*m, argUsed(), width, theme)
 
-		if m.Collapsed && !h.verbose && !m.DetailVisible {
+		if m.Collapsed && !h.toolsFullLocked() && !m.DetailVisible {
 			summary := core.TruncateToWidth(m.Text, h.limits.ToolStatusMaxWidth, "...")
 			head := bar + " [+] " + theme.ToolStyle.Render(theme.ToolPrefix+m.Meta) + argPart + " " + theme.DimStyle.Render(summary)
 			return core.WrapAnsi(head, width)
@@ -1970,6 +2087,9 @@ func (h *ChatHistory) renderMessage(m *ChatMessage, theme ChatHistoryTheme, widt
 		return lines
 	case RoleError:
 		bar := theme.ErrorStyle.Render("▌ ")
+		if m.Meta == "side" {
+			bar = theme.ErrorStyle.Render("side ▌ ")
+		}
 		return core.WrapAnsi(bar+theme.ErrorStyle.Render(m.Text), width)
 	case RoleDivider:
 		ch := theme.DividerChar

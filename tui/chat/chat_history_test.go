@@ -706,3 +706,17 @@ func TestChatHistoryVirtualizedViewportKeepsOffscreenText(t *testing.T) {
 		t.Fatalf("scrolling up should reveal the offscreen prompt: %q", live)
 	}
 }
+
+func TestChatHistoryRendersSidePrefix(t *testing.T) {
+	h := NewChatHistory()
+	h.Append(ChatMessage{Role: RoleUser, Meta: "side", Text: "btw question"})
+	h.Append(ChatMessage{Role: RoleAssistant, Meta: "side", Text: "side answer"})
+	h.Append(ChatMessage{Role: RoleError, Meta: "side", Text: "side failed"})
+	plain := core.StripAnsi(strings.Join(h.Render(60), "\n"))
+	if !strings.Contains(plain, "side") {
+		t.Fatalf("missing side prefix: %q", plain)
+	}
+	if !strings.Contains(plain, "btw question") || !strings.Contains(plain, "side answer") || !strings.Contains(plain, "side failed") {
+		t.Fatalf("missing side text: %q", plain)
+	}
+}

@@ -361,6 +361,14 @@ func (a *Agent) InvokeTool(ctx context.Context, name string, args json.RawMessag
 // Use this to redirect or interrupt the agent mid-conversation.
 func (a *Agent) Steer(msg Message) { a.steering.Push(msg) }
 
+// ClearSteering drops pending steering messages that have not yet been
+// injected into the transcript. Call this when the current run is cancelled
+// so a leftover steer cannot leak into the next Run.
+func (a *Agent) ClearSteering() { a.steering.Clear() }
+
+// SteeringPending reports how many steering messages are waiting.
+func (a *Agent) SteeringPending() int64 { return a.steering.Len() }
+
 // FollowUp queues a message that will be processed after the current
 // conversation finishes (no more tool calls). The agent loop restarts
 // with the follow-up as new input.
@@ -560,6 +568,9 @@ func (a *Agent) Run(ctx context.Context, input string) (string, error) {
 	}
 
 	output, err := a.runLoop(ctx)
+	if ctx.Err() != nil {
+		a.ClearSteering()
+	}
 
 	// Lifecycle: AfterAgentRun
 	if lc := a.lifecycle(); lc != nil {
@@ -592,6 +603,9 @@ func (a *Agent) Continue(ctx context.Context) (string, error) {
 	})
 
 	output, err := a.runLoop(ctx)
+	if ctx.Err() != nil {
+		a.ClearSteering()
+	}
 	if err != nil {
 		span.RecordError(err)
 	}
@@ -632,6 +646,9 @@ func (a *Agent) Resume(ctx context.Context) (string, error) {
 
 	defer a.eventBus.Drain()
 	output, err := a.runLoop(ctx)
+	if ctx.Err() != nil {
+		a.ClearSteering()
+	}
 	if err != nil {
 		span.RecordError(err)
 		a.recordAgentError(ctx, err)

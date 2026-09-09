@@ -56,6 +56,77 @@ func TestVerboseExpandsCollapsedTool(t *testing.T) {
 	}
 }
 
+func TestVerboseLevelOffOnFull(t *testing.T) {
+	h := NewChatHistory()
+	h.Append(ChatMessage{Role: RoleUser, Text: "run tests"})
+	h.Append(ChatMessage{
+		Role:       RoleTool,
+		Meta:       "bash",
+		ArgPreview: "go test",
+		Text:       "✓ done",
+		Collapsed:  true,
+		Detail:     "PASS",
+	})
+	h.Append(ChatMessage{Role: RoleAssistant, Text: "ok"})
+
+	if got := h.SetVerboseLevel("off"); got != "off" {
+		t.Fatalf("level=%q", got)
+	}
+	off := strings.Join(h.Render(100), "\n")
+	if !strings.Contains(off, "[+]") {
+		t.Fatalf("off should collapse tools, got:\n%s", off)
+	}
+	if strings.Contains(off, "PASS") {
+		t.Fatalf("off must hide detail:\n%s", off)
+	}
+
+	if got := h.SetVerboseLevel("on"); got != "on" {
+		t.Fatalf("level=%q", got)
+	}
+	on := strings.Join(h.Render(100), "\n")
+	if !strings.Contains(on, "bash") {
+		t.Fatalf("on should show tool head:\n%s", on)
+	}
+	if strings.Contains(on, "PASS") {
+		t.Fatalf("on must keep collapsed detail hidden:\n%s", on)
+	}
+
+	if got := h.SetVerboseLevel("full"); got != "full" {
+		t.Fatalf("level=%q", got)
+	}
+	full := strings.Join(h.Render(100), "\n")
+	if !strings.Contains(full, "PASS") {
+		t.Fatalf("full must reveal detail:\n%s", full)
+	}
+
+	h.ToggleVerbose()
+	if got := h.VerboseLevel(); got != "on" {
+		t.Fatalf("toggle from full should land on, got %q", got)
+	}
+}
+
+func TestRevealThroughMessageExpandsHiddenToolGroup(t *testing.T) {
+	h := NewChatHistory()
+	h.Append(ChatMessage{Role: RoleUser, Text: "run"})
+	h.Append(ChatMessage{Role: RoleTool, Meta: "bash", Text: "secret-hit", Collapsed: true, Detail: "secret-hit"})
+	h.Append(ChatMessage{Role: RoleAssistant, Text: "done"})
+	h.SetVerboseLevel("off")
+	off := core.StripAnsi(strings.Join(h.Render(80), "\n"))
+	if strings.Contains(off, "secret-hit") {
+		t.Fatalf("off should hide tool body: %q", off)
+	}
+	h.RevealThroughMessage(1)
+	revealed := core.StripAnsi(strings.Join(h.Render(80), "\n"))
+	if !strings.Contains(revealed, "secret-hit") {
+		t.Fatalf("reveal should expand matched tool group: %q", revealed)
+	}
+	h.RevealThroughMessage(-1)
+	hidden := core.StripAnsi(strings.Join(h.Render(80), "\n"))
+	if strings.Contains(hidden, "secret-hit") {
+		t.Fatalf("clearing reveal should hide again: %q", hidden)
+	}
+}
+
 func TestToolArgFitsWidth(t *testing.T) {
 	h := NewChatHistory()
 	long := strings.Repeat("arg-", 60) // 240 runes
@@ -200,4 +271,3 @@ func TestStaleGhostDroppedAfterSubmitClear(t *testing.T) {
 	}
 	t.Fatalf("fresh ghost never appeared; requests=%d", requests)
 }
-

@@ -25,18 +25,20 @@ type HiddenReasoningRenderer struct{}
 
 func (HiddenReasoningRenderer) RenderThinking(_ ChatMessage, _ int64) []string { return nil }
 
-// DefaultReasoningRenderer preserves the legacy reasoning display policy:
-// thinking segments are shown (or hidden) and collapsed (or expanded)
-// according to the Show and Mode fields.
+const thinkingTruncateLines = 8
+
+// DefaultReasoningRenderer preserves the reasoning display policy:
+// thinking segments are shown (or hidden) according to Show and Mode.
 //
-//   - Show=false: emit nothing.
+//   - Show=false or Mode="hide": emit nothing (segments stay in the message).
+//   - Mode="summary" / "collapsed": one-line summary per segment.
+//   - Mode="truncated": first thinkingTruncateLines of each segment, then "…".
 //   - Mode="full": always expand every segment.
-//   - Mode="truncated": respect per-segment Collapsed flag (legacy behaviour
-//     kept "truncated" semantically equivalent to non-"full" for now).
-//   - Mode="collapsed" (or any other value): respect per-segment Collapsed flag.
+//   - Per-segment Collapsed still wins for summary/truncated unless Mode=full.
 type DefaultReasoningRenderer struct {
-	Show bool
-	Mode string // "collapsed" / "truncated" / "full"
+	Show   bool
+	Stream bool   // when false, hide thinking on pending (streaming) messages
+	Mode   string // "hide" / "summary"|"collapsed" / "truncated" / "full"
 }
 
 // RenderThinking uses a pointer receiver so that runtime mutations to
@@ -44,7 +46,14 @@ type DefaultReasoningRenderer struct {
 // receiver would snapshot the fields at the moment the value was assigned
 // to the ReasoningRenderer interface, making later tweaks invisible.
 func (r *DefaultReasoningRenderer) RenderThinking(m ChatMessage, width int64) []string {
-	if !r.Show {
+	if r == nil || !r.Show {
+		return nil
+	}
+	mode := strings.ToLower(strings.TrimSpace(r.Mode))
+	if mode == "hide" {
+		return nil
+	}
+	if m.Pending && !r.Stream {
 		return nil
 	}
 	pal := theme.CurrentPalette()
@@ -53,20 +62,29 @@ func (r *DefaultReasoningRenderer) RenderThinking(m ChatMessage, width int64) []
 		if seg.Text == "" {
 			continue
 		}
-		lineCount := len(strings.Split(seg.Text, "\n"))
+		rawLines := strings.Split(seg.Text, "\n")
+		lineCount := len(rawLines)
 
 		collapsed := seg.Collapsed
-		if r.Mode == "full" {
+		if mode == "full" {
 			collapsed = false
 		}
-		// "truncated" / "collapsed" / any other value all just respect the
-		// per-segment Collapsed flag (already captured in `collapsed`), so no
-		// extra branch is needed.
+		if mode == "summary" || mode == "collapsed" {
+			collapsed = true
+		}
 
-		if collapsed {
+		switch {
+		case collapsed:
 			summary := fmt.Sprintf("💭 Thinking (%d lines)", lineCount)
 			out = append(out, pal.Thinking.Render(summary))
-		} else {
+		case mode == "truncated" && lineCount > thinkingTruncateLines:
+			out = append(out, pal.Thinking.Render("💭 Thinking"))
+			shown := strings.Join(rawLines[:thinkingTruncateLines], "\n")
+			for _, line := range core.WrapAnsi(pal.Thinking.Render(shown), width) {
+				out = append(out, "  "+line)
+			}
+			out = append(out, pal.Dim.Render(fmt.Sprintf("  … %d lines", lineCount-thinkingTruncateLines)))
+		default:
 			out = append(out, pal.Thinking.Render("💭 Thinking"))
 			for _, line := range core.WrapAnsi(pal.Thinking.Render(seg.Text), width) {
 				out = append(out, "  "+line)

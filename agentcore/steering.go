@@ -59,3 +59,10 @@ func (q *messageQueue) Len() int64 {
 	defer q.mu.Unlock()
 	return int64(len(q.msgs))
 }
+
+// Clear drops pending messages without returning them.
+func (q *messageQueue) Clear() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.msgs = nil
+}

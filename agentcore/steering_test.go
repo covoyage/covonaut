@@ -74,6 +74,19 @@ func TestMessageQueueLen(t *testing.T) {
 	}
 }
 
+func TestMessageQueueClear(t *testing.T) {
+	q := newMessageQueue(SteeringAll)
+	q.Push(Message{Role: RoleUser, Content: "a"})
+	q.Push(Message{Role: RoleUser, Content: "b"})
+	q.Clear()
+	if q.Len() != 0 {
+		t.Fatalf("expected 0 after clear, got %d", q.Len())
+	}
+	if msgs := q.Drain(); msgs != nil {
+		t.Fatalf("expected nil drain after clear, got %v", msgs)
+	}
+}
+
 func TestMessageQueueConcurrentSafety(t *testing.T) {
 	q := newMessageQueue(SteeringAll)
 	var wg sync.WaitGroup

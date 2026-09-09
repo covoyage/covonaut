@@ -573,3 +573,38 @@ func TestFencedContentPreview(t *testing.T) {
 		t.Errorf("expected exactly 2 fence markers, got %d: %q", fenceCount, out)
 	}
 }
+
+func TestEscapeInterruptsSideQuestionWhenIdle(t *testing.T) {
+	var interrupted bool
+	app, _ := newTestChatApp(t, ChatAppConfig{
+		OnInterrupt:  func() { interrupted = true },
+		CanInterrupt: func() bool { return true },
+	})
+	app.layout.Update(core.KeyMsg{Data: "\x1b"})
+	if !interrupted {
+		t.Fatal("expected Esc to interrupt a side question while main is idle")
+	}
+}
+
+func TestEscapeDoesNotInterruptWhenIdleWithoutCanInterrupt(t *testing.T) {
+	var interrupted bool
+	app, _ := newTestChatApp(t, ChatAppConfig{
+		OnInterrupt: func() { interrupted = true },
+	})
+	app.layout.Update(core.KeyMsg{Data: "\x1b"})
+	if interrupted {
+		t.Fatal("idle Esc should not interrupt")
+	}
+}
+
+func TestEscapeInterruptsWhenMainRunning(t *testing.T) {
+	var interrupted bool
+	app, _ := newTestChatApp(t, ChatAppConfig{
+		OnInterrupt: func() { interrupted = true },
+	})
+	app.Busy("working")
+	app.layout.Update(core.KeyMsg{Data: "\x1b"})
+	if !interrupted {
+		t.Fatal("expected Esc to interrupt a running agent")
+	}
+}
