@@ -85,6 +85,12 @@ type ChatAppConfig struct {
 	// any-motion, ?1003h).
 	InputRail bool
 
+	// HorizontalMargin insets the content area (history text, editor,
+	// status bar, footer) from the window's left/right edges by this many
+	// columns on each side. The input rail keeps hugging the true window
+	// right edge regardless of this margin. Default 0 (edge-to-edge).
+	HorizontalMargin int64
+
 	EditorMinRows int64
 	EditorMaxRows int64
 	EditorPrompt  string
@@ -346,7 +352,10 @@ func newChatApp(cfg ChatAppConfig) *ChatApp {
 		loader:    loader,
 		statusBar: statusBar,
 		ac:        chatApp.ac,
+		hMargin:   cfg.HorizontalMargin,
 	}
+	// history 的边距在组件内部生效（内容缩进、rail 仍贴窗口右缘）。
+	history.SetHorizontalMargin(cfg.HorizontalMargin)
 	chatApp.layout = layout
 
 	// Ghost generation guard: every editor change — including the clear on
@@ -1180,6 +1189,11 @@ type chatLayout struct {
 	// computed by the most recent Render call. Used to translate MouseMsg
 	// screen coordinates into the editor's own row space (see Update).
 	editorTop int64
+	// hMargin insets all content from the window's left/right edges
+	// (ChatAppConfig.HorizontalMargin). The history applies the same inset
+	// internally (see ChatHistory.SetHorizontalMargin) while its rail keeps
+	// hugging the true window right edge.
+	hMargin int64
 }
 
 type textSelectionComponent interface {
@@ -1202,20 +1216,39 @@ func (l *chatLayout) Render(width int64) []string {
 	var out []string
 	var loaderLines, editorLines, statusLines, footerLines, acLines []string
 
-	editorLines = l.editor.Render(width)
-	editorBorder := theme.CurrentPalette().Border.Render(strings.Repeat("─", int(width)))
+	// 内容区宽度：左右各内缩 hMargin 列。rail 由 history 内部按全宽贴
+	// 窗口右缘，不受此影响。
+	contentW := width - 2*l.hMargin
+	if contentW < 1 {
+		contentW = 1
+	}
+	// padLines 给组件输出补上左右边距空白（右侧补齐到全宽）。
+	padLines := func(ls []string) []string {
+		if l.hMargin <= 0 || len(ls) == 0 {
+			return ls
+		}
+		pad := strings.Repeat(" ", int(l.hMargin))
+		for i := range ls {
+			ls[i] = core.PadToWidth(pad+ls[i], width)
+		}
+		return ls
+	}
+
+	editorLines = l.editor.Render(contentW)
+	editorBorder := theme.CurrentPalette().Border.Render(strings.Repeat("─", int(contentW)))
 	editorLines = append(append([]string{editorBorder}, editorLines...), editorBorder)
+	editorLines = padLines(editorLines)
 	if l.loader != nil && l.loader.IsRunning() {
-		loaderLines = l.loader.Render(width)
+		loaderLines = padLines(l.loader.Render(contentW))
 	}
 	if l.footer != nil {
-		footerLines = l.footer.Render(width)
+		footerLines = padLines(l.footer.Render(contentW))
 	}
 	if l.statusBar != nil {
-		statusLines = l.statusBar.Render(width)
+		statusLines = padLines(l.statusBar.Render(contentW))
 	}
 	if l.ac != nil && l.ac.Active() {
-		acLines = l.ac.Render(width)
+		acLines = padLines(l.ac.Render(contentW))
 	}
 
 	reserved := int64(len(editorLines) + len(loaderLines) + len(footerLines) + len(statusLines) + len(acLines))
@@ -1373,6 +1406,7 @@ func (l *chatLayout) Update(msg core.Msg) core.Cmd {
 			if upd, ok := l.editor.(core.Updatable); ok {
 				editorAdjusted := m
 				editorAdjusted.Row -= l.editorTop + 1
+				editorAdjusted.Col -= l.hMargin
 				upd.Update(editorAdjusted)
 			}
 		case core.KeyMsg:
@@ -1491,20 +1525,25 @@ func (l *chatLayout) Update(msg core.Msg) core.Cmd {
 
 func (l *chatLayout) recalcMaxRows(width, height int64) {
 	var loaderH, editorH, footerH, statusH, acH int64
+	// 高度估算用内容宽（与 Render 一致），避免 margin 导致的换行差。
+	contentW := width - 2*l.hMargin
+	if contentW < 1 {
+		contentW = 1
+	}
 	if l.editor != nil {
-		editorH = int64(len(l.editor.Render(width))) + 2
+		editorH = int64(len(l.editor.Render(contentW))) + 2
 	}
 	if l.loader != nil && l.loader.IsRunning() {
-		loaderH = int64(len(l.loader.Render(width)))
+		loaderH = int64(len(l.loader.Render(contentW)))
 	}
 	if l.footer != nil {
-		footerH = int64(len(l.footer.Render(width)))
+		footerH = int64(len(l.footer.Render(contentW)))
 	}
 	if l.statusBar != nil {
-		statusH = int64(len(l.statusBar.Render(width)))
+		statusH = int64(len(l.statusBar.Render(contentW)))
 	}
 	if l.ac != nil && l.ac.Active() {
-		acH = int64(len(l.ac.Render(width)))
+		acH = int64(len(l.ac.Render(contentW)))
 	}
 	reserved := editorH + loaderH + footerH + statusH + acH
 	remaining := height - reserved

@@ -35,6 +35,67 @@ const (
 	totalTestLines  = 30
 )
 
+// TestRailHorizontalMargin 验证内容边距：内容行左右内缩（左边距前缀、
+// 内容按 width-2*m 换行），而 rail tick 仍贴窗口右缘、命中测试用全宽。
+func TestRailHorizontalMargin(t *testing.T) {
+	h := railTestHistory(t, railTestWidth, railTestMaxRows)
+	h.SetHorizontalMargin(2)
+	lines := h.Render(railTestWidth)
+
+	h.mu.Lock()
+	tickN := len(h.rail.ticks)
+	firstRow := -1
+	if tickN > 0 {
+		firstRow = h.rail.ticks[0].row
+	}
+	h.mu.Unlock()
+	if tickN == 0 {
+		t.Fatalf("no ticks with margin set")
+	}
+
+	// 内容行：非空行剥 ANSI 后应以 2 格左边距开头。
+	contentIndented := false
+	for _, ln := range lines {
+		plain := stripANSI(ln)
+		if strings.TrimSpace(plain) == "" {
+			continue
+		}
+		if strings.HasPrefix(plain, "  ") {
+			contentIndented = true
+		}
+		break
+	}
+	if !contentIndented {
+		t.Fatalf("content not indented by margin after SetHorizontalMargin(2)")
+	}
+
+	// rail tick：仍落在窗口最右缘（行尾 railDrawCols 列内）。
+	tickAtEdge := false
+	for r, ln := range lines {
+		if r != firstRow {
+			continue
+		}
+		plain := stripANSI(ln)
+		tail := plain
+		if len(tail) > int(railDrawCols) {
+			tail = tail[len(tail)-int(railDrawCols):]
+		}
+		tickAtEdge = strings.Contains(tail, "─")
+	}
+	if !tickAtEdge {
+		t.Fatalf("tick not at window right edge with margin set")
+	}
+
+	// 命中测试：hover 用屏幕全宽坐标（railCol = 全宽 - railHitCols）。
+	h.Update(core.MouseMsg{Action: core.MouseMotion, Row: int64(firstRow), Col: railCol()})
+	h.mu.Lock()
+	hover := h.rail.hover
+	h.mu.Unlock()
+	if hover != 0 {
+		t.Fatalf("rail hover with screen col not captured (hover=%d)", hover)
+	}
+}
+
 func railCol() int64 { return railTestWidth - railHitCols }
 
 // TestRailSpreadRows 验证居中聚拢分布：少量输入聚在中间，增多后向两边
@@ -332,6 +393,39 @@ func TestRailPopupSlideIn(t *testing.T) {
 		if strings.Contains(stripANSI(ln), "first input") {
 			t.Fatalf("popup content still visible after slide-out")
 		}
+	}
+}
+
+// TestRailPopupShadow 验证浮层投影：完全展开后，浮层每一行右缘外 1 列
+// 与底部 1 行应出现投影背景色（256 色 235）。需强制开色（无 TTY 环境
+// 下 Style.Render 退化为纯文本）。
+func TestRailPopupShadow(t *testing.T) {
+	theme.ForceColor(true)
+	t.Cleanup(func() { theme.ForceColor(false) })
+
+	h := railTestHistory(t, railTestWidth, railTestMaxRows)
+	h.mu.Lock()
+	row := h.rail.ticks[0].row
+	h.mu.Unlock()
+	h.Update(core.MouseMsg{Action: core.MouseMotion, Row: int64(row), Col: railCol()})
+	lines := railDriveFrames(h, 20)
+
+	h.mu.Lock()
+	popupH := h.rail.popupH
+	h.mu.Unlock()
+	if popupH == 0 {
+		t.Fatalf("popup not expanded; cannot assert shadow")
+	}
+
+	shadowRows := 0
+	for _, ln := range lines {
+		if strings.Contains(ln, "\x1b[48;5;235m") {
+			shadowRows++
+		}
+	}
+	// 右缘投影 popupH 行 + 底部投影 1 行。
+	if shadowRows != popupH+1 {
+		t.Fatalf("shadow rows = %d, want %d (popup %d rows + bottom 1)", shadowRows, popupH+1, popupH)
 	}
 }
 

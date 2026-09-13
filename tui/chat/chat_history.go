@@ -186,7 +186,9 @@ type ChatHistory struct {
 	// layout cache keyed on width + invalidation counter.
 	// cachedAll holds the current viewport window (absolute startLine..),
 	// not the full transcript. cachedTotal is the virtual line count.
-	cachedWidth     int64
+	cachedWidth     int64 // 内容区宽度（不含左右边距）
+	fullW           int64 // 屏幕全宽：rail 贴此右缘，内容宽 = fullW - 2*hMargin
+	hMargin         int64 // 内容区左右边距（列），0 = 贴边
 	cachedAll       []string
 	cachedMsgRanges []msgRange
 	layoutLines     [][]string // per-span lines parallel to cachedMsgRanges
@@ -208,6 +210,16 @@ type ChatHistory struct {
 
 	// callback invoked when a message is copied
 	onCopy func(text string)
+
+	// turn footer chip 的「复制」按钮点击反馈：最近复制的消息 ID 与时刻，
+	// 2s 内该 chip 的按钮显示「已复制」。
+	copiedID string
+	copiedAt time.Time
+
+	// chip 复制按钮的格式选择菜单：点「复制」后原位展开为
+	// 「⧉ Markdown │ ⧉ 解析后」，选择格式后复制并收起。
+	chipMenuID string
+	chipMenuAt time.Time
 
 	// Scrollback mode: previous turns' user/assistant messages are written
 	// to native terminal scrollback via emitFn and excluded from subsequent
@@ -337,6 +349,24 @@ func (h *ChatHistory) SetMaxRowsDirect(n int64) {
 	h.mu.Lock()
 	h.maxRows = n
 	h.mu.Unlock()
+}
+
+// SetHorizontalMargin 设置内容区左右边距（列）。内容按 width-2*m 渲染并
+// 左右补空白；rail 与浮层仍按全宽贴窗口右缘。m<=0 恢复贴边。
+func (h *ChatHistory) SetHorizontalMargin(m int64) {
+	if m < 0 {
+		m = 0
+	}
+	h.mu.Lock()
+	if h.hMargin == m {
+		h.mu.Unlock()
+		return
+	}
+	h.hMargin = m
+	h.clearLineCacheLocked()
+	h.dirty = true
+	h.mu.Unlock()
+	h.invalidate()
 }
 
 // SetDisplayLimits updates the transcript rendering caps (zero values fall
@@ -922,18 +952,25 @@ func (h *ChatHistory) MessageLineRange(msgIndex int) (start, end int, ok bool) {
 }
 
 // Render draws the transcript, assembling only the visible window.
+// 内容区宽度为 width-2*hMargin（左右各内缩 hMargin 列）；输出行左右补
+// 空白到全宽，rail/浮层叠加在全宽坐标系上（贴窗口右缘）。
 func (h *ChatHistory) Render(width int64) []string {
 	if width < 1 {
 		width = 1
 	}
 	h.mu.Lock()
+	h.fullW = width
+	contentW := width - 2*h.hMargin
+	if contentW < 1 {
+		contentW = 1
+	}
 	wasDirty := h.dirty
-	if h.dirty || h.cachedWidth != width {
-		if h.cachedWidth != width {
+	if h.dirty || h.cachedWidth != contentW {
+		if h.cachedWidth != contentW {
 			h.clearLineCacheLocked()
 		}
-		h.rebuildLayoutLocked(width)
-		h.cachedWidth = width
+		h.rebuildLayoutLocked(contentW)
+		h.cachedWidth = contentW
 		h.dirty = false
 		if wasDirty && h.follow {
 			h.offset = 0
@@ -971,7 +1008,7 @@ func (h *ChatHistory) Render(width int64) []string {
 	}
 	visible := h.assembleViewportLocked(start, end)
 	if h.selActive && !h.isSelectionEmptyLocked() {
-		h.applySelectionHighlightLocked(visible, width)
+		h.applySelectionHighlightLocked(visible, contentW)
 	}
 	sticky := ""
 	if !follow && offset > 0 {
@@ -998,7 +1035,18 @@ func (h *ChatHistory) Render(width int64) []string {
 	// Also clamp over-wide lines (streaming cursor, wide CJK) so a wrap
 	// cannot push the footer/status bar down. This runs on every path,
 	// including short transcripts that previously skipped the clamp.
-	return h.applyRailOverlay(fitHistoryLines(visible, width), width)
+	out := fitHistoryLines(visible, contentW)
+	if m := h.hMargin; m > 0 {
+		pad := strings.Repeat(" ", int(m))
+		for i := range out {
+			out[i] = pad + out[i]
+		}
+	}
+	for i := range out {
+		out[i] = core.PadToWidth(out[i], width)
+	}
+	// rail 与浮层叠加在全宽坐标系上：tick 贴窗口右缘，不随内容边距内缩。
+	return h.applyRailOverlay(out, width)
 }
 
 func (h *ChatHistory) stickyUserPromptLocked(maxRows, offset int64) string {
@@ -1266,6 +1314,19 @@ func (h *ChatHistory) handleMouse(m core.MouseMsg) {
 			h.mu.Unlock()
 			return
 		}
+		// Chip 复制菜单优先：点在菜单所在 chip 行按选项/收起处理；点在
+		// 别处则先收起菜单，本次点击继续走正常路径（折叠、选区等）。
+		if h.chipMenuID != "" {
+			if h.tryCopyChipAtLineLocked(absLine, m.Col-h.hMargin) {
+				h.dirty = true
+				needInvalidate = true
+				h.mu.Unlock()
+				h.invalidate()
+				return
+			}
+			h.closeChipMenuLocked()
+			needInvalidate = true
+		}
 		if h.tryToggleThinkingAtLineLocked(absLine) {
 			h.dirty = true
 			needInvalidate = true
@@ -1283,8 +1344,17 @@ func (h *ChatHistory) handleMouse(m core.MouseMsg) {
 			h.invalidate()
 			return
 		}
+		// Click on a turn footer chip's copy button: copy that turn's user
+		// input. Consumed clicks do not start a text selection.
+		if h.tryCopyChipAtLineLocked(absLine, m.Col-h.hMargin) {
+			h.dirty = true
+			needInvalidate = true
+			h.mu.Unlock()
+			h.invalidate()
+			return
+		}
 		// Start selection — convert viewport row to absolute line index
-		mappedCol := h.mapMouseColToVisibleColLocked(absLine, m.Col)
+		mappedCol := h.mapMouseColToVisibleColLocked(absLine, m.Col-h.hMargin)
 		h.selDragging = true
 		h.selActive = true
 		h.selStart = selectionPos{line: absLine, col: mappedCol}
@@ -1310,7 +1380,7 @@ func (h *ChatHistory) handleMouse(m core.MouseMsg) {
 		if h.selDragging {
 			absLine := h.viewportRowToAbsoluteLocked(m.Row)
 			if absLine >= 0 {
-				mappedCol := h.mapMouseColToVisibleColLocked(absLine, m.Col)
+				mappedCol := h.mapMouseColToVisibleColLocked(absLine, m.Col-h.hMargin)
 				h.selEnd = selectionPos{line: absLine, col: mappedCol}
 				h.dirty = true // force re-render to update selection highlight
 				needInvalidate = true
@@ -1998,6 +2068,172 @@ func trimBlankEdges(lines []string) []string {
 	return lines[start:end]
 }
 
+// turn footer chip 的复制按钮文案与几何：行结构为
+// "  ▸ <chip>" + " │ " + <label>，命中测试与渲染共用这套常量。
+// label 有三种形态：关闭态 "⎘ 复制"、菜单态 "⎘ Markdown │ ⎘ 解析后"、
+// 复制反馈 "✓ 已复制"。图标用 U+2398（⎘）——单格宽、笔画细。
+const (
+	chipIcon        = "⎘ "
+	chipCopyLabel   = chipIcon + "复制"
+	chipCopiedLabel = "✓ 已复制"
+	chipOptMD       = chipIcon + "Markdown" // 菜单选项：复制 markdown 源码
+	chipOptPlain    = chipIcon + "解析后"    // 菜单选项：复制解析后的纯文本
+	chipPrefixCols  = 4                     // "  ▸ "
+	chipSepCols     = 3                     // " │ "
+	chipCopiedFor   = 2 * time.Second
+	chipMenuFor     = 10 * time.Second // 菜单无人理睬时的自动收起时长
+)
+
+// chipLine 渲染 turn footer chip 行：▸ <chip> │ <label>。label 随状态切换
+// （复制按钮 / 格式菜单 / 已复制反馈）。调用方须持有 h.mu。
+func (h *ChatHistory) chipLine(m *ChatMessage, chip string) string {
+	base := h.theme.DimStyle.Render("  ▸ " + chip) + h.theme.DimStyle.Render(" │ ")
+	if m.ID != "" && m.ID == h.copiedID && time.Since(h.copiedAt) < chipCopiedFor {
+		return base + h.theme.SuccessStyle.Render(chipCopiedLabel)
+	}
+	if m.ID != "" && m.ID == h.chipMenuID && time.Since(h.chipMenuAt) < chipMenuFor {
+		return base + h.theme.DimStyle.Render(chipOptMD) +
+			h.theme.DimStyle.Render(" │ ") +
+			h.theme.DimStyle.Render(chipOptPlain)
+	}
+	return base + h.theme.DimStyle.Render(chipCopyLabel)
+}
+
+// chipMenuOpen 报告该消息的格式选择菜单当前是否展开。调用方须持有 h.mu。
+func (h *ChatHistory) chipMenuOpen(m *ChatMessage) bool {
+	return m.ID != "" && m.ID == h.chipMenuID && time.Since(h.chipMenuAt) < chipMenuFor
+}
+
+// closeChipMenuLocked 收起格式选择菜单并让对应 chip 行重渲染。调用方须持有 h.mu。
+func (h *ChatHistory) closeChipMenuLocked() {
+	id := h.chipMenuID
+	h.chipMenuID = ""
+	if id == "" {
+		return
+	}
+	for i := range h.messages {
+		if h.messages[i].ID == id {
+			h.messages[i].cachedLines = nil
+			break
+		}
+	}
+	h.dirty = true
+}
+
+// chipPlainCopyText 把 markdown 源码解析成纯文本（component.MarkdownPlain），
+// 用于「解析后」复制——不带终端渲染的样式、边框与硬换行。
+func (h *ChatHistory) chipPlainCopyText(src string) string {
+	return component.MarkdownPlain(src)
+}
+
+// tryCopyChipAtLineLocked 处理 turn footer chip 上复制控件的点击。
+// 关闭态：点击「⧉ 复制」展开格式选择菜单；菜单态：点击选项复制对应格式
+// 的该 turn 助手输出（Markdown 源码 / 解析后纯文本）。命中时返回 true
+// （事件被 consume）。col 是内容区行内可见列（已扣除边距）。调用方须持有 h.mu。
+func (h *ChatHistory) tryCopyChipAtLineLocked(absLine, col int64) bool {
+	for _, r := range h.cachedMsgRanges {
+		if absLine < int64(r.startLine) || absLine >= int64(r.endLine) {
+			continue
+		}
+		if r.toolGroup || r.msgIndex < 0 || r.msgIndex >= len(h.messages) {
+			return false
+		}
+		m := &h.messages[r.msgIndex]
+		chip := strings.TrimSpace(m.FooterChip)
+		if m.Role != RoleAssistant || chip == "" || m.Pending {
+			return false
+		}
+		// 按钮在 chip 行（该 span 的最后一行）上。
+		if absLine != int64(r.endLine-1) {
+			return false
+		}
+		// label 起始列 = "  ▸ " + chip + " │ "。
+		labelStart := int64(chipPrefixCols + core.VisibleWidth(chip) + chipSepCols)
+		if h.chipMenuOpen(m) {
+			wMD := int64(core.VisibleWidth(chipOptMD))
+			plainStart := labelStart + wMD + int64(chipSepCols)
+			wPlain := int64(core.VisibleWidth(chipOptPlain))
+			switch {
+			case col >= labelStart && col < labelStart+wMD:
+				h.closeChipMenuLocked()
+				h.copyChipText(m, strings.TrimSpace(m.Text))
+			case col >= plainStart && col < plainStart+wPlain:
+				h.closeChipMenuLocked()
+				h.copyChipText(m, h.chipPlainCopyText(m.Text))
+			default:
+				// 点在 chip 行其余位置：仅收起菜单。
+				h.closeChipMenuLocked()
+			}
+			return true
+		}
+		if col < labelStart || col >= labelStart+int64(core.VisibleWidth(chipCopyLabel)) {
+			return false
+		}
+		// 展开格式选择菜单（若别处有菜单开着，先收起）。
+		if m.ID != "" {
+			h.closeChipMenuLocked()
+			h.chipMenuID = m.ID
+			h.chipMenuAt = time.Now()
+			m.cachedLines = nil // 让 chip 行按菜单态重渲染
+			h.dirty = true
+			id := m.ID
+			time.AfterFunc(chipMenuFor+100*time.Millisecond, func() {
+				h.mu.Lock()
+				if h.chipMenuID == id {
+					h.chipMenuID = ""
+					for i := range h.messages {
+						if h.messages[i].ID == id {
+							h.messages[i].cachedLines = nil
+							h.dirty = true
+							break
+						}
+					}
+				}
+				h.mu.Unlock()
+				h.invalidate()
+			})
+		}
+		return true
+	}
+	return false
+}
+
+// copyChipText 复制文本（经 onCopy hook）并显示「已复制」反馈，2s 后恢复。
+// 调用方须持有 h.mu。
+func (h *ChatHistory) copyChipText(m *ChatMessage, text string) {
+	if text == "" {
+		return
+	}
+	if h.onCopy != nil {
+		h.onCopy(text)
+	}
+	if m.ID == "" {
+		return
+	}
+	h.copiedID = m.ID
+	h.copiedAt = time.Now()
+	m.cachedLines = nil // 让 chip 行按「已复制」态重渲染
+	h.dirty = true
+	// 反馈到期：清状态并让该消息的 chip 行重渲染（只 invalidate
+	// 不够——Render 看到 !dirty 会直接复用布局缓存）。
+	id := m.ID
+	time.AfterFunc(chipCopiedFor+100*time.Millisecond, func() {
+		h.mu.Lock()
+		if h.copiedID == id {
+			h.copiedID = ""
+			for i := range h.messages {
+				if h.messages[i].ID == id {
+					h.messages[i].cachedLines = nil
+					h.dirty = true
+					break
+				}
+			}
+		}
+		h.mu.Unlock()
+		h.invalidate()
+	})
+}
+
 func (h *ChatHistory) renderMessage(m *ChatMessage, theme ChatHistoryTheme, width int64) []string {
 	// Can't name the theme package here (shadowed by the param) — route
 	// through a package-level helper for the palette generation counter.
@@ -2057,7 +2293,7 @@ func (h *ChatHistory) renderMessage(m *ChatMessage, theme ChatHistoryTheme, widt
 				}
 			}
 			if chip := strings.TrimSpace(m.FooterChip); chip != "" && !m.Pending {
-				lines = append(lines, theme.DimStyle.Render("  ▸ "+chip))
+				lines = append(lines, h.chipLine(m, chip))
 			}
 			return lines
 		}
@@ -2120,7 +2356,7 @@ func (h *ChatHistory) renderMessage(m *ChatMessage, theme ChatHistoryTheme, widt
 			if len(allLines) > 0 {
 				allLines = append(allLines, "")
 			}
-			allLines = append(allLines, theme.DimStyle.Render("  ▸ "+chip))
+			allLines = append(allLines, h.chipLine(m, chip))
 		}
 		return allLines
 	case RoleSystem:

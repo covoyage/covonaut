@@ -9,6 +9,10 @@ import (
 	"github.com/covoyage/covonaut/tui/theme"
 )
 
+// railShadowStyle 浮层投影色：与 tui/overlay.go 的暗化背景同一色阶
+//（256 色 235）。只设背景不设前景——投影是空格串。
+var railShadowStyle = theme.NewStyle().WithBgParams("48;5;235")
+
 // ---------------------------------------------------------------------------
 // Input Rail — 右缘输入记录刻度条。
 //
@@ -256,11 +260,12 @@ func (h *ChatHistory) railNearestTick(row int64) int {
 
 // railPressLocked 处理 rail 列上的按下事件。返回 true 表示事件已被
 // rail consume（不应再启动文本选区）。调用方须持有 h.mu。
+// 命中坐标是屏幕全宽坐标系（rail 贴窗口右缘，不受内容边距影响）。
 func (h *ChatHistory) railPressLocked(col, row int64) bool {
-	if !h.rail.enabled || h.suppressGesture || h.cachedWidth <= railHitCols {
+	if !h.rail.enabled || h.suppressGesture || h.fullW <= railHitCols {
 		return false
 	}
-	if col < h.cachedWidth-railHitCols {
+	if col < h.fullW-railHitCols {
 		return false
 	}
 	h.rail.press = h.railNearestTick(row)
@@ -271,7 +276,7 @@ func (h *ChatHistory) railPressLocked(col, row int64) bool {
 // consume（不应再进入选区逻辑）；changed=true 表示状态变化、需要重绘。
 // 调用方须持有 h.mu。
 func (h *ChatHistory) railMotionLocked(col, row int64) (handled, changed bool) {
-	if !h.rail.enabled || h.cachedWidth <= railHitCols {
+	if !h.rail.enabled || h.fullW <= railHitCols {
 		return false, false
 	}
 	// 浮层选区拖拽中：无论指针是否仍在浮层内都继续更新选区（钳到浮层内），
@@ -290,7 +295,7 @@ func (h *ChatHistory) railMotionLocked(col, row int64) (handled, changed bool) {
 		}
 		return true, false
 	}
-	if col < h.cachedWidth-railHitCols {
+	if col < h.fullW-railHitCols {
 		// 离开 rail 列：清除悬停
 		if h.rail.hover != -1 {
 			h.rail.hover = -1
@@ -714,6 +719,25 @@ func (h *ChatHistory) applyRailOverlay(lines []string, width int64) []string {
 			}
 		}
 		lines[r] = core.PadToWidth(row, width)
+	}
+
+	// 3. 投影：浮层右缘外 1 列 + 底部 1 行暗背景，营造“浮在内容之上”
+	// 的层次感。右缘投影落在浮层与 tick 之间的 gap 列（本来就空着），
+	// 底部投影避开左下圆角两格——影子替换的是等宽空格/被覆盖区域，
+	// 不改变任何行的可见宽度。
+	shadowCol := left + boxW
+	for i := range popupLines {
+		r := top + i
+		prefix := core.TruncateToWidth(lines[r], shadowCol, "")
+		tail := core.SliceByColumn(lines[r], shadowCol+1, width)
+		lines[r] = core.PadToWidth(prefix+railShadowStyle.Render(" ")+tail, width)
+	}
+	if shadowRow := top + len(popupLines); shadowRow < len(lines) {
+		from := left + 2
+		prefix := core.TruncateToWidth(lines[shadowRow], from, "")
+		mid := railShadowStyle.Render(strings.Repeat(" ", int(boxW-2)))
+		tail := core.SliceByColumn(lines[shadowRow], left+boxW, width)
+		lines[shadowRow] = core.PadToWidth(prefix+mid+tail, width)
 	}
 	return lines
 }

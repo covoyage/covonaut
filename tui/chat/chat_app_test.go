@@ -377,6 +377,21 @@ func TestChatAppBusyIdle(t *testing.T) {
 	}
 }
 
+// TestChatAppHorizontalMarginPropagates 验证配置边距同时作用于 layout
+// （editor/footer 等）与 history（正文缩进、rail 仍贴窗缘）。
+func TestChatAppHorizontalMarginPropagates(t *testing.T) {
+	app, _ := newTestChatApp(t, ChatAppConfig{HorizontalMargin: 2})
+	if app.layout.hMargin != 2 {
+		t.Fatalf("layout hMargin = %d, want 2", app.layout.hMargin)
+	}
+	app.layout.history.mu.Lock()
+	m := app.layout.history.hMargin
+	app.layout.history.mu.Unlock()
+	if m != 2 {
+		t.Fatalf("history hMargin = %d, want 2", m)
+	}
+}
+
 func TestChatAppHoldSubmitDefersUntilReady(t *testing.T) {
 	var captured string
 	app, _ := newTestChatApp(t, ChatAppConfig{
