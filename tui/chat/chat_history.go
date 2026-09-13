@@ -193,6 +193,7 @@ type ChatHistory struct {
 	cachedTotal     int64
 	startLine       int64
 	dirty           bool
+	toolLineClick ToolLineClickHandler // optional host hook: tool-row click action
 	expandedGroups  map[int]bool // group message indices that are expanded
 	verbose         bool         // legacy: true when VerboseLevel=="full"
 	verboseLevel    string       // off | on | full; empty means "on"
@@ -235,6 +236,9 @@ type ChatHistory struct {
 	// when the cache was empty at JumpToAbsoluteLine time.
 	pendingJump int64
 	hasJump     bool
+
+	// Input rail (right-edge tick rail); see chat_rail.go.
+	rail railState
 }
 
 // NewChatHistory returns an empty history using the default theme.
@@ -994,7 +998,7 @@ func (h *ChatHistory) Render(width int64) []string {
 	// Also clamp over-wide lines (streaming cursor, wide CJK) so a wrap
 	// cannot push the footer/status bar down. This runs on every path,
 	// including short transcripts that previously skipped the clamp.
-	return fitHistoryLines(visible, width)
+	return h.applyRailOverlay(fitHistoryLines(visible, width), width)
 }
 
 func (h *ChatHistory) stickyUserPromptLocked(maxRows, offset int64) string {
@@ -1113,7 +1117,18 @@ func (h *ChatHistory) tryToggleToolDetailAtLineLocked(absLine int64) bool {
 			return true
 		}
 		m := &h.messages[r.msgIndex]
-		if m.Role != RoleTool || strings.TrimSpace(m.Detail) == "" {
+		if m.Role != RoleTool {
+			return false
+		}
+		// Host-application hook: a tool row click can carry a richer action
+		// (e.g. open a sub-agent transcript view) than the default
+		// detail-toggle. Returning true consumes the click.
+		if h.toolLineClick != nil {
+			if h.toolLineClick(m.Meta, m.ArgPreview, m.Text, m.Detail) {
+				return true
+			}
+		}
+		if strings.TrimSpace(m.Detail) == "" {
 			return false
 		}
 		m.DetailVisible = !m.DetailVisible
@@ -1121,6 +1136,20 @@ func (h *ChatHistory) tryToggleToolDetailAtLineLocked(absLine int64) bool {
 		return true
 	}
 	return false
+}
+
+// ToolLineClickHandler receives the clicked tool row's tool name (Meta),
+// distilled primary argument preview, status text, and detail body (full
+// tool result; empty while the call is still running). Returning true
+// consumes the click (suppressing the default expand/collapse toggle).
+type ToolLineClickHandler func(meta, argPreview, statusText, detail string) bool
+
+// SetToolLineClickHandler installs the host-application tool-row click hook.
+// Pass nil to restore the default detail-toggle behavior for every row.
+func (h *ChatHistory) SetToolLineClickHandler(fn ToolLineClickHandler) {
+	h.mu.Lock()
+	h.toolLineClick = fn
+	h.mu.Unlock()
 }
 
 func (h *ChatHistory) Invalidate() {
@@ -1194,6 +1223,7 @@ func (h *ChatHistory) handleMouse(m core.MouseMsg) {
 	h.mu.Lock()
 
 	needInvalidate := false
+	railJump := int64(-1)
 
 	switch m.Action {
 	case core.MouseWheelUp:
@@ -1205,6 +1235,21 @@ func (h *ChatHistory) handleMouse(m core.MouseMsg) {
 		h.scrollByLocked(-3)
 		needInvalidate = true
 	case core.MousePress:
+		// Popup selection first: pressing inside the input-rail popup
+		// starts a popup-local selection and must never start a history
+		// selection or a rail jump.
+		if h.railPopupPressLocked(m.Col, m.Row) {
+			needInvalidate = true
+			break
+		}
+		// Pressing outside the popup clears any popup selection.
+		h.railClearPopupSelLocked()
+		// Input rail first: a press in the right-edge gutter belongs to a
+		// jump gesture and must never start a text selection.
+		if h.railPressLocked(m.Col, m.Row) {
+			needInvalidate = true
+			break
+		}
 		// Left button press: check if clicking on thinking header to toggle collapse
 		absLine := h.viewportRowToAbsoluteLocked(m.Row)
 		if absLine < 0 {
@@ -1246,6 +1291,19 @@ func (h *ChatHistory) handleMouse(m core.MouseMsg) {
 		h.selEnd = selectionPos{line: absLine, col: mappedCol}
 		// Don't trigger render yet — selection is empty and invisible until drag motion.
 	case core.MouseMotion:
+		// Rail hover takes priority — but never while a selection drag is
+		// in flight: dragging across the gutter must keep extending the
+		// selection instead of flipping the hover state.
+		if !h.selDragging {
+			handled, changed := h.railMotionLocked(m.Col, m.Row)
+			if changed {
+				h.dirty = true
+				needInvalidate = true
+			}
+			if handled {
+				break
+			}
+		}
 		if h.suppressGesture {
 			break
 		}
@@ -1263,6 +1321,18 @@ func (h *ChatHistory) handleMouse(m core.MouseMsg) {
 			h.suppressGesture = false
 			break
 		}
+		// Popup selection drag release: finalize the popup-local selection.
+		if h.railPopupReleaseLocked() {
+			needInvalidate = true
+			break
+		}
+		// Rail click-release: complete the jump gesture and consume the
+		// event so it cannot finalize a phantom selection.
+		if jump := h.railReleaseLocked(); jump >= 0 {
+			railJump = jump
+			needInvalidate = true
+			break
+		}
 		if h.selDragging {
 			h.selDragging = false
 			// If selection is empty (no movement), clear it
@@ -1275,6 +1345,10 @@ func (h *ChatHistory) handleMouse(m core.MouseMsg) {
 	}
 
 	h.mu.Unlock()
+
+	if railJump >= 0 {
+		h.JumpToAbsoluteLine(railJump)
+	}
 
 	if needInvalidate {
 		h.invalidate()
@@ -1533,11 +1607,17 @@ func (h *ChatHistory) ClearSelection() {
 	h.mu.Lock()
 	h.selActive = false
 	h.selDragging = false
+	h.railClearPopupSelLocked()
 	h.mu.Unlock()
 	h.invalidate()
 }
 
 func (h *ChatHistory) getSelectedTextLocked() string {
+	// Popup selection wins: when the user selects inside the input-rail
+	// popup, copying extracts popup text, not the underlying history.
+	if s := h.railPopupSelectedTextLocked(); s != "" {
+		return s
+	}
 	if !h.selActive || h.isSelectionEmptyLocked() {
 		return ""
 	}

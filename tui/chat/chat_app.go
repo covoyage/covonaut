@@ -79,6 +79,12 @@ type ChatAppConfig struct {
 	// keeps the full transcript in the component tree.
 	Scrollback bool
 
+	// InputRail enables the right-edge input rail (chat_rail.go): one tick
+	// per user prompt, hover shows a preview popup, click jumps to the
+	// prompt. Requires a mouse mode that reports motion events (SGR +
+	// any-motion, ?1003h).
+	InputRail bool
+
 	EditorMinRows int64
 	EditorMaxRows int64
 	EditorPrompt  string
@@ -257,6 +263,9 @@ func newChatApp(cfg ChatAppConfig) *ChatApp {
 
 	history := NewChatHistory()
 	history.SetDisplayLimits(cfg.Limits)
+	if cfg.InputRail {
+		history.SetRailEnabled(true)
+	}
 	if cfg.Theme != nil {
 		history.SetTheme(*cfg.Theme)
 	}
@@ -552,6 +561,7 @@ func (a *ChatApp) Busy(message string) {
 	a.mu.Lock()
 	a.model.Running = true
 	a.mu.Unlock()
+	a.history.SetTurnRunning(true)
 	if a.statusBar != nil {
 		a.statusBar.Busy()
 	}
@@ -564,6 +574,7 @@ func (a *ChatApp) Idle() {
 	a.mu.Lock()
 	a.model.Running = false
 	a.mu.Unlock()
+	a.history.SetTurnRunning(false)
 	if a.statusBar != nil {
 		a.statusBar.Idle()
 	}

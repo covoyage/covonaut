@@ -1198,10 +1198,14 @@ func (t *TUI) enableMouse(mode string) {
 	t.outMu.Unlock()
 	switch mode {
 	case "sgr":
-		// Enable SGR positioning (?1006h) + button-event tracking (?1002h).
-		// No ?1007l — we let the terminal convert wheel-to-arrow itself;
-		// some terminals show rendering artifacts when toggling ?1007.
-		_, _ = t.term.Write([]byte("\x1b[?1002h\x1b[?1006h"))
+		// Enable SGR positioning (?1006h) + button-event tracking (?1002h)
+		// + any-motion tracking (?1003h). Any-motion is a superset of
+		// button-motion and is required for hover interactions (e.g. the
+		// input rail) — without it terminals only report motion while a
+		// button is held. No ?1007l — we let the terminal convert
+		// wheel-to-arrow itself; some terminals show rendering artifacts
+		// when toggling ?1007.
+		_, _ = t.term.Write([]byte("\x1b[?1002h\x1b[?1003h\x1b[?1006h"))
 	case "x11":
 		_, _ = t.term.Write([]byte("\x1b[?1000h"))
 	}
@@ -1217,7 +1221,7 @@ func (t *TUI) disableMouse() {
 	}
 	switch mode {
 	case "sgr":
-		_, _ = t.term.Write([]byte("\x1b[?1006l\x1b[?1002l"))
+		_, _ = t.term.Write([]byte("\x1b[?1006l\x1b[?1003l\x1b[?1002l"))
 	case "x11":
 		_, _ = t.term.Write([]byte("\x1b[?1000l"))
 	}
