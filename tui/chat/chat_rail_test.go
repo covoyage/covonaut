@@ -645,3 +645,204 @@ func TestRailPopupMarkdown(t *testing.T) {
 		t.Fatalf("literal backtick leaked into popup; markdown not parsed")
 	}
 }
+
+// TestRailTailBlankRun 验证右缘连续空白列数的计算：整宽分割线在内容
+// 边距内留出空白（margin < railDrawCols 时判定窗被内容侵入但仍有空白），
+// 无边距的整宽行空白为 0，短行尾部全空白。
+func TestRailTailBlankRun(t *testing.T) {
+	w := int64(100)
+	// 内容边距 4：分割线横跨列 4..95，右缘空白 4 列。
+	sep := strings.Repeat(" ", 4) + strings.Repeat("─", 92)
+	if got := railTailBlankRun(sep, w, railDrawCols); got != 4 {
+		t.Fatalf("divider with margin 4: blank run = %d, want 4", got)
+	}
+	// 无边距：分割线顶到右缘，空白 0。
+	if got := railTailBlankRun(strings.Repeat("─", 100), w, railDrawCols); got != 0 {
+		t.Fatalf("full-width divider: blank run = %d, want 0", got)
+	}
+	// 空行 / 短行：整个判定窗都空白。
+	if got := railTailBlankRun("", w, railDrawCols); got != railDrawCols {
+		t.Fatalf("blank row: blank run = %d, want %d", got, railDrawCols)
+	}
+	if got := railTailBlankRun("hello", w, railDrawCols); got != railDrawCols {
+		t.Fatalf("short row: blank run = %d, want %d", got, railDrawCols)
+	}
+	// 宽字符紧贴判定窗：右半占的列不算空白。
+	// 列 93 起一个宽字符（占 93、94 两列），判定窗 94..99 中 94 是
+	// continuation → 连续空白只有 95..99 共 5 列。
+	line := strings.Repeat("x", 93) + "宽" + strings.Repeat(" ", 5)
+	if got := railTailBlankRun(line, w, railDrawCols); got != 5 {
+		t.Fatalf("wide char at window edge: blank run = %d, want 5", got)
+	}
+}
+
+// TestRailTickOnDividerRow 回归：tick 行与 turn 分割线重合时横条不得
+// 消失——内容边距（4 列）小于 railDrawCols（6 列），分割线伸进判定窗
+// 但右缘仍有空白，普通 tick（1 格）应照常落笔且不裁切分割线；悬停
+// 变长时收缩到可用空白（4 格），不入侵分割线。
+func TestRailTickOnDividerRow(t *testing.T) {
+	const w = int64(100)
+	const m = int64(4)
+	h := NewChatHistory()
+	h.SetRailEnabled(true)
+	h.Append(ChatMessage{Role: RoleUser, Text: "hi"})
+	h.Append(ChatMessage{Role: RoleAssistant, Text: "reply"})
+	h.Render(w) // 建 cachedMsgRanges，让 ticks 可计算
+
+	// 伪造一个视口：tick 行（正中间）放一条内容边距 4 的整宽分割线，
+	// 其余行为空。paint 与 content 同源，模拟 Render 的真实路径。
+	h.mu.Lock()
+	viewRows := 11
+	mid := viewRows / 2
+	h.railComputeTicksLocked(int64(viewRows))
+	tickN := len(h.rail.ticks)
+	h.mu.Unlock()
+	if tickN == 0 {
+		t.Fatal("no ticks computed")
+	}
+
+	sep := strings.Repeat(" ", int(m)) + strings.Repeat("─", int(w-2*m))
+	content := make([]string, viewRows)
+	content[mid] = sep
+	paint := make([]string, viewRows)
+	copy(paint, content)
+	out := h.applyRailOverlayWith(paint, content, w, false)
+
+	plain := stripANSI(out[mid])
+	if got := strings.Count(plain, "─"); got != int(w-2*m)+1 {
+		t.Fatalf("divider row: %d dashes, want %d (divider intact + 1-cell tick)", got, w-2*m+1)
+	}
+	if !strings.HasSuffix(plain, "─") {
+		t.Fatalf("tick missing at right edge on divider row: %q", plain)
+	}
+
+	// 悬停：tick 收缩到可用空白 4 格，分割线仍完整。advance=false 复用
+	// 当前动画状态，直接把动画长度置为目标全长（6 格），验证绘制时的
+	// 可用空白钳制。
+	h.Update(core.MouseMsg{Action: core.MouseMotion, Row: int64(mid), Col: w - railHitCols})
+	h.mu.Lock()
+	h.rail.animLens = []float64{railDrawCols}
+	h.mu.Unlock()
+	content2 := make([]string, viewRows)
+	content2[mid] = sep
+	paint2 := make([]string, viewRows)
+	copy(paint2, content2)
+	out2 := h.applyRailOverlayWith(paint2, content2, w, false)
+	plain2 := stripANSI(out2[mid])
+	if got := strings.Count(plain2, "─"); got != int(w-2*m)+railDrawCols-2 {
+		t.Fatalf("hovered divider row: %d dashes, want divider %d + clamped tick %d",
+			got, w-2*m, railDrawCols-2)
+	}
+	if !strings.HasSuffix(plain2, "────") {
+		t.Fatalf("hovered tick not clamped to available blank run: %q", plain2)
+	}
+}
+
+// TestRailTopLayerPaintsOnBlankCanvas 验证顶层图层：RenderRailLayer 在空白
+// 画布上只画 tick（与底图帧的 tick 行一致），tick 之外的位置全部保持空白
+// 透出下层（overlay 或底图）。
+func TestRailTopLayerPaintsOnBlankCanvas(t *testing.T) {
+	h := railTestHistory(t, railTestWidth, railTestMaxRows)
+	base := h.Render(railTestWidth)
+
+	h.mu.Lock()
+	tickRows := make(map[int]bool)
+	for _, tk := range h.rail.ticks {
+		tickRows[tk.row] = true
+	}
+	h.mu.Unlock()
+	if len(tickRows) == 0 {
+		t.Fatal("no ticks computed")
+	}
+
+	top := h.RenderRailLayer(len(base), railTestWidth)
+	if top == nil {
+		t.Fatal("RenderRailLayer returned nil")
+	}
+	if len(top) != len(base) {
+		t.Fatalf("top layer rows = %d, want %d", len(top), len(base))
+	}
+	// 期望集合：tick 行中右缘尚有连续空白的行才画 tick（与底图同一
+	// 让位规则，按实际空白收缩，不要求整个绘制区全空）。
+	// 注意不能靠「行尾含 ─」识别底图 tick——用户输入分隔线本身就是
+	// 全宽横线。
+	basePainted := make(map[int]bool)
+	h.mu.Lock()
+	for _, tk := range h.rail.ticks {
+		if tk.row < len(h.rail.preLines) && railTailBlankRun(h.rail.preLines[tk.row], railTestWidth, railDrawCols) > 0 {
+			basePainted[tk.row] = true
+		}
+	}
+	h.mu.Unlock()
+	for r, ln := range top {
+		plain := stripANSI(ln)
+		if len(plain) < int(railDrawCols) {
+			// 画布行不强制 pad：全空行以空串表示。
+			if strings.TrimSpace(plain) != "" {
+				t.Fatalf("short non-blank top row %d: %q", r, plain)
+			}
+			if basePainted[r] {
+				t.Fatalf("tick row %d blank in top layer", r)
+			}
+			continue
+		}
+		tail := plain[len(plain)-int(railDrawCols):]
+		head := plain[:len(plain)-int(railDrawCols)]
+		if basePainted[r] {
+			if strings.TrimSpace(tail) == "" {
+				t.Fatalf("tick row %d missing tick in top layer", r)
+			}
+			if strings.TrimSpace(head) != "" {
+				t.Fatalf("top layer row %d paints outside rail columns: %q", r, plain)
+			}
+		} else if strings.TrimSpace(plain) != "" {
+			t.Fatalf("row %d painted in top layer but not in base: %q", r, plain)
+		}
+	}
+}
+
+// TestRailTopLayerYieldsToContent 验证顶层图层的让位规则与底图一致：
+// 内容顶到右缘的行，tick 在顶层同样不落笔。
+func TestRailTopLayerYieldsToContent(t *testing.T) {
+	h := railTestHistory(t, railTestWidth, railTestMaxRows)
+	h.Append(ChatMessage{Role: RoleUser, Text: "wide"})
+	// 造一条右缘满宽的内容行：整宽段落让 markdown 渲染成占满行宽的文本。
+	var sb strings.Builder
+	for i := 0; i < 30; i++ {
+		sb.WriteString("word ")
+	}
+	h.Append(ChatMessage{Role: RoleAssistant, Text: sb.String()})
+	base := h.Render(railTestWidth)
+
+	h.mu.Lock()
+	var tickRows []int
+	for _, tk := range h.rail.ticks {
+		tickRows = append(tickRows, tk.row)
+	}
+	h.mu.Unlock()
+
+	top := h.RenderRailLayer(len(base), railTestWidth)
+	if top == nil {
+		t.Fatal("RenderRailLayer returned nil")
+	}
+	// 顶层画了 tick 的行必须是底图右缘为空白的行。
+	for _, r := range tickRows {
+		if r >= len(top) {
+			continue
+		}
+		tail := stripANSI(top[r])
+		if len(tail) > int(railDrawCols) {
+			tail = tail[len(tail)-int(railDrawCols):]
+		}
+		if strings.TrimSpace(tail) == "" {
+			continue
+		}
+		baseTail := stripANSI(base[r])
+		if len(baseTail) > int(railDrawCols) {
+			baseTail = baseTail[len(baseTail)-int(railDrawCols):]
+		}
+		if strings.TrimSpace(baseTail) != "" && !strings.Contains(baseTail, "─") {
+			t.Fatalf("top layer tick at row %d overwrites content tail %q", r, baseTail)
+		}
+	}
+}

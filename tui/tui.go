@@ -883,8 +883,11 @@ func (t *TUI) renderFrame() {
 	// Render children to strings, then parse each line into a cell Row.
 	// Parsing happens here (not in components) so component authors keep the
 	// simple []string API and the engine owns the cell model.
+	// childStarts 记录每个 child 在帧内的起始行号，供 TopLayer 合并时对齐。
 	var rows []core.Row
-	for _, c := range children {
+	childStarts := make([]int64, len(children))
+	for i, c := range children {
+		childStarts[i] = int64(len(rows))
 		for _, ln := range c.Render(cols) {
 			ln = normalizeLine(ln, cols)
 			rows = append(rows, core.ParseLine(ln))
@@ -900,6 +903,18 @@ func (t *TUI) renderFrame() {
 		termRows = int64(len(rows))
 	}
 	rows = composeOverlays(rows, overlays, cols, termRows)
+	if len(overlays) > 0 {
+		// TopLayer：overlay 之上的最高层。overlay 会盖住 children 的普通
+		// 输出（并可能压暗），实现 TopLayer 的组件在此重绘需要保持可见
+		// 的部分（如输入记录横条）。
+		for i, c := range children {
+			if tl, ok := c.(TopLayer); ok {
+				if lines := tl.RenderTopLayer(cols); len(lines) > 0 {
+					mergeTopLayer(rows, childStarts[i], lines)
+				}
+			}
+		}
+	}
 	if termRows > 0 && int64(len(rows)) > termRows {
 		// Never emit a frame taller than the terminal: the surplus rows
 		// would scroll the screen and permanently desync the differential

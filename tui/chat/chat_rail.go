@@ -89,6 +89,12 @@ type railState struct {
 	popupSelEnd    popupSelPos
 
 	turnRunning bool // 宿主上报的 turn 运行态（ChatApp.Busy/Idle 同步）
+
+	// 顶层图层（TopLayer）支持：Render 在叠加 rail 前存下的输出与宽度，
+	// 供 RenderRailLayer 做 tick 让位判定（内容顶到右缘的行仍让位，
+	// overlay 区域在这里是空白，tick/浮层会画上去盖住 overlay）。
+	preLines []string
+	preWidth int64
 }
 
 // popupSelPos 是浮层局部选区的一个端点。
@@ -524,15 +530,115 @@ func (h *ChatHistory) railAnimTick() {
 }
 
 // railTailBlank 报告一行最右侧 railDrawCols 列是否全为空白。
-// 只有空白时 tick 才落笔，保证悬浮、不入侵下层内容。
+// 只有空白时整宽 tick 才落笔，保证悬浮、不入侵下层内容。
 func railTailBlank(line string, width int64) bool {
-	tail := core.StripAnsi(core.SliceByColumn(line, width-railDrawCols, width))
-	return strings.TrimSpace(tail) == ""
+	return railTailBlankRun(line, width, railDrawCols) == railDrawCols
+}
+
+// railTailBlankRun 返回一行从最右列向左的连续空白列数（最多数 maxCols
+// 列）。带样式的空格不算空白；宽字符按两列计。内容行右缘的连续空白
+// 决定了 tick 的可用宽度——判定按实际空白收缩，而不是要求整个 tick
+// 绘制区全空：内容边距小于 railDrawCols 时，顶满内容区的行（如 turn
+// 分割线）在最右 hMargin 列仍是空白，普通 tick 应照常落笔。
+func railTailBlankRun(line string, width, maxCols int64) int64 {
+	if maxCols <= 0 || width <= 0 {
+		return 0
+	}
+	if maxCols > width {
+		maxCols = width
+	}
+	if line == "" {
+		return maxCols // 空画布行：整个判定窗都可用
+	}
+	// 从整行解析：SliceByColumn 在宽字符边界会补空格，切出来的尾段
+	// 丢失「起点是宽字符 continuation」的信息，会把被切开的宽字符
+	// 误判成空白。
+	row := core.ParseLine(line)
+	if row.IsRaw() || len(row.Cells) == 0 {
+		return 0
+	}
+	lastNonBlank := int64(-1) // 全局列坐标（Cells 下标即列号）
+	col := int64(0)
+	prevBlank := false // 上一个非 continuation 单元格是否空白
+	for _, c := range row.Cells {
+		if c.IsContinuation() {
+			if !prevBlank {
+				lastNonBlank = col // 宽字符右半随左半算非空白
+			}
+			col++
+			continue
+		}
+		if isRailBlankCell(c) {
+			prevBlank = true
+		} else {
+			lastNonBlank = col + int64(c.Width) - 1 // 宽字符左半覆盖两列
+			prevBlank = false
+		}
+		col++
+	}
+	run := width - (lastNonBlank + 1)
+	if run > maxCols {
+		run = maxCols
+	}
+	return run
+}
+
+// isRailBlankCell 报告一个单元格是否为无字形、无 combining、无样式的
+// 空白（与 tui 包顶层合并的空白判定同一标准）。
+func isRailBlankCell(c core.Cell) bool {
+	if len(c.Combining) > 0 {
+		return false
+	}
+	if c.Rune != 0 && c.Rune != ' ' {
+		return false
+	}
+	return c.Style.Equal(core.DefaultStyle)
 }
 
 // applyRailOverlay 在 Render 输出上叠加 rail 刻度与悬停浮层。
 // lines 是已按 width 裁齐的视口行；返回叠加后的行切片。
 func (h *ChatHistory) applyRailOverlay(lines []string, width int64) []string {
+	return h.applyRailOverlayWith(lines, lines, width, true)
+}
+
+// RenderRailLayer 在 n 行空白画布上绘制 rail（供 TUI 的 TopLayer 机制在
+// overlay 之上重绘）。content 是让位判断的来源——history 本帧未叠加 rail
+// 的输出，右缘被内容占据的行 tick 仍让位；overlay 占据的位置在 content
+// 里是空白，tick/浮层会画上去并覆盖 overlay。不推进动画（动画由本帧
+// Render 内的 applyRailOverlay 负责，这里复用当前帧的长度与进度）。
+func (h *ChatHistory) RenderRailLayer(n int, width int64) []string {
+	if n <= 0 || width < 20 {
+		return nil
+	}
+	h.mu.Lock()
+	enabled := h.rail.enabled
+	h.mu.Unlock()
+	if !enabled {
+		return nil
+	}
+	canvas := make([]string, n)
+	h.applyRailOverlayWith(canvas, h.railContentLines(n), width, false)
+	return canvas
+}
+
+// railContentLines 返回让位判断用的内容行切片（本帧 Render 存下的未叠加
+// rail 的输出；长度不足画布时补空串——空白即让位判定通过）。
+func (h *ChatHistory) railContentLines(n int) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.rail.preLines) == 0 {
+		return nil
+	}
+	content := make([]string, n)
+	copy(content, h.rail.preLines)
+	return content
+}
+
+// applyRailOverlayWith 在 paint 上叠加 rail 刻度与浮层；content 提供让位
+// 判定（tick 只落在右缘空白的行上）。advance 为 true 时推进动画帧并调度
+// 下一次重绘，false 时只按当前动画状态绘制（供顶层画布同帧复用）。
+func (h *ChatHistory) applyRailOverlayWith(paint, content []string, width int64, advance bool) []string {
+	lines := paint
 	if width < 20 || len(lines) == 0 {
 		return lines
 	}
@@ -555,7 +661,8 @@ func (h *ChatHistory) applyRailOverlay(lines []string, width int64) []string {
 	bright := h.theme.UserStyle.Bold()
 
 	// 动画步进：把每个 tick 的当前长度向目标长度推进一帧，
-	// 未收敛则调度下一帧重绘。
+	// 未收敛则调度下一帧重绘。顶层画布复用（advance=false）时只读取
+	// 当前动画状态，不步进、不调度——本帧 Render 已负责推进。
 	kindOf := func(idx int) int {
 		if hover >= 0 {
 			switch idx {
@@ -567,56 +674,74 @@ func (h *ChatHistory) applyRailOverlay(lines []string, width int64) []string {
 		}
 		return 0
 	}
-	now := time.Now()
-	dt := railAnimInterval.Milliseconds()
-	if !h.rail.lastAnim.IsZero() {
-		if d := now.Sub(h.rail.lastAnim).Milliseconds(); d > 0 && d < dt {
-			dt = d
+	var cells []int
+	var popupFrom int
+	var popupT float64
+	if advance {
+		now := time.Now()
+		dt := railAnimInterval.Milliseconds()
+		if !h.rail.lastAnim.IsZero() {
+			if d := now.Sub(h.rail.lastAnim).Milliseconds(); d > 0 && d < dt {
+				dt = d
+			}
 		}
-	}
-	if len(h.rail.animLens) != len(ticks) {
-		lens := make([]float64, len(ticks))
-		copy(lens, h.rail.animLens)
-		for i := len(h.rail.animLens); i < len(ticks); i++ {
-			lens[i] = float64(railTargetCells(kindOf(i))) // 新 tick 从静止长度起步
+		if len(h.rail.animLens) != len(ticks) {
+			lens := make([]float64, len(ticks))
+			copy(lens, h.rail.animLens)
+			for i := len(h.rail.animLens); i < len(ticks); i++ {
+				lens[i] = float64(railTargetCells(kindOf(i))) // 新 tick 从静止长度起步
+			}
+			h.rail.animLens = lens
 		}
-		h.rail.animLens = lens
-	}
-	cells := make([]int, len(ticks))
-	needMore := false
-	for i := range ticks {
-		cur := railEaseLen(h.rail.animLens[i], float64(railTargetCells(kindOf(i))), float64(dt))
-		h.rail.animLens[i] = cur
-		c := int(math.Round(cur))
-		if math.Abs(float64(railTargetCells(kindOf(i)))-cur) > 0.05 {
+		cells = make([]int, len(ticks))
+		needMore := false
+		for i := range ticks {
+			cur := railEaseLen(h.rail.animLens[i], float64(railTargetCells(kindOf(i))), float64(dt))
+			h.rail.animLens[i] = cur
+			c := int(math.Round(cur))
+			if math.Abs(float64(railTargetCells(kindOf(i)))-cur) > 0.05 {
+				needMore = true
+			}
+			cells[i] = c
+		}
+		// 浮层滑入/滑出进度：hover 出现→1，清除→0；hover 在 tick 间移动时
+		// 保持 1，只换内容不重播动画。
+		popupFrom = h.rail.popupFrom
+		if hover >= 0 {
+			h.rail.popupFrom = hover
+			popupFrom = hover
+		}
+		popupTarget := 0.0
+		if hover >= 0 {
+			popupTarget = 1
+		}
+		h.rail.popupT = railEaseLen(h.rail.popupT, popupTarget, float64(dt))
+		popupT = h.rail.popupT
+		if math.Abs(popupTarget-popupT) > 0.02 {
 			needMore = true
 		}
-		cells[i] = c
-	}
-	// 浮层滑入/滑出进度：hover 出现→1，清除→0；hover 在 tick 间移动时
-	// 保持 1，只换内容不重播动画。
-	popupFrom := h.rail.popupFrom
-	if hover >= 0 {
-		h.rail.popupFrom = hover
-		popupFrom = hover
-	}
-	popupTarget := 0.0
-	if hover >= 0 {
-		popupTarget = 1
-	}
-	h.rail.popupT = railEaseLen(h.rail.popupT, popupTarget, float64(dt))
-	popupT := h.rail.popupT
-	if math.Abs(popupTarget-popupT) > 0.02 {
-		needMore = true
-	}
-	h.rail.lastAnim = now
-	startAnim := needMore && !h.rail.animScheduled && h.onInvalidate != nil
-	if startAnim {
-		h.rail.animScheduled = true
-	}
-	h.mu.Unlock()
-	if startAnim {
-		time.AfterFunc(railAnimInterval, h.railAnimTick)
+		h.rail.lastAnim = now
+		startAnim := needMore && !h.rail.animScheduled && h.onInvalidate != nil
+		if startAnim {
+			h.rail.animScheduled = true
+		}
+		h.mu.Unlock()
+		if startAnim {
+			time.AfterFunc(railAnimInterval, h.railAnimTick)
+		}
+	} else {
+		cells = make([]int, len(ticks))
+		for i := range ticks {
+			lens := h.rail.animLens
+			if len(lens) != len(ticks) {
+				cells[i] = railTargetCells(kindOf(i))
+				continue
+			}
+			cells[i] = int(math.Round(lens[i]))
+		}
+		popupFrom = h.rail.popupFrom
+		popupT = h.rail.popupT
+		h.mu.Unlock()
 	}
 
 	// tick 样式选择：悬停最长最亮，相邻次之，其余普通。
@@ -628,10 +753,13 @@ func (h *ChatHistory) applyRailOverlay(lines []string, width int64) []string {
 		return kind, dim
 	}
 
-	// 1. tick 列：悬浮绘制——只在右缘 railDrawCols 列全为空白时才画，
-	// 内容顶到右缘的行让位（内容优先，tick 不裁切、不覆盖任何字符）。
+	// 1. tick 列：悬浮绘制——tick 可用宽度由该行右缘连续空白决定，
+	// 按实际空白收缩（普通 1 格 tick 只需最右 1 列空白；悬停变长时
+	// 最多伸到内容前），绝不裁切、不覆盖任何字符。内容完全顶到右缘
+	// 的行（连续空白为 0）让位不画。
 	tickAt := make(map[int]int, len(ticks))  // row -> tick index
 	drawn := make(map[int]bool, len(ticks)) // row -> tick 已实际绘制
+	drawnLen := make(map[int]int, len(ticks))
 	for i, t := range ticks {
 		tickAt[t.row] = i
 	}
@@ -640,13 +768,24 @@ func (h *ChatHistory) applyRailOverlay(lines []string, width int64) []string {
 		if !ok {
 			continue
 		}
-		if !railTailBlank(lines[r], width) {
-			continue // 该行内容占据右缘：不画，保持悬浮
+		n := cells[idx]
+		if r < len(content) {
+			avail := railTailBlankRun(content[r], width, railDrawCols)
+			if avail <= 0 {
+				continue // 该行内容顶到右缘：不画，保持悬浮
+			}
+			if int64(n) > avail {
+				n = int(avail) // 可用空白不足时收缩，不入侵内容
+			}
 		}
 		_, style := tickKindStyle(idx)
-		base := core.TruncateToWidth(lines[r], width-railDrawCols, "")
-		lines[r] = core.PadToWidth(base+railTickSeg(style, cells[idx]), width)
+		// 画布行可能短于内容区宽（顶层图层是空串），先补齐再拼，
+		// 保证 tick 始终右对齐到窗口右缘。截断点取 tick 实际起点，
+		// 内容比整宽判定窗更靠右时也不会被裁掉。
+		base := core.PadToWidth(core.TruncateToWidth(lines[r], width-int64(n), ""), width-int64(n))
+		lines[r] = core.PadToWidth(base+style.Render(strings.Repeat("─", n)), width)
 		drawn[r] = true
+		drawnLen[r] = n
 	}
 
 	// 2. 悬停浮层：贴在 tick 左侧，滑入动画——右缘固定在 tick 列，
@@ -703,19 +842,21 @@ func (h *ChatHistory) applyRailOverlay(lines []string, width int64) []string {
 	gap := strings.Repeat(" ", railPopupGap)
 	for i, seg := range popupLines {
 		r := top + i
-		base := core.TruncateToWidth(lines[r], left+shift, "")
+		base := core.PadToWidth(core.TruncateToWidth(lines[r], left+shift, ""), left+shift)
 		if shift > 0 {
 			seg = core.SliceByColumn(seg, shift, boxW)
 		}
 		row := base + seg
 		// 浮层覆盖范围内的 tick（含被悬停的那个）必须重新接回行尾，
 		// 否则会被截掉——表现为"悬停的横条消失"。未绘制的 tick
-		// （内容占据右缘）补回空白，保持原状。
+		// （内容顶到右缘）补回空白，保持原状；已绘制的按底图同一
+		// 收缩长度回接，右对齐到窗口右缘。
 		if _, ok := tickAt[r]; ok {
 			row += gap
 			if drawn[r] {
 				_, style := tickKindStyle(tickAt[r])
-				row += railTickSeg(style, cells[tickAt[r]])
+				n := drawnLen[r]
+				row += strings.Repeat(" ", railDrawCols-n) + style.Render(strings.Repeat("─", n))
 			}
 		}
 		lines[r] = core.PadToWidth(row, width)
@@ -728,13 +869,13 @@ func (h *ChatHistory) applyRailOverlay(lines []string, width int64) []string {
 	shadowCol := left + boxW
 	for i := range popupLines {
 		r := top + i
-		prefix := core.TruncateToWidth(lines[r], shadowCol, "")
+		prefix := core.PadToWidth(core.TruncateToWidth(lines[r], shadowCol, ""), shadowCol)
 		tail := core.SliceByColumn(lines[r], shadowCol+1, width)
 		lines[r] = core.PadToWidth(prefix+railShadowStyle.Render(" ")+tail, width)
 	}
 	if shadowRow := top + len(popupLines); shadowRow < len(lines) {
 		from := left + 2
-		prefix := core.TruncateToWidth(lines[shadowRow], from, "")
+		prefix := core.PadToWidth(core.TruncateToWidth(lines[shadowRow], from, ""), from)
 		mid := railShadowStyle.Render(strings.Repeat(" ", int(boxW-2)))
 		tail := core.SliceByColumn(lines[shadowRow], left+boxW, width)
 		lines[shadowRow] = core.PadToWidth(prefix+mid+tail, width)

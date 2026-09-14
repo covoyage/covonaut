@@ -1194,6 +1194,13 @@ type chatLayout struct {
 	// internally (see ChatHistory.SetHorizontalMargin) while its rail keeps
 	// hugging the true window right edge.
 	hMargin int64
+
+	// 顶层图层（TopLayer）几何快照：最近一次 Render 的输出总行数与其中
+	// history 区块的行数（含补白）。RenderTopLayer 用它们把 rail 图层对齐
+	// 到本帧。帧末尾发生裁剪（out 超过终端行数、从顶部丢行）时置 0 跳过
+	// ——裁剪后 rail 的视口行坐标整体位移，再叠加会错位。
+	lastFrameLen int64
+	historyRows  int64
 }
 
 type textSelectionComponent interface {
@@ -1304,7 +1311,30 @@ func (l *chatLayout) Render(width int64) []string {
 		// Last-resort: drop history from the top so the footer/status bar
 		// stay on screen. The engine also clips, but it clips the tail.
 		out = out[int64(len(out))-rows:]
+		// 裁剪后 rail 的视口行坐标整体位移，顶层图层无法对齐，本帧跳过。
+		l.lastFrameLen = 0
+		l.historyRows = 0
+	} else {
+		l.lastFrameLen = int64(len(out))
+		l.historyRows = int64(len(historyLines))
 	}
+	return out
+}
+
+// RenderTopLayer 实现 TUI 的 TopLayer 接口：在所有 overlay 合成之后重绘
+// rail，使其 z 序高于键位帮助等任何浮层。返回行与最近一次 Render 输出按
+// 行对齐：前 historyRows 行是 rail 图层（空白画布上只画 tick/浮层），
+// 其余保持空白透出下层。
+func (l *chatLayout) RenderTopLayer(width int64) []string {
+	if l.historyRows <= 0 || l.lastFrameLen <= 0 {
+		return nil
+	}
+	rail := l.history.RenderRailLayer(int(l.historyRows), width)
+	if rail == nil {
+		return nil
+	}
+	out := make([]string, l.lastFrameLen)
+	copy(out, rail)
 	return out
 }
 

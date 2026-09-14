@@ -623,3 +623,54 @@ func TestEscapeInterruptsWhenMainRunning(t *testing.T) {
 		t.Fatal("expected Esc to interrupt a running agent")
 	}
 }
+
+// TestChatLayoutRenderTopLayer 验证布局层的 TopLayer 委派：rail 图层与
+// Render 输出按行对齐，history 区块之外保持空白。
+func TestChatLayoutRenderTopLayer(t *testing.T) {
+	vt := terminal.NewVirtualTerminal(100, 24)
+	h := NewChatHistory()
+	h.SetRailEnabled(true)
+	h.SetMaxRows(10)
+	h.Append(ChatMessage{Role: RoleUser, Text: "hello"})
+	h.Append(ChatMessage{Role: RoleAssistant, Text: "reply"})
+	l := &chatLayout{
+		host:    &testAppHost{vt: vt},
+		history: h,
+		editor:  stubComp{lines: []string{""}},
+	}
+	out := l.Render(100)
+	if l.historyRows <= 0 || l.lastFrameLen != int64(len(out)) {
+		t.Fatalf("frame geometry not recorded: rows=%d len=%d out=%d", l.historyRows, l.lastFrameLen, len(out))
+	}
+	top := l.RenderTopLayer(100)
+	if top == nil {
+		t.Fatal("RenderTopLayer returned nil")
+	}
+	if int64(len(top)) != l.lastFrameLen {
+		t.Fatalf("top layer len = %d, want %d", len(top), l.lastFrameLen)
+	}
+	painted := 0
+	for r, ln := range top {
+		inHistory := int64(r) < l.historyRows
+		plain := stripANSI(ln)
+		if strings.TrimSpace(plain) == "" {
+			if inHistory {
+				continue
+			}
+			continue
+		}
+		if !inHistory {
+			t.Fatalf("top layer paints below history block at row %d: %q", r, plain)
+		}
+		painted++
+	}
+	if painted == 0 {
+		t.Fatal("top layer painted nothing in history block")
+	}
+	// 再 Render 一次（模拟新帧）后顶层仍对齐。
+	_ = l.Render(100)
+	top2 := l.RenderTopLayer(100)
+	if int64(len(top2)) != l.lastFrameLen {
+		t.Fatalf("second frame top layer len = %d, want %d", len(top2), l.lastFrameLen)
+	}
+}

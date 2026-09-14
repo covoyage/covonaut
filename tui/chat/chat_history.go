@@ -1046,6 +1046,13 @@ func (h *ChatHistory) Render(width int64) []string {
 		out[i] = core.PadToWidth(out[i], width)
 	}
 	// rail 与浮层叠加在全宽坐标系上：tick 贴窗口右缘，不随内容边距内缩。
+	// 叠加前把输出存为顶层图层的让位来源（rail.preLines）。
+	h.mu.Lock()
+	if h.rail.enabled {
+		h.rail.preLines = append(h.rail.preLines[:0], out...)
+		h.rail.preWidth = width
+	}
+	h.mu.Unlock()
 	return h.applyRailOverlay(out, width)
 }
 
