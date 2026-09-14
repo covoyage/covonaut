@@ -617,6 +617,13 @@ func (a *ChatApp) PrintStatus(message string) {
 	a.host.RequestRender()
 }
 
+// SetThinkingTail 更新 loader 行的思考尾部滚动预览（空串清除）。
+// 数据来自 thinking delta 流：Loader 只存最新文本并贴尾截取，滚动感
+// 由内容增长自然产生，动画帧负责刷新节拍。
+func (a *ChatApp) SetThinkingTail(text string) {
+	a.loader.SetTicker(text)
+}
+
 func (a *ChatApp) ToggleKeyHelp() OverlayRef {
 	a.mu.Lock()
 	if a.helpOverlay != nil {
