@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/covoyage/covonaut/tui/core"
+	"github.com/covoyage/covonaut/tui/theme"
 )
 
 func rangeForMsg(h *ChatHistory, msgIndex int) (msgRange, bool) {
@@ -718,5 +719,72 @@ func TestChatHistoryRendersSidePrefix(t *testing.T) {
 	}
 	if !strings.Contains(plain, "btw question") || !strings.Contains(plain, "side answer") || !strings.Contains(plain, "side failed") {
 		t.Fatalf("missing side text: %q", plain)
+	}
+}
+
+// TestTurnDividerSubtleStyle 验证 turn 分割线刻意低调：使用
+// TurnDividerStyle（BorderMuted + faint）而非 DimStyle，带 SGR 2
+// faint 属性，任何主题下都不抢眼。
+func TestTurnDividerSubtleStyle(t *testing.T) {
+	theme.ForceColor(true)
+	t.Cleanup(func() { theme.ForceColor(false) })
+
+	h := NewChatHistory()
+	gap := h.turnGapLocked(RoleUser, RoleAssistant, 20)
+	if len(gap) != 3 {
+		t.Fatalf("user→assistant gap should be 3 lines, got %d", len(gap))
+	}
+	sep := gap[1]
+	if plain := stripANSI(sep); plain != strings.Repeat("─", 20) {
+		t.Fatalf("divider text = %q, want 20 dashes", plain)
+	}
+	if sep == h.theme.DimStyle.Render(strings.Repeat("─", 20)) {
+		t.Fatalf("turn divider must not use DimStyle (too prominent)")
+	}
+	if !strings.Contains(sep, "\x1b[2;") {
+		t.Fatalf("turn divider must carry the faint (SGR 2) attribute: %q", sep)
+	}
+}
+
+// TestTurnDividerZeroThemeFallback 验证零值 theme 回退：宿主手工构造
+// ChatHistoryTheme（未设 TurnDividerStyle）时不 panic、回退 DimStyle。
+func TestTurnDividerZeroThemeFallback(t *testing.T) {
+	h := NewChatHistory()
+	h.theme = ChatHistoryTheme{}
+	gap := h.turnGapLocked(RoleUser, RoleAssistant, 10)
+	if len(gap) != 3 {
+		t.Fatalf("gap lines = %d, want 3", len(gap))
+	}
+	if plain := stripANSI(gap[1]); plain != strings.Repeat("─", 10) {
+		t.Fatalf("divider text = %q, want 10 dashes", plain)
+	}
+}
+
+// TestRoleDividerSubtleStyle 验证 RoleDivider 消息（onTurnStart 多 turn
+// 续跑时插入）与 turnGap 分割线同一观感：不走 DimStyle，携带 faint。
+func TestRoleDividerSubtleStyle(t *testing.T) {
+	theme.ForceColor(true)
+	t.Cleanup(func() { theme.ForceColor(false) })
+
+	h := NewChatHistory()
+	h.Append(ChatMessage{Role: RoleUser, Text: "q"})
+	h.Append(ChatMessage{Role: RoleDivider, Text: "turn 2"})
+	h.Append(ChatMessage{Role: RoleAssistant, Text: "a"})
+	lines := h.Render(20)
+
+	var sep string
+	for _, ln := range lines {
+		if plain := stripANSI(ln); plain != "" && strings.Trim(plain, "─") == "" {
+			sep = ln
+		}
+	}
+	if sep == "" {
+		t.Fatalf("no divider line rendered")
+	}
+	if sep == h.theme.DimStyle.Render(strings.Repeat("─", 20)) {
+		t.Fatalf("RoleDivider must not render with DimStyle (too prominent)")
+	}
+	if !strings.Contains(sep, "\x1b[2;") {
+		t.Fatalf("RoleDivider must carry faint (SGR 2): %q", sep)
 	}
 }

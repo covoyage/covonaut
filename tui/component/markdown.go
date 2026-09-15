@@ -41,9 +41,14 @@ type MarkdownTheme struct {
 	// It receives the raw label and URL and returns the fully rendered link string.
 	LinkRendererFn func(label, url string) string
 	HRFn           func(string) string
-	ListBulletFn   func(string) string
-	TableBorderFn  func(string) string
-	TableHeaderFn  func(string) string
+	// RuleFn styles standalone horizontal rules (`---`). Defaults to
+	// HRFn's semantic color with the faint (SGR 2) attribute added, so
+	// section dividers stay unobtrusive in any theme; heading underlines
+	// keep using HRFn at full strength.
+	RuleFn        func(string) string
+	ListBulletFn  func(string) string
+	TableBorderFn func(string) string
+	TableHeaderFn func(string) string
 	// Syntax, when set, is used to style fenced code blocks with a
 	// language tag. A nil value falls back to CodeBlockFn.
 	Syntax *SyntaxTheme
@@ -232,6 +237,10 @@ func defaultMarkdownTheme() MarkdownTheme {
 	if mutedColor == "" {
 		mutedColor = sem.Dim
 	}
+	hrColor := sem.MdHr
+	if hrColor == "" {
+		hrColor = sem.BorderMuted
+	}
 	h1 := apitheme.SemStyle(hColor, mode).Bold().Render
 	h2 := apitheme.SemStyle(apitheme.MixHex(hColor, textColor, 0.22), mode).Bold().Render
 	h3 := apitheme.SemStyle(apitheme.MixHex(hColor, textColor, 0.45), mode).Bold().Render
@@ -255,11 +264,14 @@ func defaultMarkdownTheme() MarkdownTheme {
 		LinkURLFn:      linkURLFn,
 		LinkRendererFn: OSC8LinkRenderer(linkLabelFn, linkURLFn),
 		HRFn:           apitheme.SemStyle(sem.MdHr, mode).Render,
-		ListBulletFn:   apitheme.SemStyle(sem.MdListBullet, mode).Render,
-		TableBorderFn:  apitheme.SemStyle(sem.MdCodeBlockBorder, mode).Render,
-		TableHeaderFn:  apitheme.NewStyle().Bold().Render,
-		MathFn:         mathFn,
-		ImageRenderer:  defaultImageRenderer,
+		// 独立水平线：MdHr 向背景方向大幅混色 + faint，似有非有；
+		// h1 下划线（HRFn）保持原亮度。
+		RuleFn:        apitheme.SemStyle(apitheme.FaintHairline(hrColor, textColor), mode).Dim().Render,
+		ListBulletFn:  apitheme.SemStyle(sem.MdListBullet, mode).Render,
+		TableBorderFn: apitheme.SemStyle(sem.MdCodeBlockBorder, mode).Render,
+		TableHeaderFn: apitheme.NewStyle().Bold().Render,
+		MathFn:        mathFn,
+		ImageRenderer: defaultImageRenderer,
 	}
 }
 
@@ -300,6 +312,10 @@ func mergeMarkdownTheme(t MarkdownTheme) MarkdownTheme {
 	}
 	if t.HRFn != nil {
 		d.HRFn = t.HRFn
+		d.RuleFn = t.HRFn // 显式覆盖 HRFn 的宿主一并接管独立水平线
+	}
+	if t.RuleFn != nil {
+		d.RuleFn = t.RuleFn
 	}
 	if t.ListBulletFn != nil {
 		d.ListBulletFn = t.ListBulletFn

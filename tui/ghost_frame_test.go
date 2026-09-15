@@ -123,14 +123,14 @@ func TestGhostTextStaysInEditorRow(t *testing.T) {
 	}
 	defer func() { _ = chatApp.Stop() }()
 
-	const ghost = "find /Users/ning/projects/ai/grok-build -type f | head -50"
+	const ghost = "find /Users/ning/projects/ai/scratch-build -type f | head -50"
 	chatApp.Editor().SetValue("# 分析项目结构和规模")
 	chatApp.Editor().SetGhost(ghost)
 	chatApp.Busy("继续中 ...")
 
 	rows := waitForScreen(t, vt, func(rows map[int]string) bool {
 		for _, txt := range rows {
-			if strings.Contains(txt, "grok-build") {
+			if strings.Contains(txt, "scratch-build") {
 				return true
 			}
 		}
@@ -142,7 +142,7 @@ func TestGhostTextStaysInEditorRow(t *testing.T) {
 		if strings.Contains(txt, "分析项目结构") {
 			valueRow = r
 		}
-		if strings.Contains(txt, "grok-build") {
+		if strings.Contains(txt, "scratch-build") {
 			ghostRow = r
 		}
 		if strings.Count(txt, "─") > 10 {
@@ -173,7 +173,7 @@ func TestGhostTextStaysInEditorRow(t *testing.T) {
 		if strings.Contains(txt, "分析项目结构") {
 			valueRow = r
 		}
-		if strings.Contains(txt, "grok-build") {
+		if strings.Contains(txt, "scratch-build") {
 			ghostRow = r
 		}
 		if strings.Count(txt, "─") > 10 {

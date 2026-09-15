@@ -113,23 +113,24 @@ type ThinkingSegment struct {
 
 // ChatHistoryTheme customizes prefix / styling for each role.
 type ChatHistoryTheme struct {
-	UserPrefix      string
-	UserStyle       theme.Style
-	AssistantPrefix string
-	AssistantStyle  theme.Style
-	SystemPrefix    string
-	SystemStyle     theme.Style
-	ToolPrefix      string
-	ToolStyle       theme.Style
-	ToolBorder      theme.Style
-	SuccessStyle    theme.Style
-	ErrorPrefix     string
-	ErrorStyle      theme.Style
-	DividerChar     string
-	DimStyle        theme.Style
-	ThinkingStyle   theme.Style
-	SelectedBg      string // ANSI background for selection
-	MarkdownTheme   component.MarkdownTheme
+	UserPrefix       string
+	UserStyle        theme.Style
+	AssistantPrefix  string
+	AssistantStyle   theme.Style
+	SystemPrefix     string
+	SystemStyle      theme.Style
+	ToolPrefix       string
+	ToolStyle        theme.Style
+	ToolBorder       theme.Style
+	SuccessStyle     theme.Style
+	ErrorPrefix      string
+	ErrorStyle       theme.Style
+	DividerChar      string
+	DimStyle         theme.Style
+	TurnDividerStyle theme.Style // turn 间隔分割线（似有非有：BorderMuted 向背景混色 + faint）；零值回退 DimStyle
+	ThinkingStyle    theme.Style
+	SelectedBg       string // ANSI background for selection
+	MarkdownTheme    component.MarkdownTheme
 }
 
 // DefaultChatHistoryTheme returns a theme built from the current palette.
@@ -150,9 +151,11 @@ func DefaultChatHistoryTheme() ChatHistoryTheme {
 		ErrorStyle:      pal.Error,
 		DividerChar:     "─",
 		DimStyle:        pal.Dim,
-		ThinkingStyle:   pal.Thinking,
-		SelectedBg:      "\x1b[48;5;33m",
-		MarkdownTheme:   component.DefaultMarkdownTheme(),
+		TurnDividerStyle: theme.SemStyle(
+			theme.FaintHairline(pal.Semantic.BorderMuted, pal.Semantic.Text), pal.Mode).Dim(),
+		ThinkingStyle: pal.Thinking,
+		SelectedBg:    "\x1b[48;5;33m",
+		MarkdownTheme: component.DefaultMarkdownTheme(),
 	}
 }
 
@@ -195,11 +198,11 @@ type ChatHistory struct {
 	cachedTotal     int64
 	startLine       int64
 	dirty           bool
-	toolLineClick ToolLineClickHandler // optional host hook: tool-row click action
-	expandedGroups  map[int]bool // group message indices that are expanded
-	verbose         bool         // legacy: true when VerboseLevel=="full"
-	verboseLevel    string       // off | on | full; empty means "on"
-	revealUntil     int          // temporarily expand hidden tools through this message index; -1 = none
+	toolLineClick   ToolLineClickHandler // optional host hook: tool-row click action
+	expandedGroups  map[int]bool         // group message indices that are expanded
+	verbose         bool                 // legacy: true when VerboseLevel=="full"
+	verboseLevel    string               // off | on | full; empty means "on"
+	revealUntil     int                  // temporarily expand hidden tools through this message index; -1 = none
 	limits          DisplayLimits
 	// themeRev ticks on every SetTheme so per-message checkpoint render memos
 	// are invalidated even when the palette revision is unchanged.
@@ -1770,9 +1773,15 @@ func (h *ChatHistory) turnGapLocked(lastRole, role ChatRole, width int64) []stri
 	if lastRole == 0 {
 		return nil
 	}
+	// 分割线刻意低调：BorderMuted（各主题中最弱的边框色）+ SGR 2 faint
+	// 由终端进一步压暗——任何主题（含自定义 JSON 主题）下都不抢眼。
+	divider := h.theme.TurnDividerStyle
+	if divider.IsZero() {
+		divider = h.theme.DimStyle // 旧宿主手工构造 theme 的回退
+	}
 	if (lastRole == RoleUser && role == RoleAssistant) ||
 		(lastRole == RoleAssistant && role == RoleUser) {
-		sep := h.theme.DimStyle.Render(strings.Repeat("─", int(width)))
+		sep := divider.Render(strings.Repeat("─", int(width)))
 		return []string{"", sep, ""}
 	}
 	if lastRole == RoleTool || role == RoleTool {
@@ -2084,7 +2093,7 @@ const (
 	chipCopyLabel   = chipIcon + "复制"
 	chipCopiedLabel = "✓ 已复制"
 	chipOptMD       = chipIcon + "Markdown" // 菜单选项：复制 markdown 源码
-	chipOptPlain    = chipIcon + "解析后"    // 菜单选项：复制解析后的纯文本
+	chipOptPlain    = chipIcon + "解析后"      // 菜单选项：复制解析后的纯文本
 	chipPrefixCols  = 4                     // "  ▸ "
 	chipSepCols     = 3                     // " │ "
 	chipCopiedFor   = 2 * time.Second
@@ -2094,7 +2103,7 @@ const (
 // chipLine 渲染 turn footer chip 行：▸ <chip> │ <label>。label 随状态切换
 // （复制按钮 / 格式菜单 / 已复制反馈）。调用方须持有 h.mu。
 func (h *ChatHistory) chipLine(m *ChatMessage, chip string) string {
-	base := h.theme.DimStyle.Render("  ▸ " + chip) + h.theme.DimStyle.Render(" │ ")
+	base := h.theme.DimStyle.Render("  ▸ "+chip) + h.theme.DimStyle.Render(" │ ")
 	if m.ID != "" && m.ID == h.copiedID && time.Since(h.copiedAt) < chipCopiedFor {
 		return base + h.theme.SuccessStyle.Render(chipCopiedLabel)
 	}
@@ -2419,7 +2428,14 @@ func (h *ChatHistory) renderMessage(m *ChatMessage, theme ChatHistoryTheme, widt
 		if ch == "" {
 			ch = "─"
 		}
-		return []string{theme.DimStyle.Render(strings.Repeat(ch, int(width)))}
+		// 与 turnGapLocked 的分割线同一观感：似有非有。
+		// （该消息由 onTurnStart 在多 turn 续跑时插入，此前误用最亮的
+		// DimStyle，是"分割线太显眼"的主要来源之一。）
+		style := theme.TurnDividerStyle
+		if style.IsZero() {
+			style = theme.DimStyle // 旧宿主手工构造 theme 的回退
+		}
+		return []string{style.Render(strings.Repeat(ch, int(width)))}
 	default:
 		return core.WrapAnsi(m.Text, width)
 	}

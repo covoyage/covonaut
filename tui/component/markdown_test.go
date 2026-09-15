@@ -7,6 +7,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/covoyage/covonaut/tui/core"
+	apitheme "github.com/covoyage/covonaut/tui/theme"
 )
 
 func TestMarkdownHeadingsAndCode(t *testing.T) {
@@ -185,7 +186,7 @@ func TestMarkdownSetextHeading(t *testing.T) {
 }
 
 func TestMarkdownTableStatusEmojiAlignment(t *testing.T) {
-	src := "| 能力 | OpenClaw | Other |\n| --- | --- | --- |\n| 终端 TUI | ✅ 有 | ✅ 核心体验 |\n| Web UI | ✅ Control UI | ❌ |\n| 代码理解 | ⚠️ 基础 | ✅ 深度 |"
+	src := "| 能力 | Pro A | Other |\n| --- | --- | --- |\n| 终端 TUI | ✅ 有 | ✅ 核心体验 |\n| Web UI | ✅ Control UI | ❌ |\n| 代码理解 | ⚠️ 基础 | ✅ 深度 |"
 	plain := renderPlain(src, 72)
 	assertTableBordersAlign(t, plain)
 }
@@ -722,5 +723,48 @@ func TestOSC8SkipsUnsafeURL(t *testing.T) {
 	safe := fn("docs", "https://example.com")
 	if !strings.Contains(safe, "\x1b]8;;https://example.com") {
 		t.Fatalf("safe URL should be OSC8: %q", safe)
+	}
+}
+
+// TestMarkdownRuleFaint 验证独立水平线（---）刻意低调：默认主题下
+// 携带 faint（SGR 2）属性，且比标题下划线（HRFn 原亮度）更弱；
+// 任何主题（含自定义 JSON 主题改色）都保留 faint 属性。
+func TestMarkdownRuleFaint(t *testing.T) {
+	apitheme.ForceColor(true)
+	t.Cleanup(func() { apitheme.ForceColor(false) })
+
+	md := NewMarkdown("above\n\n---\n\n# Heading\n\nbelow")
+	lines := md.Render(40)
+	joined := strings.Join(lines, "\n")
+
+	// 独立水平线存在且带 faint 属性。
+	var rule string
+	for _, ln := range lines {
+		plain := strings.TrimSpace(core.StripAnsi(ln))
+		if plain != "" && strings.Trim(plain, "─") == "" {
+			rule = ln
+			break
+		}
+	}
+	if rule == "" {
+		t.Fatalf("no standalone rule found in render: %q", joined)
+	}
+	if !strings.Contains(rule, "\x1b[2;") {
+		t.Fatalf("standalone rule must carry faint (SGR 2) attribute: %q", rule)
+	}
+
+	// h1 下划线仍走 HRFn（无 faint），保持标题层级。
+	var h1rule string
+	for _, ln := range lines {
+		plain := strings.TrimSpace(core.StripAnsi(ln))
+		if plain != "" && strings.Trim(plain, "─") == "" && ln != rule {
+			h1rule = ln
+		}
+	}
+	if h1rule == "" {
+		t.Fatalf("h1 underline not found in render: %q", joined)
+	}
+	if strings.Contains(h1rule, "\x1b[2;") {
+		t.Fatalf("h1 underline must not be faint: %q", h1rule)
 	}
 }

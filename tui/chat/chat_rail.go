@@ -24,9 +24,13 @@ var railShadowStyle = theme.NewStyle().WithBgParams("48;5;235")
 // 绝不裁切或覆盖下层内容。
 //
 // 交互：
+//   - 滚动同步：history 划到某条输入的区段时（视口顶部判定），对应
+//     tick 及上下相邻 tick 变长（当前最长、相邻次之），随滚动自动移动；
+//     长度变化走同一套缓动动画。
 //   - 悬停：当前 tick 及上下相邻 tick 变长（当前最长），并弹出浮层展示
 //     该次输入（markdown 渲染）与助手回复预览。变长与浮层滑入均带缓动
-//     动画，由 invalidate 回调驱动的帧定时器逐帧推进。
+//     动画，由 invalidate 回调驱动的帧定时器逐帧推进。悬停优先于滚动
+//     同步，focus 只加长不变亮（bold 属于悬停）。
 //   - 点击：JumpToAbsoluteLine 定位到该输入的起始行。
 //
 // 数据全部来自 ChatHistory 自身（messages / cachedMsgRanges），宿主只需
@@ -58,6 +62,7 @@ type railTick struct {
 	row       int   // 视口行号（0 基，与 Render 输出行对齐）
 	msgIndex  int   // 对应用户消息索引
 	startLine int64 // 虚拟布局绝对行号（跳转目标）
+	effStart  int64 // 区段有效起点：含紧邻前方的 turn 间隔行（focus 判定用）
 	runFrom   int   // 同一行合并的连续输入的首个消息索引
 	runTo     int   // 最后一个消息索引
 }
@@ -67,6 +72,7 @@ type railState struct {
 	enabled bool
 	hover   int        // 悬停 tick 索引，-1 = 无
 	press   int        // 已按下未释放的 tick 索引，-1 = 无
+	focus   int        // 滚动同步焦点 tick 索引（视口顶部所在 prompt），-1 = 无
 	ticks   []railTick // 最近一次 Render 计算的刻度（视口行坐标）
 	animLens []float64 // 每个 tick 的当前动画长度（浮点格数）
 	lastAnim time.Time // 上次动画步进时刻
@@ -113,6 +119,7 @@ func (h *ChatHistory) SetRailEnabled(on bool) {
 	h.rail.enabled = on
 	h.rail.hover = -1
 	h.rail.press = -1
+	h.rail.focus = -1
 	h.rail.animLens = nil
 	h.rail.animScheduled = false
 	h.rail.popupT = 0
@@ -165,24 +172,41 @@ func railSpreadRows(n, viewRows int) []int {
 	return rows
 }
 
-// railUserStarts 收集当前布局中所有用户输入：消息索引、起始行、顺序。
-// 一个消息可能拆成多个 span（footer chip 等），取首个 span 的起始行。
+// railUserStarts 收集当前布局中所有用户输入：消息索引、起始行、区段
+// 有效起点、顺序。一个消息可能拆成多个 span（footer chip 等），取首个
+// span 的起始行；若首个 span 前紧邻 turn 间隔 span（空行+分割线+空行，
+// msgIndex=-1），区段有效起点取间隔的起始行——视口顶部进入间隔行时
+// 仍视为划到了这条输入。
 //
 // 最后一条用户输入只有在其 turn 结束（正常完成或中止）后才会出现——
 // 即它之后不再有 Pending 的流式消息。正在运行的任务不产生横条。
 // 调用方须持有 h.mu。
-func (h *ChatHistory) railUserStarts() [][2]int {
-	var starts [][2]int // [msgIndex, startLine]
+func (h *ChatHistory) railUserStarts() [][3]int {
+	var starts [][3]int // [msgIndex, startLine, effStart]
 	seen := make(map[int]bool)
+	prevGapStart := -1 // 前一个 range 是 turn 间隔时的起始行，-1 = 不是
 	for _, r := range h.cachedMsgRanges {
-		if r.msgIndex < 0 || r.msgIndex >= len(h.messages) || seen[r.msgIndex] {
+		if r.msgIndex < 0 {
+			if prevGapStart < 0 {
+				prevGapStart = r.startLine
+			}
+			continue
+		}
+		if r.msgIndex >= len(h.messages) || seen[r.msgIndex] {
+			prevGapStart = -1
 			continue
 		}
 		if h.messages[r.msgIndex].Role != RoleUser {
+			prevGapStart = -1
 			continue
 		}
 		seen[r.msgIndex] = true
-		starts = append(starts, [2]int{r.msgIndex, r.startLine})
+		eff := r.startLine
+		if prevGapStart >= 0 {
+			eff = prevGapStart
+		}
+		starts = append(starts, [3]int{r.msgIndex, r.startLine, eff})
+		prevGapStart = -1
 	}
 	// 最后一条输入的 turn 还在跑：丢弃它，等结束（Idle/Finalize，完成
 	// 与中止都会走到）后的下一次重绘再出现。两个信号任一命中即扣住：
@@ -231,6 +255,7 @@ func (h *ChatHistory) railComputeTicksLocked(viewRows int64) {
 			row:       row,
 			msgIndex:  s[0],
 			startLine: int64(s[1]),
+			effStart:  int64(s[2]),
 			runFrom:   s[0],
 			runTo:     s[0],
 		})
@@ -244,6 +269,21 @@ func (h *ChatHistory) railComputeTicksLocked(viewRows int64) {
 	if h.rail.press >= len(h.rail.ticks) {
 		h.rail.press = -1
 	}
+	h.rail.focus = h.railFocusTickLocked()
+}
+
+// railFocusTickLocked 计算滚动同步焦点：视口顶部（h.startLine）落在哪个
+// prompt 区段内，对应的 tick 就是焦点。取最后一个 effStart ≤ 视口顶部
+// 的 tick（effStart 含该输入前方的 turn 间隔行——视口顶部停在间隔或
+// 在某条输入之后的回复区内时，仍归属该输入）；视口顶部还没到第一条
+// 输入的区段时无焦点。调用方须持有 h.mu。
+func (h *ChatHistory) railFocusTickLocked() int {
+	for i := len(h.rail.ticks) - 1; i >= 0; i-- {
+		if h.rail.ticks[i].effStart <= h.startLine {
+			return i
+		}
+	}
+	return -1
 }
 
 // railNearestTick 返回距离 row 最近的 tick 索引（偏差 ≤ railHoverTol），
@@ -656,6 +696,7 @@ func (h *ChatHistory) applyRailOverlayWith(paint, content []string, width int64,
 	ticks := make([]railTick, len(h.rail.ticks))
 	copy(ticks, h.rail.ticks)
 	hover := h.rail.hover
+	focus := h.rail.focus
 	dim := h.theme.DimStyle
 	// 悬停 tick 加粗提亮，与相邻/普通刻度在长度之外再加一层区分。
 	bright := h.theme.UserStyle.Bold()
@@ -663,12 +704,21 @@ func (h *ChatHistory) applyRailOverlayWith(paint, content []string, width int64,
 	// 动画步进：把每个 tick 的当前长度向目标长度推进一帧，
 	// 未收敛则调度下一帧重绘。顶层画布复用（advance=false）时只读取
 	// 当前动画状态，不步进、不调度——本帧 Render 已负责推进。
+	// 长度梯度：悬停（6）> 滚动焦点及其相邻（6/3）> 普通（1）；
+	// 无悬停时焦点接管梯度，悬停出现时焦点让位。
 	kindOf := func(idx int) int {
 		if hover >= 0 {
 			switch idx {
 			case hover:
 				return 2
 			case hover - 1, hover + 1:
+				return 1
+			}
+		} else if focus >= 0 {
+			switch idx {
+			case focus:
+				return 2
+			case focus - 1, focus + 1:
 				return 1
 			}
 		}
@@ -744,10 +794,11 @@ func (h *ChatHistory) applyRailOverlayWith(paint, content []string, width int64,
 		h.mu.Unlock()
 	}
 
-	// tick 样式选择：悬停最长最亮，相邻次之，其余普通。
+	// tick 样式选择：悬停最长最亮，滚动焦点等长但保持暗色（bold 只
+	// 属于悬停），相邻/普通暗色。
 	tickKindStyle := func(idx int) (int, theme.Style) {
 		kind := kindOf(idx)
-		if kind == 2 {
+		if kind == 2 && idx == hover {
 			return kind, bright
 		}
 		return kind, dim

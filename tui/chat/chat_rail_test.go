@@ -1,8 +1,10 @@
 package chat
 
 import (
+	"math"
 	"strings"
 	"testing"
+	"time"
 
 	core "github.com/covoyage/covonaut/tui/core"
 	"github.com/covoyage/covonaut/tui/theme"
@@ -155,7 +157,7 @@ func stripANSI(s string) string {
 // 最长（占满 railDrawCols），相邻 tick 明显更短。
 func TestRailTicksRendered(t *testing.T) {
 	h := railTestHistory(t, railTestWidth, railTestMaxRows)
-	lines := h.applyRailOverlay(h.Render(railTestWidth), railTestWidth)
+	lines := h.Render(railTestWidth)
 
 	ticks := 0
 	for _, ln := range lines {
@@ -167,26 +169,28 @@ func TestRailTicksRendered(t *testing.T) {
 		t.Fatalf("no rail ticks rendered in %d lines", len(lines))
 	}
 
-	// 悬停：motion 到第一个 tick 行。tick 段位于行尾 railDrawCols 列，
-	// 剥掉 ANSI 后按行尾后缀断言（行内容可能自带 markdown 分隔线，
-	// 不能全行数 "─"）。相邻行是否画 tick 取决于该行内容是否顶到右缘
-	// （悬浮让位规则），因此长度梯度在 railTickSeg 单元级断言。
+	// 悬停：motion 到最后一个 tick 行（滚动焦点在视口顶部的 prompt 上，
+	// 最后一个 tick 非焦点、从短长度起步）。tick 段位于行尾
+	// railDrawCols 列，剥掉 ANSI 后按行尾后缀断言（行内容可能自带
+	// markdown 分隔线，不能全行数 "─"）。相邻行是否画 tick 取决于该行
+	// 内容是否顶到右缘（悬浮让位规则），因此长度梯度在 railTickSeg
+	// 单元级断言。
 	h2 := railTestHistory(t, railTestWidth, railTestMaxRows)
 	h2.mu.Lock()
-	firstRow := h2.rail.ticks[0].row
+	lastRow := h2.rail.ticks[len(h2.rail.ticks)-1].row
 	h2.mu.Unlock()
-	h2.Update(core.MouseMsg{Action: core.MouseMotion, Row: int64(firstRow), Col: railCol()})
+	h2.Update(core.MouseMsg{Action: core.MouseMotion, Row: int64(lastRow), Col: railCol()})
 
 	// 动画：第一帧悬停 tick 还未到全长，逐帧推进后收敛到 6 格。
-	lines2 := h2.applyRailOverlay(h2.Render(railTestWidth), railTestWidth)
+	lines2 := h2.Render(railTestWidth)
 	tailOf := func(ls []string, row int) string {
 		return strings.TrimRight(stripANSI(ls[row]), " ")
 	}
-	if strings.HasSuffix(tailOf(lines2, firstRow), strings.Repeat("─", railDrawCols)) {
+	if strings.HasSuffix(tailOf(lines2, lastRow), strings.Repeat("─", railDrawCols)) {
 		t.Fatalf("hovered tick should start short and animate to full length")
 	}
 	lines2 = railDriveFrames(h2, 15)
-	hoveredOK := strings.HasSuffix(tailOf(lines2, firstRow), strings.Repeat("─", railDrawCols))
+	hoveredOK := strings.HasSuffix(tailOf(lines2, lastRow), strings.Repeat("─", railDrawCols))
 	if !hoveredOK {
 		t.Fatalf("hovered tick not converged to full %d-cell length after animation", railDrawCols)
 	}
@@ -289,12 +293,24 @@ func TestRailEaseLen(t *testing.T) {
 	}
 }
 
-// railDriveFrames 连续推进 n 帧动画（applyRailOverlay 每调用一次推进
+// railAdvanceFrame 确定性帧推进：把 lastAnim 注入为一个整帧之前，
+// 让缓动步长固定为 railAnimInterval，不受测试循环调用的墙钟间隔影响
+//（railEaseLen 以真实 dt 步进，调用过快时每帧几乎不推进）。
+func railAdvanceFrame(h *ChatHistory) {
+	h.mu.Lock()
+	h.rail.lastAnim = time.Now().Add(-railAnimInterval)
+	h.mu.Unlock()
+}
+
+// railDriveFrames 连续推进 n 帧动画（Render 内部每帧推进
 // railAnimInterval 毫秒的缓动），返回最后一帧的渲染行。
+// 注意 Render 内部已叠加 rail，不要再调 applyRailOverlay（双重叠加
+// 会让第二次的让位判定失效、丢失浮层行的 tick 回接）。
 func railDriveFrames(h *ChatHistory, n int) []string {
 	var lines []string
 	for i := 0; i < n; i++ {
-		lines = h.applyRailOverlay(h.Render(railTestWidth), railTestWidth)
+		railAdvanceFrame(h)
+		lines = h.Render(railTestWidth)
 	}
 	return lines
 }
@@ -374,7 +390,7 @@ func TestRailPopupSlideIn(t *testing.T) {
 		return false
 	}
 	// 第一帧：滑入刚开始，浮层不应已完全展开。
-	first := h.applyRailOverlay(h.Render(railTestWidth), railTestWidth)
+	first := h.Render(railTestWidth)
 	if hasFullBorder(first) {
 		t.Fatalf("popup should start partially hidden, but fully drawn on first frame")
 	}
@@ -700,6 +716,11 @@ func TestRailTickOnDividerRow(t *testing.T) {
 	if tickN == 0 {
 		t.Fatal("no ticks computed")
 	}
+	// 静止长度 1 格：该用例的单 tick 同时是滚动焦点（目标 6 格），
+	// 显式置为静止值以隔离 focus 对断言的影响。
+	h.mu.Lock()
+	h.rail.animLens = []float64{1}
+	h.mu.Unlock()
 
 	sep := strings.Repeat(" ", int(m)) + strings.Repeat("─", int(w-2*m))
 	content := make([]string, viewRows)
@@ -776,7 +797,8 @@ func TestRailTopLayerPaintsOnBlankCanvas(t *testing.T) {
 	h.mu.Unlock()
 	for r, ln := range top {
 		plain := stripANSI(ln)
-		if len(plain) < int(railDrawCols) {
+		runes := []rune(plain)
+		if len(runes) < int(railDrawCols) {
 			// 画布行不强制 pad：全空行以空串表示。
 			if strings.TrimSpace(plain) != "" {
 				t.Fatalf("short non-blank top row %d: %q", r, plain)
@@ -786,8 +808,9 @@ func TestRailTopLayerPaintsOnBlankCanvas(t *testing.T) {
 			}
 			continue
 		}
-		tail := plain[len(plain)-int(railDrawCols):]
-		head := plain[:len(plain)-int(railDrawCols)]
+		// 按 rune 切尾窗（"─" 是多字节 UTF-8，按字节切会切进字符中间）。
+		tail := string(runes[len(runes)-int(railDrawCols):])
+		head := string(runes[:len(runes)-int(railDrawCols)])
 		if basePainted[r] {
 			if strings.TrimSpace(tail) == "" {
 				t.Fatalf("tick row %d missing tick in top layer", r)
@@ -844,5 +867,151 @@ func TestRailTopLayerYieldsToContent(t *testing.T) {
 		if strings.TrimSpace(baseTail) != "" && !strings.Contains(baseTail, "─") {
 			t.Fatalf("top layer tick at row %d overwrites content tail %q", r, baseTail)
 		}
+	}
+}
+
+// railSyncHistory 构造三条输入 + 各自多行回复的 history，供滚动同步测试。
+func railSyncHistory(t *testing.T) *ChatHistory {
+	t.Helper()
+	h := NewChatHistory()
+	h.SetRailEnabled(true)
+	h.SetMaxRows(12)
+	asst := make([]string, 8)
+	for i := range asst {
+		asst[i] = "assistant line"
+	}
+	reply := strings.Join(asst, "\n\n")
+	for _, p := range []string{"p1", "p2", "p3"} {
+		h.Append(ChatMessage{Role: RoleUser, Text: p})
+		h.Append(ChatMessage{Role: RoleAssistant, Text: reply})
+	}
+	h.Render(railTestWidth)
+	return h
+}
+
+// convergeRail 反复 Render 推进缓动直到长度收敛。
+func convergeRail(h *ChatHistory, n int) {
+	for i := 0; i < n; i++ {
+		railAdvanceFrame(h)
+		h.Render(railTestWidth)
+	}
+}
+
+// TestRailFocusTracksScroll 验证滚动同步：视口顶部落在哪个 prompt 区段，
+// 对应 tick 即为焦点（tail 跟随时是最新一条，滚到顶是第一条）。
+func TestRailFocusTracksScroll(t *testing.T) {
+	h := railSyncHistory(t)
+
+	h.mu.Lock()
+	total := h.cachedTotal
+	maxRows := h.maxRows
+	starts := make([]int64, len(h.rail.ticks))
+	for i, tk := range h.rail.ticks {
+		starts[i] = tk.startLine
+	}
+	focusTail := h.rail.focus
+	h.mu.Unlock()
+
+	if focusTail != len(starts)-1 {
+		t.Fatalf("tail follow should focus last tick, got %d (n=%d)", focusTail, len(starts))
+	}
+
+	// 视口顶部落在最后一条输入的 turn 间隔行内（空行+分割线+空行，
+	// 共 3 行，在 prompt 起始行之前）：焦点必须仍是最后一条。
+	// 回归：间隔 span 不属于消息区段，旧判定会让焦点退到前一条。
+	for _, back := range []int64{1, 3} {
+		off := total - maxRows - (starts[len(starts)-1] - back)
+		if off < 0 {
+			continue
+		}
+		h.FollowTail()
+		h.ScrollBy(off)
+		h.Render(railTestWidth)
+		h.mu.Lock()
+		focusGap := h.rail.focus
+		h.mu.Unlock()
+		if focusGap != len(starts)-1 {
+			t.Fatalf("viewport top %d rows above last prompt (inside its turn gap) should still focus last tick, got %d", back, focusGap)
+		}
+	}
+
+	// 滚到视口顶部 = 第二条输入的区段内。
+	h.FollowTail()
+	off := total - maxRows - (starts[1] + 2)
+	if off < 0 {
+		off = 0
+	}
+	h.ScrollBy(off)
+	h.Render(railTestWidth)
+	h.mu.Lock()
+	focusMid := h.rail.focus
+	h.mu.Unlock()
+	if focusMid != 1 {
+		t.Fatalf("viewport top inside prompt 2 should focus tick 1, got %d", focusMid)
+	}
+
+	// 滚到顶：焦点是第一条输入。
+	h.ScrollBy(total) // 钳制到顶端
+	h.Render(railTestWidth)
+	h.mu.Lock()
+	focusTop := h.rail.focus
+	h.mu.Unlock()
+	if focusTop != 0 {
+		t.Fatalf("scrolled to top should focus tick 0, got %d", focusTop)
+	}
+}
+
+// TestRailFocusGradient 验证焦点长度梯度：焦点 6 格、相邻 3 格、
+// 其余 1 格，悬停出现时焦点让位。
+func TestRailFocusGradient(t *testing.T) {
+	h := railSyncHistory(t)
+
+	// 无悬停：焦点梯度收敛。
+	convergeRail(h, 120)
+	h.mu.Lock()
+	var lens []int
+	for _, v := range h.rail.animLens {
+		lens = append(lens, int(math.Round(v)))
+	}
+	focus := h.rail.focus
+	h.mu.Unlock()
+
+	if focus < 0 || focus >= len(lens) {
+		t.Fatalf("focus %d out of range (lens=%v)", focus, lens)
+	}
+	for i, l := range lens {
+		want := 1
+		switch i {
+		case focus:
+			want = 6
+		case focus - 1, focus + 1:
+			want = 3
+		}
+		if l != want {
+			t.Fatalf("tick %d len = %d, want %d (focus=%d, lens=%v)", i, l, want, focus, lens)
+		}
+	}
+
+	// 悬停另一 tick：悬停接管梯度，焦点 tick 回落到 1（非相邻时）。
+	h.mu.Lock()
+	hoverRow := h.rail.ticks[0].row
+	h.mu.Unlock()
+	h.Update(core.MouseMsg{Action: core.MouseMotion, Row: int64(hoverRow), Col: railTestWidth - railHitCols})
+	convergeRail(h, 120)
+	h.mu.Lock()
+	hover := h.rail.hover
+	lens = lens[:0]
+	for _, v := range h.rail.animLens {
+		lens = append(lens, int(math.Round(v)))
+	}
+	h.mu.Unlock()
+	if hover != 0 {
+		t.Fatalf("hover should be tick 0, got %d", hover)
+	}
+	if lens[0] != 6 {
+		t.Fatalf("hovered tick len = %d, want 6 (lens=%v)", lens[0], lens)
+	}
+	if focus != 0 && focus != 1 && lens[focus] != 1 {
+		t.Fatalf("focused tick %d must yield to hover, len = %d (lens=%v)", focus, lens[focus], lens)
 	}
 }

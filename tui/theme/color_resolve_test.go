@@ -43,3 +43,19 @@ func TestDetectColorModeAppleTerminal(t *testing.T) {
 		t.Fatalf("Apple_Terminal should force 256, got %v", m)
 	}
 }
+
+// TestFaintHairline 验证分割线混色：亮文字（深色底）向黑混、暗文字
+// （浅色底）向白混、非 hex 原样返回。
+func TestFaintHairline(t *testing.T) {
+	dark := FaintHairline("#606070", "#e0e0e0")
+	if dark != "#292930" {
+		t.Fatalf("dark-theme hairline = %q, want #292930", dark)
+	}
+	light := FaintHairline("#bdbdbd", "#212121")
+	if light != "#e3e3e3" {
+		t.Fatalf("light-theme hairline = %q, want #e3e3e3", light)
+	}
+	if got := FaintHairline("plain", "#e0e0e0"); got != "plain" {
+		t.Fatalf("non-hex base must pass through, got %q", got)
+	}
+}

@@ -95,6 +95,36 @@ func MixHex(a, b string, t float64) string {
 	return fmt.Sprintf("#%02x%02x%02x", mix(ar, br), mix(ag, bg), mix(ab, bb))
 }
 
+// hairlineBlend is how far divider colors are pushed toward the
+// background: high enough to read as barely-there, low enough to stay
+// perceptible on the 256-color ramp.
+const hairlineBlend = 0.58
+
+// FaintHairline mixes a divider color toward the approximate terminal
+// background so hairline rules (turn separators, markdown horizontal
+// rules) read as barely visible in any theme. The anchor is chosen by
+// the text luminance: light text implies a dark background (mix toward
+// black), dark text implies a light background (mix toward white).
+// Non-hex base returns unchanged.
+func FaintHairline(base, text string) string {
+	if _, _, _, ok := hexToRGB(base); !ok {
+		return base
+	}
+	anchor := "#000000"
+	if hexLuma(text) < 0.5 {
+		anchor = "#ffffff"
+	}
+	return MixHex(base, anchor, hairlineBlend)
+}
+
+func hexLuma(hex string) float64 {
+	r, g, b, ok := hexToRGB(hex)
+	if !ok {
+		return 0.5
+	}
+	return (0.299*float64(r) + 0.587*float64(g) + 0.114*float64(b)) / 255
+}
+
 var cubeValues = []int64{0, 95, 135, 175, 215, 255}
 
 func findClosestCubeIndex(value int64) int64 {

@@ -1108,10 +1108,10 @@ func (t *TUI) EnableMouse(mode string) { t.enableMouse(mode) }
 // mode. Each frame re-renders only its own region, so content written here
 // persists in the terminal's history for the user to scroll up through.
 //
-// The implementation mirrors the grok inline model: move to the top of the
-// live region, clear from there down, print the new content, then re-create
-// the live region's blank space at the bottom. Old content above is pushed
-// into native scrollback by the terminal.
+// The implementation mirrors the inline live-region model: move to the top
+// of the live region, clear from there down, print the new content, then
+// re-create the live region's blank space at the bottom. Old content above
+// is pushed into native scrollback by the terminal.
 func (t *TUI) WriteNativeScrollback(lines []string) {
 	if !t.options.Scrollback || len(lines) == 0 {
 		return

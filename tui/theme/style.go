@@ -65,6 +65,11 @@ type Style struct {
 
 func NewStyle() Style { return Style{fg: Default, bg: Default} }
 
+// IsZero 报告样式是否为未设置的零值（区别于 NewStyle 的默认前景/背景）。
+func (s Style) IsZero() bool {
+	return s.fg == 0 && s.bg == 0 && s.fgParams == "" && s.bgParams == "" && len(s.attrs) == 0
+}
+
 func (s Style) Fg(c Color) Style {
 	s.fg = c
 	s.fgParams = ""

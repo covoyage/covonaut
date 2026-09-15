@@ -53,7 +53,11 @@ func renderBlock(b mdBlock, width int64, theme MarkdownTheme, indent int) []stri
 		return []string{core.PadToWidth("", width)}
 	case mdHR:
 		rule := strings.Repeat("─", maxInt(int(width)-indent, 1))
-		line := strings.Repeat(" ", indent) + theme.HRFn(rule)
+		styleFn := theme.RuleFn
+		if styleFn == nil {
+			styleFn = theme.HRFn
+		}
+		line := strings.Repeat(" ", indent) + styleFn(rule)
 		return []string{core.PadToWidth(line, width)}
 	case mdHeading:
 		level := b.Level - 1
