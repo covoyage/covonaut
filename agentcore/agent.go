@@ -1614,6 +1614,7 @@ func (a *Agent) executeToolCalls(ctx context.Context, calls []ToolCall) error {
 		if err := a.persistMessage(ctx, Message{
 			Role:       RoleTool,
 			Content:    content,
+			Blocks:     r.Blocks,
 			ToolCallID: tc.ID,
 			Name:       tc.Name,
 		}); err != nil {

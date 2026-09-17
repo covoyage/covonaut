@@ -86,7 +86,7 @@ type contentBlock struct {
 	Name         string                   `json:"name,omitempty"`         // tool_use
 	Input        any                      `json:"input,omitempty"`        // tool_use
 	ToolUseID    string                   `json:"tool_use_id,omitempty"`  // tool_result
-	Content      string                   `json:"content,omitempty"`      // tool_result body
+	Content      any                      `json:"content,omitempty"`      // tool_result body: string, or multipart parts when the result carries images
 	CacheControl *agentcore.CacheControlMarker `json:"cache_control,omitempty"`
 }
 
@@ -197,10 +197,39 @@ func ConvertMessages(msgs []agentcore.Message) (string, []apiMessage) {
 			out = append(out, am)
 
 		case agentcore.RoleTool:
+			// Multipart tool_result: when the tool attached image blocks,
+			// send them alongside the textual body so native multimodal
+			// providers see the actual pixels instead of a text summary.
+			var images []contentBlock
+			for _, bl := range m.Blocks {
+				if bl.Kind == agentcore.BlockKindImage {
+					if block, ok := ImageBlockFromContent(bl); ok {
+						images = append(images, block)
+					}
+				}
+			}
+			var body any = m.Content
+			if len(images) > 0 {
+				parts := make([]any, 0, len(images)+1)
+				if m.Content != "" {
+					parts = append(parts, map[string]any{"type": "text", "text": m.Content})
+				}
+				for _, img := range images {
+					parts = append(parts, map[string]any{
+						"type": "image",
+						"source": map[string]any{
+							"type":       "base64",
+							"media_type": img.Source.MediaType,
+							"data":       img.Source.Data,
+						},
+					})
+				}
+				body = parts
+			}
 			result := contentBlock{
 				Type:      "tool_result",
 				ToolUseID: m.ToolCallID,
-				Content:   m.Content,
+				Content:   body,
 			}
 			// Group consecutive tool results into a single user message.
 			if n := len(out); n > 0 && out[n-1].Role == "user" && len(out[n-1].Content) > 0 && out[n-1].Content[0].Type == "tool_result" {

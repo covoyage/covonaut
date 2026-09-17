@@ -126,22 +126,22 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 		},
 		Func: func(ctx context.Context, args json.RawMessage) (any, error) {
 			var input struct {
-				Action     string `json:"action"`
-				URL        string `json:"url"`
-				Ref        string `json:"ref"`
-				Text       string `json:"text"`
-				Direction  string `json:"direction"`
-				Key        string `json:"key"`
-				FullPage   bool   `json:"full_page"`
-				Full       bool   `json:"full"`
-				Mode       string `json:"mode"`
-				Expression string `json:"expression"`
-				FrameID    string `json:"frame_id"`
-				DialogID   string `json:"dialog_id"`
-				Accept     bool   `json:"accept"`
-				PromptText string `json:"prompt_text"`
-				Question   string `json:"question"`
-				Annotate   bool   `json:"annotate"`
+				Action     string                 `json:"action"`
+				URL        string                 `json:"url"`
+				Ref        string                 `json:"ref"`
+				Text       string                 `json:"text"`
+				Direction  string                 `json:"direction"`
+				Key        string                 `json:"key"`
+				FullPage   bool                   `json:"full_page"`
+				Full       bool                   `json:"full"`
+				Mode       string                 `json:"mode"`
+				Expression string                 `json:"expression"`
+				FrameID    string                 `json:"frame_id"`
+				DialogID   string                 `json:"dialog_id"`
+				Accept     bool                   `json:"accept"`
+				PromptText string                 `json:"prompt_text"`
+				Question   string                 `json:"question"`
+				Annotate   bool                   `json:"annotate"`
 				CDPMethod  string                 `json:"cdp_method"`
 				CDPParams  map[string]interface{} `json:"cdp_params"`
 			}
@@ -262,26 +262,26 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 							AnnotateLightpandaFallback(nil)
 						}
 					}
-			case BackendLocal, BackendCDP, BackendBrowserbase, BackendBrowserUse, BackendFirecrawl, BackendAgentBrowser:
-				navTimeout := navigationTimeout(cfg.CommandTimeout)
-				timeoutCtx, cancel := context.WithTimeout(session.ctx, navTimeout)
+				case BackendLocal, BackendCDP, BackendBrowserbase, BackendBrowserUse, BackendFirecrawl, BackendAgentBrowser:
+					navTimeout := navigationTimeout(cfg.CommandTimeout)
+					timeoutCtx, cancel := context.WithTimeout(session.ctx, navTimeout)
 
-				if err := chromedp.Run(timeoutCtx, chromedp.ActionFunc(func(ctx context.Context) error {
-					_, _, _, _, err := page.Navigate(parsedURL.String()).Do(ctx)
-					return err
-				})); err != nil {
-					cancel()
-					if isDeadlineError(err) {
-						return nil, navigationTimeoutError(parsedURL.String(), navTimeout)
+					if err := chromedp.Run(timeoutCtx, chromedp.ActionFunc(func(ctx context.Context) error {
+						_, _, _, _, err := page.Navigate(parsedURL.String()).Do(ctx)
+						return err
+					})); err != nil {
+						cancel()
+						if isDeadlineError(err) {
+							return nil, navigationTimeoutError(parsedURL.String(), navTimeout)
+						}
+						return nil, fmt.Errorf("navigation failed: %w", err)
 					}
-					return nil, fmt.Errorf("navigation failed: %w", err)
-				}
 
-				readyCtx, readyCancel := context.WithTimeout(timeoutCtx, 30*time.Second)
-				var ready bool
-				for i := 0; i < 30; i++ {
-					var state string
-					chromedp.Run(readyCtx, chromedp.Evaluate(`
+					readyCtx, readyCancel := context.WithTimeout(timeoutCtx, 30*time.Second)
+					var ready bool
+					for i := 0; i < 30; i++ {
+						var state string
+						chromedp.Run(readyCtx, chromedp.Evaluate(`
 						(function() {
 							return JSON.stringify({
 								state: document.readyState,
@@ -290,52 +290,52 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 						})()
 					`, &state))
 
-					var navResult struct {
-						State string `json:"state"`
-						URL   string `json:"url"`
-					}
-					if json.Unmarshal([]byte(state), &navResult) == nil {
-						if navResult.State == "interactive" || navResult.State == "complete" {
-							ready = true
-							break
+						var navResult struct {
+							State string `json:"state"`
+							URL   string `json:"url"`
 						}
-						if strings.Contains(navResult.URL, parsedURL.Host) {
-							ready = true
-							break
+						if json.Unmarshal([]byte(state), &navResult) == nil {
+							if navResult.State == "interactive" || navResult.State == "complete" {
+								ready = true
+								break
+							}
+							if strings.Contains(navResult.URL, parsedURL.Host) {
+								ready = true
+								break
+							}
 						}
+						time.Sleep(1 * time.Second)
 					}
+					readyCancel()
+
+					if !ready {
+						cancel()
+						return nil, fmt.Errorf("navigation timed out: page did not become interactive")
+					}
+
 					time.Sleep(1 * time.Second)
-				}
-				readyCancel()
 
-				if !ready {
+					stealthCtx, stealthCancel := context.WithTimeout(timeoutCtx, 3*time.Second)
+					chromedp.Run(stealthCtx, chromedp.Evaluate(stealthJavaScript, nil))
+					stealthCancel()
+
+					var title string
+					titleCtx, titleCancel := context.WithTimeout(timeoutCtx, 5*time.Second)
+					chromedp.Run(titleCtx, chromedp.Title(&title))
+					titleCancel()
+
+					snapshot, err = generateSnapshot(timeoutCtx, false, session.refMapper)
 					cancel()
-					return nil, fmt.Errorf("navigation timed out: page did not become interactive")
-				}
 
-				time.Sleep(1 * time.Second)
+					session.mu.Lock()
+					session.url = parsedURL.String()
+					session.title = title
+					session.lastActivity = time.Now()
+					session.mu.Unlock()
 
-				stealthCtx, stealthCancel := context.WithTimeout(timeoutCtx, 3*time.Second)
-				chromedp.Run(stealthCtx, chromedp.Evaluate(stealthJavaScript, nil))
-				stealthCancel()
-
-				var title string
-				titleCtx, titleCancel := context.WithTimeout(timeoutCtx, 5*time.Second)
-				chromedp.Run(titleCtx, chromedp.Title(&title))
-				titleCancel()
-
-				snapshot, err = generateSnapshot(timeoutCtx, false, session.refMapper)
-				cancel()
-
-				session.mu.Lock()
-				session.url = parsedURL.String()
-				session.title = title
-				session.lastActivity = time.Now()
-				session.mu.Unlock()
-
-				if err != nil {
-					snapshot = fmt.Sprintf("(snapshot unavailable: %v)", err)
-				}
+					if err != nil {
+						snapshot = fmt.Sprintf("(snapshot unavailable: %v)", err)
+					}
 				default:
 					return nil, fmt.Errorf("backend %s not yet supported for navigation", session.backendType)
 				}
@@ -370,18 +370,18 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 				return result(fmt.Sprintf("Navigated to %s\nTitle: %s\n\n%s%s", url, title, snapshot, extraInfo), nil)
 
 			case "snapshot":
-			session, ok := defaultBrowserManager.GetActiveSession("default")
-			if !ok {
-				return nil, fmt.Errorf("no active browser session. Call browser (action=navigate) first")
-			}
+				session, ok := defaultBrowserManager.GetActiveSession("default")
+				if !ok {
+					return nil, fmt.Errorf("no active browser session. Call browser (action=navigate) first")
+				}
 
-			mode := input.Mode
-			if mode == "" {
-				mode = "default"
-			}
+				mode := input.Mode
+				if mode == "" {
+					mode = "default"
+				}
 
-			var err error
-			var snapshot string
+				var err error
+				var snapshot string
 				switch session.backendType {
 				case BackendCamofox:
 					snapshot, err = session.camofoxClient.GetSnapshot(session.sessionID, input.Full)
@@ -417,21 +417,21 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 				return result(fmt.Sprintf("Page: %s\nTitle: %s\n\n%s%s", url, title, snapshot, extraInfo), nil)
 
 			case "click":
-			if input.Ref == "" {
-				return nil, fmt.Errorf("ref is required for action=click")
-			}
-			ref := input.Ref
-			if !strings.HasPrefix(ref, "@") {
-				ref = "@" + ref
-			}
+				if input.Ref == "" {
+					return nil, fmt.Errorf("ref is required for action=click")
+				}
+				ref := input.Ref
+				if !strings.HasPrefix(ref, "@") {
+					ref = "@" + ref
+				}
 
-			session, ok := defaultBrowserManager.GetActiveSession("default")
-			if !ok {
-				return nil, fmt.Errorf("no active browser session. Call browser (action=navigate) first")
-			}
+				session, ok := defaultBrowserManager.GetActiveSession("default")
+				if !ok {
+					return nil, fmt.Errorf("no active browser session. Call browser (action=navigate) first")
+				}
 
-			var err error
-			var snapshot string
+				var err error
+				var snapshot string
 				switch session.backendType {
 				case BackendCamofox:
 					snapshot, err = session.camofoxClient.Click(session.sessionID, ref)
@@ -478,21 +478,21 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 				return result(fmt.Sprintf("Clicked %s\n\n%s", ref, snapshot), nil)
 
 			case "type":
-			if input.Ref == "" || input.Text == "" {
-				return nil, fmt.Errorf("ref and text are required for action=type")
-			}
-			ref := input.Ref
-			if !strings.HasPrefix(ref, "@") {
-				ref = "@" + ref
-			}
+				if input.Ref == "" || input.Text == "" {
+					return nil, fmt.Errorf("ref and text are required for action=type")
+				}
+				ref := input.Ref
+				if !strings.HasPrefix(ref, "@") {
+					ref = "@" + ref
+				}
 
-			session, ok := defaultBrowserManager.GetActiveSession("default")
-			if !ok {
-				return nil, fmt.Errorf("no active browser session. Call browser (action=navigate) first")
-			}
+				session, ok := defaultBrowserManager.GetActiveSession("default")
+				if !ok {
+					return nil, fmt.Errorf("no active browser session. Call browser (action=navigate) first")
+				}
 
-			var err error
-			var resultMsg string
+				var err error
+				var resultMsg string
 				switch session.backendType {
 				case BackendCamofox:
 					resultMsg, err = session.camofoxClient.Type(session.sessionID, ref, input.Text)
@@ -543,17 +543,17 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 				return result(resultMsg, nil)
 
 			case "scroll":
-			if input.Direction != "up" && input.Direction != "down" {
-				return nil, fmt.Errorf("direction must be \"up\" or \"down\" for action=scroll")
-			}
+				if input.Direction != "up" && input.Direction != "down" {
+					return nil, fmt.Errorf("direction must be \"up\" or \"down\" for action=scroll")
+				}
 
-			session, ok := defaultBrowserManager.GetActiveSession("default")
-			if !ok {
-				return nil, fmt.Errorf("no active browser session. Call browser (action=navigate) first")
-			}
+				session, ok := defaultBrowserManager.GetActiveSession("default")
+				if !ok {
+					return nil, fmt.Errorf("no active browser session. Call browser (action=navigate) first")
+				}
 
-			var err error
-			var snapshot string
+				var err error
+				var snapshot string
 				switch session.backendType {
 				case BackendCamofox:
 					snapshot, err = session.camofoxClient.Scroll(session.sessionID, input.Direction)
@@ -598,14 +598,14 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 				return result(fmt.Sprintf("Scrolled %s\n\n%s", input.Direction, snapshot), nil)
 
 			case "back":
-			session, ok := defaultBrowserManager.GetActiveSession("default")
-			if !ok {
-				return nil, fmt.Errorf("no active browser session. Call browser (action=navigate) first")
-			}
+				session, ok := defaultBrowserManager.GetActiveSession("default")
+				if !ok {
+					return nil, fmt.Errorf("no active browser session. Call browser (action=navigate) first")
+				}
 
-			var err error
-			var url, title string
-			var snapshot string
+				var err error
+				var url, title string
+				var snapshot string
 				switch session.backendType {
 				case BackendCamofox:
 					snapshot, err = session.camofoxClient.Back(session.sessionID)
@@ -655,17 +655,17 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 				return result(fmt.Sprintf("Navigated back\nURL: %s\nTitle: %s\n\n%s", url, title, snapshot), nil)
 
 			case "press":
-			if input.Key == "" {
-				return nil, fmt.Errorf("key is required for action=press")
-			}
+				if input.Key == "" {
+					return nil, fmt.Errorf("key is required for action=press")
+				}
 
-			session, ok := defaultBrowserManager.GetActiveSession("default")
-			if !ok {
-				return nil, fmt.Errorf("no active browser session. Call browser (action=navigate) first")
-			}
+				session, ok := defaultBrowserManager.GetActiveSession("default")
+				if !ok {
+					return nil, fmt.Errorf("no active browser session. Call browser (action=navigate) first")
+				}
 
-			var err error
-			var resultMsg string
+				var err error
+				var resultMsg string
 				switch session.backendType {
 				case BackendCamofox:
 					resultMsg, err = session.camofoxClient.Press(session.sessionID, input.Key)
@@ -700,13 +700,13 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 				return result(resultMsg, nil)
 
 			case "screenshot":
-			session, ok := defaultBrowserManager.GetActiveSession("default")
-			if !ok {
-				return nil, fmt.Errorf("no active browser session. Call browser (action=navigate) first")
-			}
+				session, ok := defaultBrowserManager.GetActiveSession("default")
+				if !ok {
+					return nil, fmt.Errorf("no active browser session. Call browser (action=navigate) first")
+				}
 
-			var err error
-			var sizeBytes int
+				var err error
+				var sizeBytes int
 				switch session.backendType {
 				case BackendCamofox:
 					var buf []byte
@@ -750,17 +750,17 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 				})
 
 			case "evaluate":
-			if input.Expression == "" {
-				return nil, fmt.Errorf("expression is required for action=evaluate")
-			}
+				if input.Expression == "" {
+					return nil, fmt.Errorf("expression is required for action=evaluate")
+				}
 
-			session, ok := defaultBrowserManager.GetActiveSession("default")
-			if !ok {
-				return nil, fmt.Errorf("no active browser session. Call browser (action=navigate) first")
-			}
+				session, ok := defaultBrowserManager.GetActiveSession("default")
+				if !ok {
+					return nil, fmt.Errorf("no active browser session. Call browser (action=navigate) first")
+				}
 
-			var err error
-			var evalResult string
+				var err error
+				var evalResult string
 				if session.supervisor != nil && input.FrameID != "" {
 					evalResult, err = session.supervisor.EvaluateJS(input.Expression, input.FrameID)
 				} else if session.backendType == BackendLightpanda || session.backendType == BackendLocal || session.backendType == BackendCDP || session.backendType == BackendBrowserbase || session.backendType == BackendBrowserUse || session.backendType == BackendFirecrawl {
@@ -817,17 +817,17 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 				return result(msg, nil)
 
 			case "vision":
-			if input.Question == "" {
-				return nil, fmt.Errorf("question is required for action=vision")
-			}
+				if input.Question == "" {
+					return nil, fmt.Errorf("question is required for action=vision")
+				}
 
-			session, ok := defaultBrowserManager.GetActiveSession("default")
-			if !ok {
-				return nil, fmt.Errorf("no active browser session. Call browser (action=navigate) first")
-			}
+				session, ok := defaultBrowserManager.GetActiveSession("default")
+				if !ok {
+					return nil, fmt.Errorf("no active browser session. Call browser (action=navigate) first")
+				}
 
-			var err error
-			var screenshotData []byte
+				var err error
+				var screenshotData []byte
 				switch session.backendType {
 				case BackendCamofox:
 					screenshotData, err = session.camofoxClient.Screenshot(session.sessionID)

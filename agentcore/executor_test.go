@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func echoTool() *Tool {
@@ -367,5 +370,246 @@ func TestExecutorNoRepairFunc(t *testing.T) {
 
 	if result.Err == nil {
 		t.Fatal("expected error for invalid JSON without repair func")
+	}
+}
+
+// fakeImageResult is a BlockCarrier standing in for a multimodal tool result.
+type fakeImageResult struct {
+	text   string
+	blocks []ContentBlock
+}
+
+func (r *fakeImageResult) ToolBlocks() []ContentBlock { return r.blocks }
+func (r *fakeImageResult) ToolText() string           { return r.text }
+
+func TestExecuteBlockCarrierRoundTrip(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(&Tool{
+		Name: "snap",
+		Func: func(ctx context.Context, args json.RawMessage) (any, error) {
+			return &fakeImageResult{
+				text: "image attached",
+				blocks: []ContentBlock{
+					{Kind: BlockKindImage, URL: "data:image/png;base64,QUFB", MediaType: "image/png"},
+				},
+			}, nil
+		},
+	})
+	exe := NewExecutor(reg, ExecutorConfig{Mode: ModeSerial})
+	res := exe.Execute(context.Background(), ToolCall{ID: "c1", Name: "snap"}, &AgentState{})
+	if res.Err != nil {
+		t.Fatalf("execute: %v", res.Err)
+	}
+	if res.Result != "image attached" {
+		t.Fatalf("text form: got %q", res.Result)
+	}
+	if len(res.Blocks) != 1 || res.Blocks[0].Kind != BlockKindImage {
+		t.Fatalf("blocks not transported: %+v", res.Blocks)
+	}
+	if res.Blocks[0].URL != "data:image/png;base64,QUFB" {
+		t.Fatalf("block payload corrupted: %+v", res.Blocks[0])
+	}
+}
+
+func TestExecuteAllMixed(t *testing.T) {
+	var mu sync.Mutex
+	var inFlight int32
+	maxConcurrent := int32(0)
+	timeline := []string{}
+
+	record := func(name string) {
+		mu.Lock()
+		timeline = append(timeline, name)
+		mu.Unlock()
+	}
+
+	track := func() func() {
+		mu.Lock()
+		inFlight++
+		if inFlight > maxConcurrent {
+			maxConcurrent = inFlight
+		}
+		mu.Unlock()
+		return func() {
+			mu.Lock()
+			inFlight--
+			mu.Unlock()
+		}
+	}
+
+	safe := func(ctx context.Context, args json.RawMessage) (any, error) {
+		done := track()
+		defer done()
+		time.Sleep(30 * time.Millisecond)
+		record("safe:" + string(args))
+		return "ok", nil
+	}
+	unsafe := func(name string) ToolFunc {
+		return func(ctx context.Context, args json.RawMessage) (any, error) {
+			done := track()
+			defer done()
+			mu.Lock()
+			current := inFlight
+			mu.Unlock()
+			if current != 1 {
+				t.Errorf("%s ran with %d calls in flight; want exclusive execution", name, current)
+			}
+			record(name)
+			return "ok", nil
+		}
+	}
+
+	yes := true
+	no := false
+	reg := NewRegistry()
+	reg.Register(&Tool{Name: "safe", Func: safe, ConcurrencySafe: &yes})
+	reg.Register(&Tool{Name: "blocked", Func: unsafe("blocked"), ConcurrencySafe: &no})
+	reg.Register(&Tool{Name: "undeclared", Func: unsafe("undeclared")})
+
+	calls := []ToolCall{
+		{ID: "1", Name: "safe", Arguments: `"a"`},
+		{ID: "2", Name: "safe", Arguments: `"b"`},
+		{ID: "3", Name: "blocked", Arguments: ""},
+		{ID: "4", Name: "safe", Arguments: `"c"`},
+		{ID: "5", Name: "undeclared", Arguments: ""},
+		{ID: "6", Name: "safe", Arguments: `"d"`},
+	}
+
+	exe := NewExecutor(reg, ExecutorConfig{Mode: ModeMixed})
+	results := exe.ExecuteAll(context.Background(), calls, &AgentState{}, nil)
+
+	for i, r := range results {
+		if r.Err != nil {
+			t.Fatalf("call %d failed: %v", i, r.Err)
+		}
+	}
+	if maxConcurrent < 2 {
+		t.Errorf("declared-safe calls never ran concurrently (max=%d)", maxConcurrent)
+	}
+	// Results stay in model order.
+	want := []string{"a", "b", "", "c", "", "d"}
+	for i, arg := range want {
+		if arg != "" && !strings.Contains(results[i].Result, "ok") {
+			t.Errorf("result %d = %q, want ok", i, results[i].Result)
+		}
+	}
+	_ = timeline
+}
+
+func TestExecuteAllParallel(t *testing.T) {
+	var mu sync.Mutex
+	var inFlight int32
+	maxConcurrent := int32(0)
+
+	track := func() func() {
+		mu.Lock()
+		inFlight++
+		if inFlight > maxConcurrent {
+			maxConcurrent = inFlight
+		}
+		mu.Unlock()
+		return func() {
+			mu.Lock()
+			inFlight--
+			mu.Unlock()
+		}
+	}
+
+	slow := func(ctx context.Context, args json.RawMessage) (any, error) {
+		done := track()
+		defer done()
+		time.Sleep(30 * time.Millisecond)
+		return "ok", nil
+	}
+	exclusive := func(name string) ToolFunc {
+		return func(ctx context.Context, args json.RawMessage) (any, error) {
+			done := track()
+			defer done()
+			mu.Lock()
+			current := inFlight
+			mu.Unlock()
+			if current != 1 {
+				t.Errorf("%s ran with %d calls in flight; want exclusive execution", name, current)
+			}
+			time.Sleep(10 * time.Millisecond)
+			return "ok", nil
+		}
+	}
+
+	yes := true
+	no := false
+	reg := NewRegistry()
+	reg.Register(&Tool{Name: "declared", Func: slow, ConcurrencySafe: &yes})
+	reg.Register(&Tool{Name: "opted_out", Func: exclusive("opted_out"), ConcurrencySafe: &no})
+	reg.Register(&Tool{Name: "undeclared", Func: slow})
+
+	calls := []ToolCall{
+		{ID: "1", Name: "undeclared", Arguments: ""},
+		{ID: "2", Name: "undeclared", Arguments: ""},
+		{ID: "3", Name: "opted_out", Arguments: ""},
+		{ID: "4", Name: "declared", Arguments: ""},
+		{ID: "5", Name: "undeclared", Arguments: ""},
+	}
+
+	exe := NewExecutor(reg, ExecutorConfig{Mode: ModeParallel})
+	results := exe.ExecuteAll(context.Background(), calls, &AgentState{}, nil)
+
+	for i, r := range results {
+		if r.Err != nil {
+			t.Fatalf("call %d failed: %v", i, r.Err)
+		}
+	}
+	// Undeclared tools join the pool (fail-open), so the first two calls must
+	// have overlapped; the opted-out call ran alone as a barrier.
+	if maxConcurrent < 2 {
+		t.Errorf("parallel pool never overlapped calls (max=%d)", maxConcurrent)
+	}
+}
+
+func TestExecuteAllRolling(t *testing.T) {
+	var mu sync.Mutex
+	slowFinished := false
+	fastStartedWhileSlowRunning := 0
+
+	reg := NewRegistry()
+	reg.Register(&Tool{Name: "slow", Func: func(ctx context.Context, args json.RawMessage) (any, error) {
+		time.Sleep(100 * time.Millisecond)
+		mu.Lock()
+		slowFinished = true
+		mu.Unlock()
+		return "ok", nil
+	}})
+	reg.Register(&Tool{Name: "fast", Func: func(ctx context.Context, args json.RawMessage) (any, error) {
+		mu.Lock()
+		if !slowFinished {
+			fastStartedWhileSlowRunning++
+		}
+		mu.Unlock()
+		return "ok", nil
+	}})
+
+	// Both tools are undeclared, so under ModeParallel both are pool-eligible.
+	// A batch-granularity scheduler would wait for the slow call to settle
+	// before starting the fast ones; a rolling scheduler starts them while it
+	// is still in flight.
+	calls := []ToolCall{
+		{ID: "1", Name: "slow", Arguments: ""},
+		{ID: "2", Name: "fast", Arguments: ""},
+		{ID: "3", Name: "fast", Arguments: ""},
+	}
+
+	exe := NewExecutor(reg, ExecutorConfig{Mode: ModeParallel})
+	results := exe.ExecuteAll(context.Background(), calls, &AgentState{}, nil)
+
+	for i, r := range results {
+		if r.Err != nil {
+			t.Fatalf("call %d failed: %v", i, r.Err)
+		}
+		if !strings.Contains(r.Result, "ok") {
+			t.Errorf("result %d = %q, want ok", i, r.Result)
+		}
+	}
+	if fastStartedWhileSlowRunning < 2 {
+		t.Errorf("rolling pool blocked later eligible calls behind a slow straggler (started early: %d)", fastStartedWhileSlowRunning)
 	}
 }

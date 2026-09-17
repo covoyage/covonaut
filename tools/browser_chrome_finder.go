@@ -10,10 +10,10 @@ import (
 )
 
 type ChromeInfo struct {
-	Path        string
-	Version     string
-	IsChromium  bool
-	IsHeadless  bool
+	Path       string
+	Version    string
+	IsChromium bool
+	IsHeadless bool
 }
 
 func FindChrome() (*ChromeInfo, error) {

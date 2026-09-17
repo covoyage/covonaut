@@ -55,10 +55,10 @@ type WebFetchOperations interface {
 
 // DefaultWebFetchOperations uses a browser-like HTTP client.
 type DefaultWebFetchOperations struct {
-	Client      *http.Client
-	UserAgent   string
-	MaxRetries  int
-	RetryDelay  time.Duration
+	Client     *http.Client
+	UserAgent  string
+	MaxRetries int
+	RetryDelay time.Duration
 }
 
 func (d *DefaultWebFetchOperations) defaults() {
@@ -67,8 +67,8 @@ func (d *DefaultWebFetchOperations) defaults() {
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
 				DialContext: (&net.Dialer{
-					Timeout:   10 * time.Second,
-					Control:   safeDialControl,
+					Timeout: 10 * time.Second,
+					Control: safeDialControl,
 				}).DialContext,
 			},
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {

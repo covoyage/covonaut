@@ -146,15 +146,15 @@ type BrowserSession struct {
 }
 
 type BrowserManager struct {
-	mu                    sync.RWMutex
-	sessions              map[string]*BrowserSession
-	config                BrowserConfig
-	cloudProvider         browser_providers.CloudBrowserProvider
-	camofoxClient         *CamofoxClient
-	lightpandaMgr         *LightpandaManager
-	agentBrowserMgr       *AgentBrowserManager
+	mu                     sync.RWMutex
+	sessions               map[string]*BrowserSession
+	config                 BrowserConfig
+	cloudProvider          browser_providers.CloudBrowserProvider
+	camofoxClient          *CamofoxClient
+	lightpandaMgr          *LightpandaManager
+	agentBrowserMgr        *AgentBrowserManager
 	fallbackCloudProviders []browser_providers.CloudBrowserProvider
-	activeSession         string
+	activeSession          string
 }
 
 func NewBrowserManager(cfg *BrowserConfig) *BrowserManager {
@@ -191,8 +191,8 @@ func NewBrowserManager(cfg *BrowserConfig) *BrowserManager {
 
 	if backend == BackendLocal || backend == BackendLightpanda {
 		for _, try := range []struct {
-			name     string
-			factory  func() browser_providers.CloudBrowserProvider
+			name    string
+			factory func() browser_providers.CloudBrowserProvider
 		}{
 			{"browserbase", func() browser_providers.CloudBrowserProvider { return browser_providers.NewBrowserbaseProvider() }},
 			{"browser_use", func() browser_providers.CloudBrowserProvider { return browser_providers.NewBrowserUseProvider() }},

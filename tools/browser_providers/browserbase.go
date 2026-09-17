@@ -12,13 +12,13 @@ import (
 )
 
 type BrowserbaseProvider struct {
-	apiKey      string
-	projectID   string
-	proxies     bool
-	stealth     bool
-	keepAlive   bool
-	timeout     int
-	httpClient  *http.Client
+	apiKey     string
+	projectID  string
+	proxies    bool
+	stealth    bool
+	keepAlive  bool
+	timeout    int
+	httpClient *http.Client
 }
 
 func NewBrowserbaseProvider() *BrowserbaseProvider {

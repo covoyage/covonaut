@@ -19,6 +19,11 @@ type Tool struct {
 	Func        ToolFunc
 	Before      []BeforeHook
 	After       []AfterHook
+	// ConcurrencySafe declares whether the tool may run concurrently with
+	// other declared-safe calls in mixed execution mode. Tri-state: true
+	// joins the rolling parallel pool, false runs behind a serial barrier,
+	// nil (undeclared) fails closed and is treated as unsafe.
+	ConcurrencySafe *bool
 }
 
 // Definition converts a Tool to its schema representation for the model.

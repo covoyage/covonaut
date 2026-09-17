@@ -575,12 +575,12 @@ type CloudSessionInfo struct {
 type BrowserBackendType string
 
 const (
-	BackendLocal       BrowserBackendType = "local"
-	BackendCDP         BrowserBackendType = "cdp"
-	BackendCamofox     BrowserBackendType = "camofox"
-	BackendBrowserbase BrowserBackendType = "browserbase"
-	BackendBrowserUse  BrowserBackendType = "browser_use"
-	BackendFirecrawl   BrowserBackendType = "firecrawl"
+	BackendLocal        BrowserBackendType = "local"
+	BackendCDP          BrowserBackendType = "cdp"
+	BackendCamofox      BrowserBackendType = "camofox"
+	BackendBrowserbase  BrowserBackendType = "browserbase"
+	BackendBrowserUse   BrowserBackendType = "browser_use"
+	BackendFirecrawl    BrowserBackendType = "firecrawl"
 	BackendLightpanda   BrowserBackendType = "lightpanda"
 	BackendAgentBrowser BrowserBackendType = "agent_browser"
 )

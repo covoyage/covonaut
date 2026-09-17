@@ -83,6 +83,11 @@ type ExtensionConfig struct {
 	// ExecuteCode configures the execute_code tool. If nil, a default configuration is used.
 	ExecuteCode *ExecuteCodeToolConfig
 
+	// Terminal configures the persistent terminal tool family
+	// (terminal_open/send/read/signal/close/list). If nil, terminal tools
+	// are not included.
+	Terminal *TerminalToolConfig
+
 	// ComputerUse enables the computer_use tool (macOS desktop control). macOS only.
 	ComputerUse bool
 
@@ -175,6 +180,10 @@ func BuildTools(cfg ExtensionConfig) []*agentcore.Tool {
 		tools = append(tools,
 			NewComputerUseTool(nil),
 		)
+	}
+
+	if cfg.Terminal != nil {
+		tools = append(tools, buildTerminalTools(newTerminalRegistry(cfg.Terminal))...)
 	}
 
 	return tools

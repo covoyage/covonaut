@@ -196,6 +196,7 @@ func checkBlockedKeyCombo(keys string) error {
 // --- Approval system ---
 
 type approvalLevel int
+
 const (
 	approvalNone approvalLevel = iota
 	approvalOnce
@@ -203,9 +204,9 @@ const (
 )
 
 var (
-	approvalMode   approvalLevel
-	approvalSeen   map[string]bool
-	approvalMu     sync.Mutex
+	approvalMode approvalLevel
+	approvalSeen map[string]bool
+	approvalMu   sync.Mutex
 )
 
 func initApprovalMode() {
@@ -511,20 +512,20 @@ func NewComputerUseTool(cfg *ComputerUseToolConfig) *agentcore.Tool {
 					"type":        "integer",
 					"description": "AX element index from capture(mode=ax) output (for click/set_value with cua-driver)",
 				},
-			"capture_mode": map[string]any{
-				"type":        "string",
-				"enum":        []string{"vision", "ax", "som"},
-				"description": "'vision' (screenshot only, default), 'ax' (screenshot + AX accessibility tree with element IDs, cua-driver only), 'som' (screenshot with numbered element overlays, cua-driver only)",
-			},
-			"raise_window": map[string]any{
-				"type":        "boolean",
-				"description": "Whether to raise/bring window to front (for action=focus_app, default false)",
-			},
-			"capture_after": map[string]any{
-				"type":        "boolean",
-				"description": "Take a screenshot after the action and include it in the result",
-			},
-			"required": []any{"action"},
+				"capture_mode": map[string]any{
+					"type":        "string",
+					"enum":        []string{"vision", "ax", "som"},
+					"description": "'vision' (screenshot only, default), 'ax' (screenshot + AX accessibility tree with element IDs, cua-driver only), 'som' (screenshot with numbered element overlays, cua-driver only)",
+				},
+				"raise_window": map[string]any{
+					"type":        "boolean",
+					"description": "Whether to raise/bring window to front (for action=focus_app, default false)",
+				},
+				"capture_after": map[string]any{
+					"type":        "boolean",
+					"description": "Take a screenshot after the action and include it in the result",
+				},
+				"required": []any{"action"},
 			},
 		},
 		Func: func(ctx context.Context, args json.RawMessage) (any, error) {
@@ -534,22 +535,22 @@ func NewComputerUseTool(cfg *ComputerUseToolConfig) *agentcore.Tool {
 				return nil, fmt.Errorf("computer_use is only supported on macOS, Windows, and Linux")
 			}
 
-		var input struct {
-			Action          string    `json:"action"`
-			Coordinate      []int     `json:"coordinate"`
-			FromCoordinate  []int     `json:"from_coordinate"`
-			ToCoordinate    []int     `json:"to_coordinate"`
-			Text            string    `json:"text"`
-			Keys            string    `json:"keys"`
-			Direction       string    `json:"direction"`
-			Amount          int       `json:"amount"`
-			Seconds         float64   `json:"seconds"`
-			App             string    `json:"app"`
-			Element         int       `json:"element"`
-			CaptureMode     string    `json:"capture_mode"`
-			RaiseWindow     bool      `json:"raise_window"`
-			CaptureAfter    bool      `json:"capture_after"`
-		}
+			var input struct {
+				Action         string  `json:"action"`
+				Coordinate     []int   `json:"coordinate"`
+				FromCoordinate []int   `json:"from_coordinate"`
+				ToCoordinate   []int   `json:"to_coordinate"`
+				Text           string  `json:"text"`
+				Keys           string  `json:"keys"`
+				Direction      string  `json:"direction"`
+				Amount         int     `json:"amount"`
+				Seconds        float64 `json:"seconds"`
+				App            string  `json:"app"`
+				Element        int     `json:"element"`
+				CaptureMode    string  `json:"capture_mode"`
+				RaiseWindow    bool    `json:"raise_window"`
+				CaptureAfter   bool    `json:"capture_after"`
+			}
 			if err := json.Unmarshal(args, &input); err != nil {
 				return nil, fmt.Errorf("invalid arguments: %w", err)
 			}
@@ -1054,15 +1055,15 @@ type somElement struct {
 
 var somColors = []color.RGBA{
 	{255, 50, 50, 200},   // red
-	{50, 150, 255, 200},   // blue
-	{50, 200, 50, 200},    // green
-	{255, 200, 0, 200},    // yellow
-	{200, 50, 200, 200},   // purple
-	{255, 100, 0, 200},    // orange
-	{0, 200, 200, 200},    // cyan
-	{200, 100, 50, 200},   // brown
-	{100, 200, 100, 200},  // light green
-	{200, 150, 200, 200},  // pink
+	{50, 150, 255, 200},  // blue
+	{50, 200, 50, 200},   // green
+	{255, 200, 0, 200},   // yellow
+	{200, 50, 200, 200},  // purple
+	{255, 100, 0, 200},   // orange
+	{0, 200, 200, 200},   // cyan
+	{200, 100, 50, 200},  // brown
+	{100, 200, 100, 200}, // light green
+	{200, 150, 200, 200}, // pink
 }
 
 func renderSOMOverlay(jpegBase64, axTree string) (string, []somElement, error) {
@@ -1441,9 +1442,9 @@ func fallbackCapture(ctx context.Context, backend cuBackend, appName, mode strin
 		return result(
 			fmt.Sprintf("Screenshot captured (%d bytes). AX tree not available without cua-driver.", len(data)),
 			map[string]any{
-				"size_bytes":          len(data),
+				"size_bytes":           len(data),
 				"screenshot_available": true,
-				"frontmost_app":       info,
+				"frontmost_app":        info,
 			},
 		)
 	}
@@ -2346,11 +2347,11 @@ func waylandGetWindowBounds(app string) (string, error) {
 		out, err := exec.Command("hyprctl", "clients", "-j").Output()
 		if err == nil {
 			var clients []struct {
-				Title       string `json:"title"`
+				Title        string `json:"title"`
 				InitialTitle string `json:"initialTitle"`
-				Class       string `json:"class"`
-				At          []int  `json:"at"`
-				Size        []int  `json:"size"`
+				Class        string `json:"class"`
+				At           []int  `json:"at"`
+				Size         []int  `json:"size"`
 			}
 			if json.Unmarshal(out, &clients) == nil {
 				appLower := strings.ToLower(app)
@@ -2416,10 +2417,10 @@ func waylandFocusApp(app string, raiseWindow bool) (string, error) {
 		out, err := exec.Command("hyprctl", "clients", "-j").Output()
 		if err == nil {
 			var clients []struct {
-				Title       string `json:"title"`
+				Title        string `json:"title"`
 				InitialTitle string `json:"initialTitle"`
-				Class       string `json:"class"`
-				Address     string `json:"address"`
+				Class        string `json:"class"`
+				Address      string `json:"address"`
 			}
 			if json.Unmarshal(out, &clients) == nil {
 				for _, c := range clients {

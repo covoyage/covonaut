@@ -13,8 +13,17 @@ import (
 type ExecutionMode string
 
 const (
-	ModeSerial   ExecutionMode = "serial"
+	ModeSerial ExecutionMode = "serial"
+	// ModeParallel runs every call through the rolling parallel pool — the
+	// widest scheduling. Only a tool that explicitly declared
+	// ConcurrencySafe=false is held out to run alone as a serial barrier;
+	// undeclared tools join the pool (fail-open).
 	ModeParallel ExecutionMode = "parallel"
+	// ModeMixed routes each call by its Tool.ConcurrencySafe declaration:
+	// declared-safe calls run in a rolling parallel pool in model order,
+	// everything else (explicitly unsafe or undeclared) runs alone behind a
+	// serial barrier — fail closed on missing declarations.
+	ModeMixed ExecutionMode = "mixed"
 )
 
 // DualToolOutput wraps a tool result with separate output for LLM and user.
@@ -67,10 +76,23 @@ type ToolResult struct {
 	// ForUser provides alternative content shown to the user.
 	// When set, this replaces Result in the user display.
 	ForUser string
+	// Blocks carries multimodal content (e.g. images) attached to the tool
+	// result. Providers that support multipart tool_result render these
+	// alongside the textual Result; others fall back to text only.
+	Blocks []ContentBlock
 	// Silent suppresses display output.
 	Silent   bool
 	Err      error
 	Duration time.Duration
+}
+
+// BlockCarrier lets a tool return multimodal content (e.g. images) alongside
+// its textual form. Implementations returned from a tool Func have their
+// blocks transported to the model as multipart tool_result content when the
+// provider supports it.
+type BlockCarrier interface {
+	ToolBlocks() []ContentBlock
+	ToolText() string
 }
 
 // IsDualOutput returns true when LLM and user outputs differ.
@@ -199,6 +221,18 @@ func (e *Executor) coreExecute(ctx context.Context, tc ToolCall) (string, error)
 		return dual.ForUser, nil
 	}
 
+	// Handle BlockCarrier results: transport multimodal blocks through the
+	// string-typed middleware chain via sentinel encoding, decoded back into
+	// ToolResult.Blocks by Execute.
+	if carrier, ok := result.(BlockCarrier); ok {
+		if blocks := carrier.ToolBlocks(); len(blocks) > 0 {
+			if data, err := json.Marshal(blocks); err == nil {
+				return fmt.Sprintf("__blocks__%s__|__%s", data, carrier.ToolText()), nil
+			}
+		}
+		return carrier.ToolText(), nil
+	}
+
 	if str, ok := result.(string); ok {
 		return str, nil
 	}
@@ -257,6 +291,20 @@ func (e *Executor) Execute(ctx context.Context, tc ToolCall, state *AgentState) 
 		}
 	}
 
+	// Decode block-carrier sentinel into structured Blocks. The marker is
+	// split at its last separator so textual result content may freely
+	// contain the token; a malformed payload degrades to plain text.
+	if strings.HasPrefix(result, "__blocks__") {
+		body := strings.TrimPrefix(result, "__blocks__")
+		if idx := strings.LastIndex(body, "__|__"); idx >= 0 {
+			var blocks []ContentBlock
+			if err := json.Unmarshal([]byte(body[:idx]), &blocks); err == nil && len(blocks) > 0 {
+				tr.Blocks = blocks
+				tr.Result = body[idx+len("__|__"):]
+			}
+		}
+	}
+
 	// tool-level after hooks
 	if hasTool {
 		for _, hook := range tool.After {
@@ -274,10 +322,38 @@ func (e *Executor) Execute(ctx context.Context, tc ToolCall, state *AgentState) 
 // ExecuteAll runs multiple tool calls using the configured execution mode,
 // firing optional callbacks in real time for each tool.
 func (e *Executor) ExecuteAll(ctx context.Context, calls []ToolCall, state *AgentState, cb *ExecuteCallbacks) []ToolResult {
-	if e.config.Mode == ModeParallel && len(calls) > 1 {
-		return e.executeParallel(ctx, calls, state, cb)
+	switch {
+	case e.config.Mode == ModeParallel && len(calls) > 1:
+		return e.executeRolling(ctx, calls, state, cb, e.poolEligible)
+	case e.config.Mode == ModeMixed && len(calls) > 1:
+		return e.executeRolling(ctx, calls, state, cb, e.parallelSafe)
+	default:
+		return e.executeSerial(ctx, calls, state, cb)
 	}
-	return e.executeSerial(ctx, calls, state, cb)
+}
+
+// poolEligible reports whether a call may join the parallel pool in
+// ModeParallel. Only an explicit ConcurrencySafe=false declaration excludes a
+// tool; undeclared tools join the pool (fail-open) so that "parallel" stays
+// the widest setting. The fail-closed treatment of missing declarations is
+// exclusive to ModeMixed via parallelSafe.
+func (e *Executor) poolEligible(tc ToolCall) bool {
+	tool, ok := e.registry.Get(tc.Name)
+	if !ok || tool.ConcurrencySafe == nil {
+		return true
+	}
+	return *tool.ConcurrencySafe
+}
+
+// parallelSafe reports whether a call may join the rolling pool in ModeMixed.
+// Fail closed: unknown tools, undeclared tools, and any value other than an
+// explicit true are treated as exclusive.
+func (e *Executor) parallelSafe(tc ToolCall) bool {
+	tool, ok := e.registry.Get(tc.Name)
+	if !ok || tool.ConcurrencySafe == nil {
+		return false
+	}
+	return *tool.ConcurrencySafe
 }
 
 func (e *Executor) executeSerial(ctx context.Context, calls []ToolCall, state *AgentState, cb *ExecuteCallbacks) []ToolResult {
@@ -301,38 +377,82 @@ func (e *Executor) executeSerial(ctx context.Context, calls []ToolCall, state *A
 	return results
 }
 
-func (e *Executor) executeParallel(ctx context.Context, calls []ToolCall, state *AgentState, cb *ExecuteCallbacks) []ToolResult {
+// executeRolling runs calls through a single rolling pool. Calls are started
+// strictly in model order: an eligible call acquires a free slot (waiting for
+// one if the pool is at capacity) and executes on its own goroutine, so a
+// slow straggler never blocks later eligible calls from filling the pool; an
+// ineligible call drains the pool and runs alone inline as a serial barrier.
+// Results keep their original positions, so the model sees model-ordered
+// results exactly as in serial execution. The eligibility predicate selects
+// the scheduling policy: poolEligible for ModeParallel (fail-open) or
+// parallelSafe for ModeMixed (fail-closed).
+func (e *Executor) executeRolling(ctx context.Context, calls []ToolCall, state *AgentState, cb *ExecuteCallbacks, eligible func(ToolCall) bool) []ToolResult {
 	results := make([]ToolResult, len(calls))
-	var wg sync.WaitGroup
 
 	concurrency := e.config.Concurrency
 	if concurrency <= 0 {
 		concurrency = int64(len(calls))
 	}
-	sem := make(chan struct{}, concurrency)
 
-	for i, tc := range calls {
-		wg.Add(1)
-		go func(idx int, call ToolCall) {
-			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					results[idx] = ToolResult{ToolName: call.Name, Result: fmt.Sprintf("panic: %v", r)}
-				}
-			}()
-			sem <- struct{}{}
-			defer func() { <-sem }()
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	inFlight := 0
+	poolIdle := sync.NewCond(&mu)
 
-			if cb != nil && cb.OnStart != nil {
-				cb.OnStart(call)
+	runOne := func(idx int, tc ToolCall) {
+		defer func() {
+			if r := recover(); r != nil {
+				results[idx] = ToolResult{ToolName: tc.Name, Result: fmt.Sprintf("panic: %v", r)}
 			}
-			results[idx] = e.Execute(ctx, call, state)
-			if cb != nil && cb.OnEnd != nil {
-				cb.OnEnd(results[idx])
-			}
-		}(i, tc)
+		}()
+		if cb != nil && cb.OnStart != nil {
+			cb.OnStart(tc)
+		}
+		results[idx] = e.Execute(ctx, tc, state)
+		if cb != nil && cb.OnEnd != nil {
+			cb.OnEnd(results[idx])
+		}
 	}
 
+	startPooled := func(idx int, tc ToolCall) {
+		wg.Add(1)
+		mu.Lock()
+		inFlight++
+		mu.Unlock()
+		go func() {
+			defer wg.Done()
+			// LIFO defers: the panic recover settles the result slot first,
+			// then the in-flight count drops and waiters wake up.
+			defer func() {
+				mu.Lock()
+				inFlight--
+				poolIdle.Broadcast()
+				mu.Unlock()
+			}()
+			runOne(idx, tc)
+		}()
+	}
+
+	for i := 0; i < len(calls); {
+		if eligible(calls[i]) {
+			mu.Lock()
+			for inFlight >= int(concurrency) {
+				poolIdle.Wait()
+			}
+			mu.Unlock()
+			startPooled(i, calls[i])
+			i++
+			continue
+		}
+		// Serial barrier: drain the pool, then run alone inline.
+		mu.Lock()
+		for inFlight > 0 {
+			poolIdle.Wait()
+		}
+		mu.Unlock()
+		runOne(i, calls[i])
+		i++
+	}
 	wg.Wait()
 	return results
 }
