@@ -19,7 +19,8 @@ func searchDuckDuckGo(client *http.Client, query string, count int) ([]SearchRes
 	}
 	req.Header.Set("User-Agent", defaultSearchUserAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	lang, _ := searchLocale()
+	req.Header.Set("Accept-Language", lang+",en;q=0.8")
 	req.Header.Set("Dnt", "1")
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
 

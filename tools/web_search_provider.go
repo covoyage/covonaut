@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -93,8 +96,109 @@ func resolveSearchProviderOrder(cfg *WebSearchToolConfig) []searchProviderID {
 	if env.APIURL != "" {
 		order = append(order, providerGeneric)
 	}
-	order = append(order, providerDuckDuckGo, providerBing)
+	order = append(order, keylessSearchProviderOrder()...)
 	return order
+}
+
+// searchRegionFromEnv is replaced in tests.
+var searchRegionFromEnv = detectSearchRegion
+
+// keylessSearchProviderOrder prefers the search engine commonly used in the
+// current region, then falls back to the other keyless backend.
+func keylessSearchProviderOrder() []searchProviderID {
+	switch searchRegionFromEnv() {
+	case "cn":
+		return []searchProviderID{providerBing, providerDuckDuckGo}
+	default:
+		return []searchProviderID{providerDuckDuckGo, providerBing}
+	}
+}
+
+func detectSearchRegion() string {
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("WEB_SEARCH_REGION"))); v != "" {
+		return normalizeSearchRegion(v)
+	}
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("COVO_REGION"))); v != "" {
+		return normalizeSearchRegion(v)
+	}
+	for _, key := range []string{"LC_ALL", "LC_MESSAGES", "LANG"} {
+		if region := regionFromLocale(os.Getenv(key)); region != "" {
+			return region
+		}
+	}
+	if runtime.GOOS == "darwin" {
+		if region := macosSearchRegion(); region != "" {
+			return region
+		}
+	}
+	if looksLikeChinaTZ(os.Getenv("TZ")) || looksLikeChinaTZ(time.Now().Location().String()) {
+		return "cn"
+	}
+	if name, _ := time.Now().Zone(); strings.Contains(strings.ToLower(name), "china") {
+		return "cn"
+	}
+	return ""
+}
+
+func looksLikeChinaTZ(v string) bool {
+	v = strings.ToLower(strings.TrimSpace(v))
+	return v == "asia/shanghai" || v == "asia/chongqing" || v == "asia/harbin" || v == "prc" || strings.Contains(v, "shanghai")
+}
+
+func searchLocale() (lang, market string) {
+	if searchRegionFromEnv() == "cn" {
+		return "zh-CN", "zh-CN"
+	}
+	return "en-US", "en-US"
+}
+
+func normalizeSearchRegion(v string) string {
+	v = strings.ReplaceAll(v, "_", "-")
+	switch {
+	case v == "cn" || strings.HasPrefix(v, "cn-") || strings.Contains(v, "-cn") || v == "china" || v == "prc":
+		return "cn"
+	default:
+		if i := strings.IndexByte(v, '-'); i > 0 {
+			return v[i+1:]
+		}
+		return v
+	}
+}
+
+func regionFromLocale(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" || v == "C" || v == "POSIX" {
+		return ""
+	}
+	if i := strings.IndexByte(v, '.'); i >= 0 {
+		v = v[:i]
+	}
+	if i := strings.IndexByte(v, '@'); i >= 0 {
+		v = v[:i]
+	}
+	v = strings.ToLower(strings.ReplaceAll(v, "_", "-"))
+	if v == "zh-cn" || v == "zh-sg" || strings.HasPrefix(v, "zh-hans") {
+		return "cn"
+	}
+	if i := strings.LastIndexByte(v, '-'); i >= 0 && i+1 < len(v) {
+		return normalizeSearchRegion(v[i+1:])
+	}
+	return ""
+}
+
+var (
+	macLocaleOnce sync.Once
+	macLocale     string
+)
+
+func macosSearchRegion() string {
+	macLocaleOnce.Do(func() {
+		out, err := exec.Command("defaults", "read", "-g", "AppleLocale").Output()
+		if err == nil {
+			macLocale = strings.TrimSpace(string(out))
+		}
+	})
+	return regionFromLocale(macLocale)
 }
 
 func searchWithProvider(client *http.Client, provider searchProviderID, query string, count int, cfg *WebSearchToolConfig) ([]SearchResult, error) {

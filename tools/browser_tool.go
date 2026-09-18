@@ -42,7 +42,7 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 
 	return &agentcore.Tool{
 		Name:        "browser",
-		Description: "Control a web browser. Use this for user-provided URLs, interactive pages, login flows, JavaScript-heavy pages, or as fallback when web_fetch is blocked. For simple information retrieval, prefer web_search (faster, cheaper, no browser overhead). Actions: navigate (open URL), snapshot (get page text with interactive elements), click (click element by ref ID), type (type text into element by ref ID), scroll (up/down), back (history back), press (keyboard key), screenshot (viewport capture), evaluate (run JS), dialog (handle alert/confirm/prompt), vision (ask AI about page screenshot), console (retrieve console logs).",
+		Description: "Control the agent's Chromium session for page interaction: navigate, snapshot, click, type, scroll. This is not the user's OS default browser. Headless by default; AGENT_BROWSER_HEADED=1 or BROWSER_HEADLESS=false shows a visible automation window. For simple information retrieval, prefer web_search then web_fetch. Use open_url only when the user wants to see a page themselves (no agent DOM control). Reserve computer_use for browser chrome (address bar, permission prompts), not page content. Actions: navigate (load URL in the agent browser), snapshot (get page text with interactive elements), click (click element by ref ID), type (type text into element by ref ID), scroll (up/down), back (history back), press (keyboard key), screenshot (viewport capture), evaluate (run JS), dialog (handle alert/confirm/prompt), vision (ask AI about page screenshot), console (retrieve console logs).",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -53,7 +53,7 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 				},
 				"url": map[string]any{
 					"type":        "string",
-					"description": "URL to navigate to (required for action=navigate)",
+					"description": "URL to load in the agent Chromium session (required for action=navigate). Does not open the OS default browser.",
 				},
 				"ref": map[string]any{
 					"type":        "string",
@@ -765,14 +765,11 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 					evalResult, err = session.supervisor.EvaluateJS(input.Expression, input.FrameID)
 				} else if session.backendType == BackendLightpanda || session.backendType == BackendLocal || session.backendType == BackendCDP || session.backendType == BackendBrowserbase || session.backendType == BackendBrowserUse || session.backendType == BackendFirecrawl {
 					timeoutCtx, cancel := context.WithTimeout(session.ctx, cfg.CommandTimeout)
-					var result string
-					// Use Evaluate (not EvaluateAsDevTools) — it handles array returns gracefully via JSON.stringify
-					if err := chromedp.Run(timeoutCtx, chromedp.Evaluate(input.Expression, &result)); err != nil {
-						cancel()
+					evalResult, err = evaluatePageJS(timeoutCtx, input.Expression, false)
+					cancel()
+					if err != nil {
 						return nil, fmt.Errorf("evaluation failed: %w", err)
 					}
-					cancel()
-					evalResult = result
 				} else {
 					err = fmt.Errorf("JS evaluation not supported for backend %s", session.backendType)
 				}

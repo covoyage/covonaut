@@ -8,12 +8,15 @@ import (
 
 func TestResolveSearchProviderOrder_AutoKeyless(t *testing.T) {
 	t.Setenv("WEB_SEARCH_PROVIDER", "")
+	t.Setenv("WEB_SEARCH_REGION", "us")
 	t.Setenv("SERPAPI_API_KEY", "")
 	t.Setenv("BRAVE_SEARCH_API_KEY", "")
 	t.Setenv("TAVILY_API_KEY", "")
 	t.Setenv("SEARXNG_URL", "")
 	t.Setenv("GEMINI_API_KEY", "")
 	t.Setenv("WEB_SEARCH_API_URL", "")
+	t.Setenv("GOOGLE_API_KEY", "")
+	t.Setenv("API_KEY", "")
 
 	got := resolveSearchProviderOrder(nil)
 	want := []searchProviderID{providerDuckDuckGo, providerBing}
@@ -22,14 +25,52 @@ func TestResolveSearchProviderOrder_AutoKeyless(t *testing.T) {
 	}
 }
 
+func TestResolveSearchProviderOrder_AutoKeylessChina(t *testing.T) {
+	t.Setenv("WEB_SEARCH_PROVIDER", "")
+	t.Setenv("WEB_SEARCH_REGION", "cn")
+	t.Setenv("SERPAPI_API_KEY", "")
+	t.Setenv("BRAVE_SEARCH_API_KEY", "")
+	t.Setenv("TAVILY_API_KEY", "")
+	t.Setenv("SEARXNG_URL", "")
+	t.Setenv("GEMINI_API_KEY", "")
+	t.Setenv("WEB_SEARCH_API_URL", "")
+	t.Setenv("GOOGLE_API_KEY", "")
+	t.Setenv("API_KEY", "")
+
+	got := resolveSearchProviderOrder(nil)
+	want := []searchProviderID{providerBing, providerDuckDuckGo}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+}
+
+func TestRegionFromLocale(t *testing.T) {
+	tests := map[string]string{
+		"zh_CN.UTF-8": "cn",
+		"zh-Hans":     "cn",
+		"en_US.UTF-8": "us",
+		"ja_JP":       "jp",
+		"C":           "",
+		"":            "",
+	}
+	for in, want := range tests {
+		if got := regionFromLocale(in); got != want {
+			t.Errorf("regionFromLocale(%q)=%q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestResolveSearchProviderOrder_CredentialedFirst(t *testing.T) {
 	t.Setenv("WEB_SEARCH_PROVIDER", "")
+	t.Setenv("WEB_SEARCH_REGION", "us")
 	t.Setenv("SERPAPI_API_KEY", "test")
 	t.Setenv("BRAVE_SEARCH_API_KEY", "test")
 	t.Setenv("TAVILY_API_KEY", "")
 	t.Setenv("SEARXNG_URL", "")
 	t.Setenv("GEMINI_API_KEY", "")
 	t.Setenv("WEB_SEARCH_API_URL", "")
+	t.Setenv("GOOGLE_API_KEY", "")
+	t.Setenv("API_KEY", "")
 
 	got := resolveSearchProviderOrder(nil)
 	want := []searchProviderID{providerSerpAPI, providerBrave, providerDuckDuckGo, providerBing}

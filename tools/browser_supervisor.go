@@ -308,17 +308,10 @@ func (s *CDPSupervisor) EvaluateJS(expression string, targetFrameID string) (str
 		return "", fmt.Errorf("supervisor not connected")
 	}
 
-	var result string
-	var err error
-
-	err = chromedp.Run(ctx,
-		chromedp.EvaluateAsDevTools(expression, &result),
-	)
-
+	result, err := evaluatePageJS(ctx, expression, true)
 	if err != nil {
 		return "", fmt.Errorf("JS evaluation failed: %w", err)
 	}
-
 	return result, nil
 }
 

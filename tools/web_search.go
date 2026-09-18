@@ -149,7 +149,8 @@ func searchSearXNG(client *http.Client, query string, count int, baseURL string)
 	q := url.Values{}
 	q.Set("q", query)
 	q.Set("format", "json")
-	q.Set("language", envOrDefault("SEARXNG_LANGUAGE", "zh-CN"))
+	_, market := searchLocale()
+	q.Set("language", envOrDefault("SEARXNG_LANGUAGE", market))
 	var resp struct {
 		Results []struct {
 			Title   string `json:"title"`
@@ -199,7 +200,8 @@ func searchBingRSS(client *http.Client, query string, count int) ([]SearchResult
 	q := url.Values{}
 	q.Set("q", query)
 	q.Set("format", "rss")
-	q.Set("mkt", envOrDefault("WEB_SEARCH_MARKET", "zh-CN"))
+	_, market := searchLocale()
+	q.Set("mkt", envOrDefault("WEB_SEARCH_MARKET", market))
 
 	req, err := http.NewRequest(http.MethodGet, "https://www.bing.com/search?"+q.Encode(), nil)
 	if err != nil {
@@ -207,7 +209,8 @@ func searchBingRSS(client *http.Client, query string, count int) ([]SearchResult
 	}
 	req.Header.Set("User-Agent", defaultSearchUserAgent)
 	req.Header.Set("Accept", "application/rss+xml, application/xml, text/xml")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	lang, _ := searchLocale()
+	req.Header.Set("Accept-Language", lang+",en;q=0.8")
 	req.Header.Set("Dnt", "1")
 
 	resp, err := client.Do(req)
@@ -332,7 +335,7 @@ func NewWebSearchTool(cfg *WebSearchToolConfig) *agentcore.Tool {
 
 	return &agentcore.Tool{
 		Name:        "web_search",
-		Description: fmt.Sprintf("Search the web. Auto-selects the best available backend (API keys when configured, otherwise DuckDuckGo then Bing RSS). Returns titles, URLs, and snippets. Output is truncated to %d results or %s (whichever is hit first).", cfg.Limit, FormatSize(cfg.MaxBytes)),
+		Description: fmt.Sprintf("Search the web. Auto-selects the best available backend (API keys when configured, otherwise the keyless engine commonly used in the current region). Returns titles, URLs, and snippets. Output is truncated to %d results or %s (whichever is hit first).", cfg.Limit, FormatSize(cfg.MaxBytes)),
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

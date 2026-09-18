@@ -39,6 +39,181 @@ func TestReadTool(t *testing.T) {
 	}
 }
 
+func TestReadToolDispatchesImageToHandler(t *testing.T) {
+	tmpDir := t.TempDir()
+	png := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
+	if err := os.WriteFile(filepath.Join(tmpDir, "dot.png"), png, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	called := false
+	tool := NewReadTool(tmpDir, &ReadToolConfig{
+		MediaHandler: func(ctx context.Context, kind ReadMediaKind, paths []string, input ReadToolInput) (any, error) {
+			called = true
+			if kind != ReadMediaImage {
+				t.Fatalf("kind = %q", kind)
+			}
+			if len(paths) != 1 || !strings.HasSuffix(paths[0], "dot.png") {
+				t.Fatalf("paths = %v", paths)
+			}
+			if input.Prompt != "what's in this" {
+				t.Fatalf("prompt = %q", input.Prompt)
+			}
+			return ToolResult{Content: "image-ok"}, nil
+		},
+	})
+	args, _ := json.Marshal(map[string]string{"path": "dot.png", "prompt": "what's in this"})
+	res, err := tool.Func(context.Background(), args)
+	if err != nil {
+		t.Fatalf("read image: %v", err)
+	}
+	if !called {
+		t.Fatal("expected media handler")
+	}
+	if res.(ToolResult).Content != "image-ok" {
+		t.Fatalf("got %+v", res)
+	}
+}
+
+func TestReadToolImageWithoutHandlerErrors(t *testing.T) {
+	tmpDir := t.TempDir()
+	png := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
+	if err := os.WriteFile(filepath.Join(tmpDir, "dot.png"), png, 0644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewReadTool(tmpDir, nil)
+	args, _ := json.Marshal(map[string]string{"path": "dot.png"})
+	if _, err := tool.Func(context.Background(), args); err == nil {
+		t.Fatal("expected error without MediaHandler")
+	}
+}
+
+func TestReadToolRendersNotebook(t *testing.T) {
+	tmpDir := t.TempDir()
+	nb := `{
+		"cells": [
+			{"cell_type": "markdown", "source": ["# Title\n"], "outputs": []},
+			{"cell_type": "code", "source": ["print(1)\n"], "outputs": [{"output_type": "stream", "text": ["1\n"]}]}
+		]
+	}`
+	if err := os.WriteFile(filepath.Join(tmpDir, "demo.ipynb"), []byte(nb), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewReadTool(tmpDir, nil)
+	args, _ := json.Marshal(map[string]string{"path": "demo.ipynb"})
+	res, err := tool.Func(context.Background(), args)
+	if err != nil {
+		t.Fatalf("read notebook: %v", err)
+	}
+	content := res.(ToolResult).Content
+	if !strings.Contains(content, "cell 1 (markdown)") || !strings.Contains(content, "# Title") {
+		t.Fatalf("markdown cell missing: %s", content)
+	}
+	if !strings.Contains(content, "print(1)") || !strings.Contains(content, "[stream]") {
+		t.Fatalf("code cell missing: %s", content)
+	}
+}
+
+func TestReadToolDispatchesPDFToHandler(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "doc.pdf"), []byte("%PDF-1.4\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	tool := NewReadTool(tmpDir, &ReadToolConfig{
+		MediaHandler: func(ctx context.Context, kind ReadMediaKind, paths []string, input ReadToolInput) (any, error) {
+			called = true
+			if kind != ReadMediaPDF {
+				t.Fatalf("kind = %q", kind)
+			}
+			if len(paths) != 1 || !strings.HasSuffix(paths[0], "doc.pdf") {
+				t.Fatalf("paths = %v", paths)
+			}
+			if input.Pages != "1-2" {
+				t.Fatalf("pages = %q", input.Pages)
+			}
+			return ToolResult{Content: "pdf-ok"}, nil
+		},
+	})
+	args, _ := json.Marshal(map[string]string{"path": "doc.pdf", "pages": "1-2"})
+	res, err := tool.Func(context.Background(), args)
+	if err != nil {
+		t.Fatalf("read pdf: %v", err)
+	}
+	if !called {
+		t.Fatal("expected media handler")
+	}
+	if res.(ToolResult).Content != "pdf-ok" {
+		t.Fatalf("got %+v", res)
+	}
+}
+
+func TestReadToolDispatchesRemoteURL(t *testing.T) {
+	called := false
+	tool := NewReadTool(t.TempDir(), &ReadToolConfig{
+		MediaHandler: func(ctx context.Context, kind ReadMediaKind, paths []string, input ReadToolInput) (any, error) {
+			called = true
+			if kind != ReadMediaImage {
+				t.Fatalf("kind = %q", kind)
+			}
+			if len(paths) != 1 || paths[0] != "https://example.com/a.png" {
+				t.Fatalf("paths = %v", paths)
+			}
+			return ToolResult{Content: "remote-ok"}, nil
+		},
+	})
+	args, _ := json.Marshal(map[string]string{"path": "https://example.com/a.png"})
+	res, err := tool.Func(context.Background(), args)
+	if err != nil {
+		t.Fatalf("read url: %v", err)
+	}
+	if !called {
+		t.Fatal("expected media handler")
+	}
+	if res.(ToolResult).Content != "remote-ok" {
+		t.Fatalf("got %+v", res)
+	}
+}
+
+func TestReadToolDispatchesMultiplePaths(t *testing.T) {
+	called := false
+	tool := NewReadTool(t.TempDir(), &ReadToolConfig{
+		MediaHandler: func(ctx context.Context, kind ReadMediaKind, paths []string, input ReadToolInput) (any, error) {
+			called = true
+			if kind != ReadMediaImage {
+				t.Fatalf("kind = %q", kind)
+			}
+			if len(paths) != 2 {
+				t.Fatalf("paths = %v", paths)
+			}
+			return ToolResult{Content: "multi-ok"}, nil
+		},
+	})
+	args, _ := json.Marshal(map[string]any{"paths": []string{"a.png", "b.png"}})
+	res, err := tool.Func(context.Background(), args)
+	if err != nil {
+		t.Fatalf("read paths: %v", err)
+	}
+	if !called {
+		t.Fatal("expected media handler")
+	}
+	if res.(ToolResult).Content != "multi-ok" {
+		t.Fatalf("got %+v", res)
+	}
+}
+
+func TestReadToolRejectsBinary(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "blob.bin"), []byte{0, 1, 2, 3, 4}, 0644); err != nil {
+		t.Fatal(err)
+	}
+	tool := NewReadTool(tmpDir, nil)
+	args, _ := json.Marshal(map[string]string{"path": "blob.bin"})
+	if _, err := tool.Func(context.Background(), args); err == nil {
+		t.Fatal("expected binary rejection")
+	}
+}
+
 func TestLsTool(t *testing.T) {
 	tmpDir := t.TempDir()
 	os.WriteFile(filepath.Join(tmpDir, "a.txt"), []byte(""), 0644)

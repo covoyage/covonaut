@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/chromedp/chromedp"
 )
 
 func TestNavigationTimeout(t *testing.T) {
@@ -125,5 +127,49 @@ func TestResolveRefXPathNeverReturnsEmptySelector(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "refresh") {
 		t.Fatalf("stale ref error should suggest a refresh, got %v", err)
+	}
+}
+
+func TestResolveRefXPathRejectsDocumentRoot(t *testing.T) {
+	rm := NewRefMapper()
+	rm.Set("@e1", "//a")
+
+	for _, ref := range []string{"@e0", "e0"} {
+		xpath, err := resolveRefXPath(context.Background(), rm, ref)
+		if err == nil {
+			t.Fatalf("%s: document root must not resolve, got xpath %q", ref, xpath)
+		}
+		if xpath != "" {
+			t.Fatalf("%s: expected empty xpath, got %q", ref, xpath)
+		}
+		if !strings.Contains(err.Error(), "document root") {
+			t.Fatalf("%s: error should explain document root, got %v", ref, err)
+		}
+	}
+}
+
+func TestFormatJSEvalResult(t *testing.T) {
+	got, err := formatJSEvalResult(nil, chromedp.ErrJSUndefined)
+	if err != nil || got != "undefined" {
+		t.Fatalf("undefined: got %q err=%v", got, err)
+	}
+	got, err = formatJSEvalResult(nil, chromedp.ErrJSNull)
+	if err != nil || got != "null" {
+		t.Fatalf("null: got %q err=%v", got, err)
+	}
+	got, err = formatJSEvalResult(nil, nil)
+	if err != nil || got != "undefined" {
+		t.Fatalf("nil result: got %q err=%v", got, err)
+	}
+	got, err = formatJSEvalResult("ok", nil)
+	if err != nil || got != "ok" {
+		t.Fatalf("string: got %q err=%v", got, err)
+	}
+	got, err = formatJSEvalResult(map[string]any{"href": "/privacy"}, nil)
+	if err != nil || got != `{"href":"/privacy"}` {
+		t.Fatalf("object: got %q err=%v", got, err)
+	}
+	if _, err = formatJSEvalResult(nil, errors.New("boom")); err == nil {
+		t.Fatal("expected hard evaluate errors to pass through")
 	}
 }

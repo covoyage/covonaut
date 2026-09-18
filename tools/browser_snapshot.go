@@ -51,7 +51,20 @@ func (rm *RefMapper) Count() int {
 // resolveRefXPath maps a snapshot ref such as "@e5" to its XPath, falling back to
 // the in-page __covoRefMap when the local cache misses. It never returns an empty
 // XPath with a nil error, so callers cannot pass "" to a chromedp selector.
+func canonicalBrowserRef(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if ref != "" && !strings.HasPrefix(ref, "@") {
+		ref = "@" + ref
+	}
+	return ref
+}
+
 func resolveRefXPath(ctx context.Context, refMapper *RefMapper, ref string) (string, error) {
+	ref = canonicalBrowserRef(ref)
+	if ref == "@e0" {
+		return "", fmt.Errorf("ref @e0 is the document root, not a clickable element. Use an interactive snapshot ref such as @e1, @e2, ... or call browser (action=snapshot) first")
+	}
+
 	if refMapper == nil {
 		return "", fmt.Errorf("ref %s not found. Page state is unknown. Call browser (action=snapshot) first", ref)
 	}
@@ -195,7 +208,7 @@ const jsSnapshotScript = `
 	}
 
 	const lines = [];
-	lines.push('@e0 document');
+	lines.push('document');
 	const body = document.body;
 	if (body) {
 		for (const child of body.children) buildTree(child, lines, __SHOW_ALL__);
@@ -364,12 +377,14 @@ func (n *AccessibilityNode) ToTreeString(indent int, maxDepth int, showAll bool)
 	prefix := strings.Repeat("  ", indent)
 
 	isInteractive := isInteractiveRole(n.Role)
-	shouldShow := showAll || isInteractive || n.Ref != ""
+	shouldShow := showAll || isInteractive || n.Ref != "" || strings.EqualFold(n.Role, "document")
 
 	if shouldShow {
 		sb.WriteString(prefix)
-		sb.WriteString(n.Ref)
-		sb.WriteString(" ")
+		if n.Ref != "" {
+			sb.WriteString(n.Ref)
+			sb.WriteString(" ")
+		}
 		sb.WriteString(n.Role)
 		if n.Name != "" {
 			sb.WriteString(" \"")
@@ -522,7 +537,7 @@ func buildAccessibilityTreeFromJS(ctx context.Context) (*AccessibilityNode, erro
 		role: 'document',
 		name: document.title || '',
 		value: '',
-		ref: '@e0',
+		ref: '',
 		children: []
 	};
 

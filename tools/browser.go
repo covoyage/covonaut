@@ -16,6 +16,45 @@ import (
 
 var defaultBrowserManager *BrowserManager
 
+// formatJSEvalResult turns a chromedp Evaluate result into text the model can
+// read. JS undefined/null must not surface as a hard tool error — click()/
+// scrollBy()/void expressions commonly return undefined.
+func formatJSEvalResult(res any, err error) (string, error) {
+	if errors.Is(err, chromedp.ErrJSUndefined) {
+		return "undefined", nil
+	}
+	if errors.Is(err, chromedp.ErrJSNull) {
+		return "null", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if res == nil {
+		return "undefined", nil
+	}
+	switch v := res.(type) {
+	case string:
+		return v, nil
+	default:
+		b, marshalErr := json.Marshal(v)
+		if marshalErr != nil {
+			return fmt.Sprint(v), nil
+		}
+		return string(b), nil
+	}
+}
+
+func evaluatePageJS(ctx context.Context, expression string, asDevTools bool) (string, error) {
+	var res any
+	var err error
+	if asDevTools {
+		err = chromedp.Run(ctx, chromedp.EvaluateAsDevTools(expression, &res))
+	} else {
+		err = chromedp.Run(ctx, chromedp.Evaluate(expression, &res))
+	}
+	return formatJSEvalResult(res, err)
+}
+
 var stealthJavaScript = `
 // Hide automation fingerprints
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -1051,13 +1090,11 @@ func NewBrowserEvaluateTool(cfg *BrowserToolConfig) *agentcore.Tool {
 				evalResult, err = session.supervisor.EvaluateJS(input.Expression, input.FrameID)
 			} else if session.backendType == BackendLightpanda || session.backendType == BackendLocal || session.backendType == BackendCDP || session.backendType == BackendBrowserbase || session.backendType == BackendBrowserUse || session.backendType == BackendFirecrawl {
 				timeoutCtx, cancel := context.WithTimeout(session.ctx, cfg.CommandTimeout)
-				var result string
-				if err := chromedp.Run(timeoutCtx, chromedp.EvaluateAsDevTools(input.Expression, &result)); err != nil {
-					cancel()
+				evalResult, err = evaluatePageJS(timeoutCtx, input.Expression, true)
+				cancel()
+				if err != nil {
 					return nil, fmt.Errorf("evaluation failed: %w", err)
 				}
-				cancel()
-				evalResult = result
 			} else {
 				err = fmt.Errorf("JS evaluation not supported for backend %s", session.backendType)
 			}
