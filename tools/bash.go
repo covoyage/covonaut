@@ -31,7 +31,7 @@ func (d DefaultBashOperations) Exec(command string, cwd string, env map[string]s
 
 	cmd := newShellCommand(command)
 	cmd.Dir = cwd
-	configureProcessGroup(cmd)
+	IsolateCommand(cmd)
 	if env != nil {
 		cmd.Env = os.Environ()
 		for k, v := range env {

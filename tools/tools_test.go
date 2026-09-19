@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +37,32 @@ func TestReadTool(t *testing.T) {
 	tr = result.(ToolResult)
 	if tr.Content != "line2" {
 		t.Errorf("expected 'line2', got: %s", tr.Content)
+	}
+}
+
+func TestReadToolTruncationIncludesOffsetHint(t *testing.T) {
+	tmpDir := t.TempDir()
+	var b strings.Builder
+	for i := 1; i <= 12; i++ {
+		fmt.Fprintf(&b, "line-%d\n", i)
+	}
+	testFile := filepath.Join(tmpDir, "big.txt")
+	if err := os.WriteFile(testFile, []byte(b.String()), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	tool := NewReadTool(tmpDir, &ReadToolConfig{MaxLines: 5, MaxBytes: 50 * 1024})
+	args, _ := json.Marshal(map[string]string{"path": "big.txt"})
+	result, err := tool.Func(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	tr := result.(ToolResult)
+	if !strings.Contains(tr.Content, "continue with offset=6 and limit") {
+		t.Fatalf("expected offset continuation hint, got: %s", tr.Content)
+	}
+	if !strings.Contains(tr.Content, "line-1") || strings.Contains(tr.Content, "line-12") {
+		t.Fatalf("expected truncated head, got: %s", tr.Content)
 	}
 }
 

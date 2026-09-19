@@ -234,6 +234,10 @@ func truncateReadText(content string, cfg *ReadToolConfig) (any, error) {
 		if truncation.FirstLineExceeds {
 			notices = append(notices, "first line exceeds byte limit")
 		}
+		nextOffset := truncation.OutputLines + 1
+		if truncation.OutputLines > 0 {
+			notices = append(notices, fmt.Sprintf("continue with offset=%d and limit", nextOffset))
+		}
 		output += fmt.Sprintf("\n\n[%s]", strings.Join(notices, ". "))
 	}
 	return result(output, ReadToolDetails{Truncation: &truncation})
