@@ -22,8 +22,8 @@ type DeleteOperations interface {
 type DefaultDeleteOperations struct{}
 
 func (d DefaultDeleteOperations) Stat(path string) (os.FileInfo, error) { return os.Stat(path) }
-func (d DefaultDeleteOperations) Remove(path string) error              { return os.Remove(path) }
-func (d DefaultDeleteOperations) RemoveAll(path string) error           { return os.RemoveAll(path) }
+func (d DefaultDeleteOperations) Remove(path string) error              { return TrashPath(path) }
+func (d DefaultDeleteOperations) RemoveAll(path string) error           { return TrashPath(path) }
 
 // DeleteToolConfig configures the delete tool.
 type DeleteToolConfig struct {
@@ -65,7 +65,8 @@ func NewDeleteTool(cwd string, cfg *DeleteToolConfig) *agentcore.Tool {
 
 	return &agentcore.Tool{
 		Name: "delete",
-		Description: "Delete a file or directory. Requires explicit confirmation for directories and protected paths. " +
+		Description: "Delete a file or directory. Files and directories are moved to the platform trash so they can be restored. " +
+			"Requires explicit confirmation for directories and protected paths. " +
 			"Protected paths (e.g. system directories) cannot be deleted.",
 		Parameters: map[string]any{
 			"type": "object",
@@ -129,7 +130,7 @@ func NewDeleteTool(cwd string, cfg *DeleteToolConfig) *agentcore.Tool {
 			if isDir {
 				itemType = "directory"
 			}
-			return result(fmt.Sprintf("Deleted %s: %s", itemType, input.Path), nil)
+			return result(fmt.Sprintf("Moved %s to trash: %s", itemType, input.Path), nil)
 		},
 	}
 }

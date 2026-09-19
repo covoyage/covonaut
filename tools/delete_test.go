@@ -11,6 +11,8 @@ import (
 
 func TestDeleteToolFile(t *testing.T) {
 	tmpDir := t.TempDir()
+	trashDir := t.TempDir()
+	t.Setenv("COVO_TRASH_DIR", trashDir)
 	testFile := filepath.Join(tmpDir, "test.txt")
 	os.WriteFile(testFile, []byte("hello"), 0644)
 
@@ -23,12 +25,15 @@ func TestDeleteToolFile(t *testing.T) {
 	}
 
 	r := result.(ToolResult)
-	if !strings.Contains(r.Content, "Deleted file") {
-		t.Errorf("expected delete confirmation, got: %s", r.Content)
+	if !strings.Contains(r.Content, "Moved file to trash") {
+		t.Errorf("expected trash confirmation, got: %s", r.Content)
 	}
 
 	if _, err := os.Stat(testFile); !os.IsNotExist(err) {
-		t.Errorf("file should have been deleted")
+		t.Errorf("file should have been moved to trash")
+	}
+	if _, err := os.Stat(filepath.Join(trashDir, "test.txt")); err != nil {
+		t.Errorf("file should exist in trash: %v", err)
 	}
 }
 
@@ -50,6 +55,8 @@ func TestDeleteToolDirRequiresConfirm(t *testing.T) {
 
 func TestDeleteToolDirWithConfirm(t *testing.T) {
 	tmpDir := t.TempDir()
+	trashDir := t.TempDir()
+	t.Setenv("COVO_TRASH_DIR", trashDir)
 	subdir := filepath.Join(tmpDir, "subdir")
 	os.MkdirAll(subdir, 0755)
 	os.WriteFile(filepath.Join(subdir, "file.txt"), []byte("x"), 0644)
@@ -63,8 +70,11 @@ func TestDeleteToolDirWithConfirm(t *testing.T) {
 	}
 
 	r := result.(ToolResult)
-	if !strings.Contains(r.Content, "Deleted directory") {
-		t.Errorf("expected delete confirmation, got: %s", r.Content)
+	if !strings.Contains(r.Content, "Moved directory to trash") {
+		t.Errorf("expected trash confirmation, got: %s", r.Content)
+	}
+	if _, err := os.Stat(filepath.Join(trashDir, "subdir", "file.txt")); err != nil {
+		t.Errorf("directory should exist in trash: %v", err)
 	}
 }
 

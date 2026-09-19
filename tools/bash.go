@@ -23,6 +23,12 @@ type BashOperations interface {
 type DefaultBashOperations struct{}
 
 func (d DefaultBashOperations) Exec(command string, cwd string, env map[string]string, timeoutSecs *int, onData func(data []byte)) (int, error) {
+	if err := maybeTrashShellCommand(command, cwd); err == nil {
+		return 0, nil
+	} else if err != errNotRecoverableDelete {
+		return -1, err
+	}
+
 	cmd := newShellCommand(command)
 	cmd.Dir = cwd
 	configureProcessGroup(cmd)
@@ -177,6 +183,7 @@ func NewBashTool(cwd string, cfg *BashToolConfig) *agentcore.Tool {
 	return &agentcore.Tool{
 		Name: "bash",
 		Description: fmt.Sprintf("Execute a bash command in the current working directory. Returns stdout and stderr. "+
+			"For file or directory deletion, use a top-level rm -- <path> ...; the runtime moves those paths to trash instead of unlinking them. "+
 			"Output is truncated to last %d lines or %s (whichever is hit first). "+
 			"If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.", cfg.MaxLines, FormatSize(cfg.MaxBytes)),
 		Parameters: map[string]any{

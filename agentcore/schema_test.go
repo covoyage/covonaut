@@ -2,6 +2,38 @@ package agentcore
 
 import "testing"
 
+func TestValidateJSONObjectSchema(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"answer": map[string]any{"type": "string"},
+		},
+		"required":             []any{"answer"},
+		"additionalProperties": false,
+	}
+	if err := ValidateJSON(schema, `{"answer":"ok"}`); err != nil {
+		t.Fatalf("valid payload rejected: %v", err)
+	}
+	if err := ValidateJSON(schema, `{}`); err == nil {
+		t.Fatal("expected missing required field")
+	}
+	if err := ValidateJSON(schema, `{"answer":1}`); err == nil {
+		t.Fatal("expected type error")
+	}
+	if err := ValidateJSON(schema, `{`); err == nil {
+		t.Fatal("expected invalid JSON")
+	}
+	if err := ValidateJSON(schema, ""); err == nil {
+		t.Fatal("expected empty JSON error")
+	}
+}
+
+func TestValidateJSONNilSchema(t *testing.T) {
+	if err := ValidateJSON(nil, "not json"); err != nil {
+		t.Fatalf("nil schema should skip validation: %v", err)
+	}
+}
+
 func TestValidateToolArgumentsNilSchema(t *testing.T) {
 	tool := &Tool{Name: "test", Parameters: nil}
 	if err := ValidateToolArguments(tool, `{"key":"val"}`); err != nil {

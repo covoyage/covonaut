@@ -7,6 +7,23 @@ import (
 	"strings"
 )
 
+// ValidateJSON checks that raw is valid JSON matching schema.
+// Schema is a JSON Schema object (typically {"type":"object",...}).
+func ValidateJSON(schema map[string]any, raw string) error {
+	if schema == nil {
+		return nil
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fmt.Errorf("empty JSON")
+	}
+	var value any
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return fmt.Errorf("invalid JSON: %w", err)
+	}
+	return validateValue(schema, value, "")
+}
+
 // ValidateToolArguments validates tool call arguments against the tool's
 // parameter schema. Returns nil if valid, or a descriptive error.
 func ValidateToolArguments(tool *Tool, arguments string) error {
