@@ -1,10 +1,38 @@
 # covonaut
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 [![CI](https://github.com/covoyage/covonaut/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/covoyage/covonaut/actions/workflows/ci.yml)
 
 Production-ready Agent framework for Go.
 
 [Documentation](https://covoyage.github.io/covonaut/) | [API Reference](https://pkg.go.dev/github.com/covoyage/covonaut)
+
+## Documentation
+
+The documentation site is hosted on GitHub Pages:
+
+- [English](https://covoyage.github.io/covonaut/)
+- [Chinese](https://covoyage.github.io/covonaut/zh/)
+
+The site selects a language based on your browser preferences and remembers
+manual language selections. Both versions cover setup, core concepts, tools,
+providers, protocols, and runnable examples.
+
+To preview the documentation locally, use Node.js 22 and Go 1.25+:
+
+```bash
+npm --prefix docs ci
+npm --prefix docs run dev
+```
+
+Run `npm --prefix docs run check` to build the site and validate internal links,
+bilingual page consistency, and Go examples without calling model providers.
+
+The [Documentation workflow](.github/workflows/docs.yml) checks pull requests
+and deploys updates from `main`. To enable deployment, set **Settings > Pages >
+Build and deployment > Source** to **GitHub Actions** in the repository. The
+generated site is published from `docs/.vitepress/dist`.
 
 ## Install
 
@@ -22,42 +50,84 @@ package main
 import (
     "context"
     "encoding/json"
+    "errors"
     "fmt"
+    "log"
     "os"
+    "time"
 
     "github.com/covoyage/covonaut/agentcore"
     "github.com/covoyage/covonaut/provider/chatcompat"
 )
 
 func main() {
-    agent := agentcore.New(agentcore.Config{
-        ModelConfig: agentcore.ModelConfig{
-            Name:     "assistant",
-            Model:    os.Getenv("AGENT_MODEL"),
-            Provider: chatcompat.New(chatcompat.Config{APIKey: os.Getenv("OPENAI_API_KEY")}),
-        },
-        SystemPrompt: "You are a helpful assistant.",
-        Tools: []*agentcore.Tool{{
+    if err := run(); err != nil {
+        log.Fatal(err)
+    }
+}
+
+func run() error {
+    apiKey, model := os.Getenv("OPENAI_API_KEY"), os.Getenv("AGENT_MODEL")
+    if apiKey == "" || model == "" {
+        return errors.New("set OPENAI_API_KEY and AGENT_MODEL before running")
+    }
+
+    agent, err := agentcore.NewWithError(agentcore.NewConfig(
+        agentcore.WithName("assistant"),
+        agentcore.WithModel(model),
+        agentcore.WithProvider(chatcompat.New(chatcompat.Config{
+            APIKey: apiKey,
+            BaseURL: os.Getenv("OPENAI_BASE_URL"),
+        })),
+        agentcore.WithSystemPrompt("Use the greet tool when asked to greet someone."),
+        agentcore.WithMaxTurns(5),
+        agentcore.WithValidateArguments(true),
+        agentcore.WithTools(&agentcore.Tool{
             Name:        "greet",
-            Description: "Say hello",
-            Parameters:  map[string]any{"type": "object", "properties": map[string]any{"name": map[string]any{"type": "string"}}},
-            Func: func(ctx context.Context, args json.RawMessage) (any, error) {
-                return "Hello!", nil
+            Description: "Greet a person by name",
+            Parameters: map[string]any{
+                "type": "object",
+                "properties": map[string]any{
+                    "name": map[string]any{"type": "string"},
+                },
+                "required": []string{"name"},
             },
-        }},
-    })
+            Func: func(ctx context.Context, args json.RawMessage) (any, error) {
+                var input struct {
+                    Name string `json:"name"`
+                }
+                if err := json.Unmarshal(args, &input); err != nil {
+                    return nil, err
+                }
+                return "Hello, " + input.Name + "!", nil
+            },
+        }),
+    ))
+    if err != nil {
+        return err
+    }
     defer agent.Close()
 
-    output, err := agent.Run(context.Background(), "Hi there")
+    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+    defer cancel()
+    output, err := agent.Run(ctx, "Greet Ada by name.")
     if err != nil {
-        panic(err)
+        return err
     }
     fmt.Println(output)
+    return nil
 }
 ```
 
 Set `OPENAI_API_KEY` and `AGENT_MODEL` to a tool-capable model available to your account.
 For a complete checked example, run `go run ./example/quickstart` from this repository.
+
+Quick Start is a complete program. The sections below are feature fragments:
+provide imports, a bounded `ctx`, and referenced application values. Fragments
+using `return err` belong inside a function returning `error`. Configuration
+fragments produce `cfg`; initialize it with `agentcore.NewWithError(cfg)`, check
+the error, and defer `agent.Close()` as shown above. Schema validation does not
+replace authorization. Providers and models differ in supported capabilities.
 
 ## Core Concepts
 
@@ -66,31 +136,23 @@ For a complete checked example, run `go run ./example/quickstart` from this repo
 The central `Agent` executes an LLM-tool loop with configurable max turns, automatic context compaction, and retry with exponential backoff.
 
 ```go
-agent := agentcore.New(agentcore.Config{
-    Name:         "coder",
-    Provider:     provider,
-    MaxTurns:     20,
-    ContextWindow: &agentcore.ContextWindowConfig{MaxTokens: 128000, CompactionThreshold: 0.8},
-    RetryConfig:  &agentcore.RetryConfig{MaxRetries: 3, InitialDelay: time.Second},
-})
+cfg := agentcore.NewConfig(
+    agentcore.WithName("coder"),
+    agentcore.WithModel(model),
+    agentcore.WithProvider(provider),
+    agentcore.WithMaxTurns(20),
+    agentcore.WithContextWindow(128000),
+)
+cfg.CompressionThreshold = 0.8
+cfg.RetryConfig = &agentcore.RetryConfig{MaxRetries: 3, BaseDelayMs: 1000}
 ```
 
 ### Tools
 
-Register tools with JSON Schema validation, per-tool hooks, and global middleware.
-
-```go
-tool := &agentcore.Tool{
-    Name:        "read_file",
-    Description: "Read a file from disk",
-    Parameters:  map[string]any{...},
-    Func: func(ctx context.Context, args json.RawMessage) (any, error) {
-        // ...
-    },
-    Before: []agentcore.BeforeHook{authCheck},
-    After:  []agentcore.AfterHook{auditLog},
-}
-```
+Quick Start includes a complete tool with typed argument decoding and enabled
+Schema validation. Attach `Tool.Before` and `Tool.After` hooks or global
+middleware for auditing and authorization. Validate permitted paths and actions
+inside the tool; a valid Schema is not an authorization decision.
 
 ### Built-in Tools Extension
 
@@ -100,9 +162,10 @@ tool := &agentcore.Tool{
 import "github.com/covoyage/covonaut/tools"
 
 ext := tools.NewExtension(tools.ExtensionConfig{WorkingDir: "/path/to/project"})
-agent := agentcore.New(agentcore.Config{
+cfg := agentcore.Config{
+    ModelConfig: agentcore.ModelConfig{Model: model, Provider: provider},
     Extensions: []agentcore.Extension{ext},
-})
+}
 ```
 
 Each tool supports pluggable operations for delegating to remote systems (e.g. SSH).
@@ -117,7 +180,6 @@ Supports MCP `stdio` transport and HTTP/SSE transport, plus `tools/list` / `tool
 ```go
 import "github.com/covoyage/covonaut/mcp"
 
-ctx := context.Background()
 ext, err := mcp.NewStdioExtension(ctx, mcp.StdioConfig{
     Name:       "filesystem",
     Command:    "npx",
@@ -125,15 +187,19 @@ ext, err := mcp.NewStdioExtension(ctx, mcp.StdioConfig{
     ToolPrefix: "fs.",
 })
 if err != nil {
-    panic(err)
+    return err
 }
+defer ext.Dispose()
 
-agent := agentcore.New(agentcore.Config{
-    Name:       "assistant",
-    Model:      "gpt-5.6",
-    Provider:   provider,
+agent, err := agentcore.NewWithError(agentcore.Config{
+    ModelConfig: agentcore.ModelConfig{
+        Name: "assistant", Model: model, Provider: provider,
+    },
     Extensions: []agentcore.Extension{ext},
 })
+if err != nil {
+    return err
+}
 defer agent.Close()
 ```
 
@@ -162,10 +228,11 @@ interface. Set both on `agentcore.Config`; each is optional and nil-safe.
 
 ```go
 cfg := agentcore.Config{
-    ModelConfig: ...,
+    ModelConfig: agentcore.ModelConfig{Model: model, Provider: provider},
     Tracer:      agentcore.NewOtelTracer(tp.Tracer("my-agent")),
     Metrics:     agentcore.NewOtelMetrics(mp.Meter("my-agent")),
 }
+cfg.Provider = agentcore.NewModelMetricsMiddleware(cfg.Metrics)(cfg.Provider)
 ```
 
 `Tracer` emits correlated `agent`/`model`/`tool` spans (with `run.id` /
@@ -184,12 +251,12 @@ Type-safe event bus for real-time observability.
 ```go
 agent.On(agentcore.EventMessageDelta, func(e agentcore.Event) {
     delta := e.(*agentcore.MessageDeltaEvent)
-    fmt.Print(delta.Content)
+    fmt.Print(delta.Delta)
 })
 
 agent.On(agentcore.EventToolCallEnd, func(e agentcore.Event) {
     tc := e.(*agentcore.ToolCallEndEvent)
-    fmt.Printf("Tool %s completed\n", tc.Name)
+    fmt.Printf("Tool %s completed\n", tc.ToolName)
 })
 ```
 
@@ -198,13 +265,14 @@ agent.On(agentcore.EventToolCallEnd, func(e agentcore.Event) {
 Intercept every stage of agent execution.
 
 ```go
-agent := agentcore.New(agentcore.Config{
+cfg := agentcore.Config{
+    ModelConfig: agentcore.ModelConfig{Model: model, Provider: provider},
     Lifecycle: agentcore.LifecycleChain{
-        &agentcore.GuardrailHook{Check: safetyCheck},
+        &agentcore.GuardrailHook{Validate: safetyCheck},
         &agentcore.AuditHook{OnEvent: logEvent},
-        &agentcore.RateLimitHook{Limiter: limiter},
+        &agentcore.RateLimitHook{MaxTurnsPerMinute: 20},
     },
-})
+}
 ```
 
 ### Runnable (4-mode generic)
@@ -224,14 +292,19 @@ r := agentcore.NewStreamRunnable(func(ctx context.Context, input string) (*agent
     go func() {
         defer sr.Close()
         for _, word := range strings.Fields(input) {
-            sr.Send(word)
+            if ctx.Err() != nil || !sr.Send(word) {
+                return
+            }
         }
     }()
     return sr, nil
 })
 
 // Auto-derived: Invoke collects the stream and returns the last element
-result, _ := r.Invoke(ctx, "hello world")
+result, err := r.Invoke(ctx, "hello world")
+if err != nil {
+    return err
+}
 ```
 
 ### Graph Engine
@@ -240,42 +313,58 @@ result, _ := r.Invoke(ctx, "hello world")
 
 ```go
 g := graph.NewGraph()
-g.AddNode("parse", parseStep)
-g.AddNode("validate", validateStep)
-g.AddNode("transform", transformStep)
-g.AddEdge("parse", "validate")
-g.AddEdge("parse", "transform")
+if err := g.AddNode("parse", parseStep); err != nil { return err }
+if err := g.AddNode("validate", validateStep); err != nil { return err }
+if err := g.AddNode("transform", transformStep); err != nil { return err }
+if err := g.AddEdge("parse", "validate"); err != nil { return err }
+if err := g.AddEdge("parse", "transform"); err != nil { return err }
 
-cg, _ := g.Compile(graph.CompileOptions{EntryNode: "parse"})
-output, _ := cg.Run(ctx, input)
+cg, err := g.Compile(graph.CompileOptions{EntryNode: "parse"})
+if err != nil {
+    return err
+}
+output, err := cg.Run(ctx, input)
+if err != nil {
+    return err
+}
 ```
 
 **Pregel** — cyclic state graphs with super-step iteration:
 
 ```go
 pg := graph.NewPregelGraph()
-pg.AddNode("agent", agentNode)
-pg.AddNode("tools", toolsNode)
-pg.AddEdge("tools", "agent")
-pg.SetConditionalEdgeWithTargets("agent", []string{"tools", graph.PregelEnd}, func(ctx context.Context, state graph.PregelState) []string {
+if err := pg.AddNode("agent", agentNode); err != nil { return err }
+if err := pg.AddNode("tools", toolsNode); err != nil { return err }
+if err := pg.AddEdge("tools", "agent"); err != nil { return err }
+if err := pg.SetConditionalEdgeWithTargets("agent", []string{"tools", graph.PregelEnd}, func(ctx context.Context, state graph.PregelState) []string {
     if state.GetString("done") == "true" {
         return []string{graph.PregelEnd}
     }
     return []string{"tools"}
-})
+}); err != nil { return err }
 
-cpg, _ := pg.Compile("agent")
-finalState, _ := cpg.Run(ctx, graph.PregelState{"input": "solve x^2=4"})
+cpg, err := pg.Compile("agent")
+if err != nil {
+    return err
+}
+finalState, err := cpg.Run(ctx, graph.PregelState{"input": "solve x^2=4"})
+if err != nil {
+    return err
+}
 ```
 
 **Unified Runner** — one API for both modes:
 
 ```go
 runner := graph.NewDAGRunner(compiledGraph)
-// or
-runner := graph.NewPregelRunner(compiledPregelGraph, &state)
+if usePregel {
+    runner = graph.NewPregelRunner(compiledPregelGraph, &state)
+}
 
-output, _ := runner.Run(ctx, input)
+output, err := runner.Run(ctx, input)
+if err != nil {
+    return err
+}
 ```
 
 Compiled DAG and Pregel graphs expose deterministic introspection, diagnostics,
@@ -287,12 +376,12 @@ the string graph engine:
 info := compiledGraph.Info()
 diagram := compiledGraph.Mermaid()
 
-graph.AddTypedNode(g, graph.TypedNode[int, Result]{
+if err := graph.AddTypedNode(g, graph.TypedNode[int, Result]{
     Name:     "calculate",
     Runnable: calculationRunnable,
     Decode:   parseInteger,
     Encode:   graph.JSONEncode[Result],
-})
+}); err != nil { return err }
 ```
 
 For homogeneous pipelines, `TypedGraph[T]` keeps values typed through nodes,
@@ -301,14 +390,20 @@ conversion:
 
 ```go
 typed := graph.NewTypedGraph[Document]()
-typed.AddNode("load", loadRunnable)
-typed.AddNode("enrich", enrichRunnable)
-typed.AddEdge("load", "enrich")
+if err := typed.AddNode("load", loadRunnable); err != nil { return err }
+if err := typed.AddNode("enrich", enrichRunnable); err != nil { return err }
+if err := typed.AddEdge("load", "enrich"); err != nil { return err }
 
-compiled, _ := typed.Compile(graph.TypedCompileOptions[Document]{
+compiled, err := typed.Compile(graph.TypedCompileOptions[Document]{
     EntryNode: "load",
 })
-result, _ := compiled.Run(ctx, inputDocument)
+if err != nil {
+    return err
+}
+result, err := compiled.Run(ctx, inputDocument)
+if err != nil {
+    return err
+}
 ```
 
 ### Runtime Reliability
@@ -324,7 +419,9 @@ semanticSelector := &agentcore.EmbeddingToolSelector{
     MinScore: 0.6,
     Fallback: agentcore.KeywordToolSelector{},
 }
-agent := agentcore.New(agentcore.NewConfig(
+cfg := agentcore.NewConfig(
+    agentcore.WithModel(model),
+    agentcore.WithProvider(provider),
     agentcore.WithToolSelection(&agentcore.ToolSelectionConfig{
         Selector: semanticSelector,
         MaxVisible: 12,
@@ -337,7 +434,7 @@ agent := agentcore.New(agentcore.NewConfig(
     agentcore.WithArtifactOffload(&agentcore.ArtifactOffloadConfig{
         Store: artifactStore,
     }),
-))
+)
 ```
 
 Before each provider call, incomplete tool-call history is normalized with
@@ -353,16 +450,30 @@ workflow executions propagate correlated `agentcore.RunInfo` through both
 Append-only JSONL tree with branching, compaction, labels, and version migration.
 
 ```go
-store, _ := session.NewFileStore("./sessions")
-mgr, _ := store.Create(ctx, session.CreateOptions{Cwd: "/project"})
+store, err := session.NewFileStore("./sessions")
+if err != nil {
+    return err
+}
+mgr, err := store.Create(ctx, session.CreateOptions{Cwd: "/project"})
+if err != nil {
+    return err
+}
 
 // Append messages
-mgr.AppendMessage(ctx, agentcore.Message{Role: "user", Content: "hello"})
-mgr.AppendMessage(ctx, agentcore.Message{Role: "assistant", Content: "hi"})
+if err := mgr.AppendMessage(ctx, agentcore.Message{Role: "user", Content: "hello"}); err != nil {
+    return err
+}
+if err := mgr.AppendMessage(ctx, agentcore.Message{Role: "assistant", Content: "hi"}); err != nil {
+    return err
+}
 
 // Branch from an earlier point
-mgr.Branch(earlierEntryID)
-mgr.AppendMessage(ctx, agentcore.Message{Role: "user", Content: "different question"})
+if err := mgr.Branch(earlierEntryID); err != nil {
+    return err
+}
+if err := mgr.AppendMessage(ctx, agentcore.Message{Role: "user", Content: "different question"}); err != nil {
+    return err
+}
 
 // Get messages along current path (handles compaction & branch summaries)
 msgs := mgr.MessagesOnPath()
@@ -400,7 +511,7 @@ router := &workflow.Router{
 // OpenAI / Chat Completions protocol (also works with DeepSeek, Qwen, Moonshot, Groq, Together...)
 p := chatcompat.New(chatcompat.Config{
     APIKey: os.Getenv("OPENAI_API_KEY"),
-})
+)
 
 // DeepSeek (OpenAI-compatible)
 p := chatcompat.New(chatcompat.Config{
@@ -455,7 +566,13 @@ p := mistral.New(mistral.Config{
 })
 ```
 
-All providers support streaming (SSE) and report token usage. Gemini uses the native `generateContent` / `streamGenerateContent` endpoints with `functionCall` / `functionResponse` parts.
+The provider configurations above are independent alternatives: choose one,
+rather than declaring `p` repeatedly in the same scope. Providers support
+streaming and parse usage when the service reports it. Bedrock uses AWS event
+streams rather than SSE. Tool and multimodal support vary by implementation;
+the current Bedrock adapter sends text messages only. Gemini uses the native
+`generateContent` / `streamGenerateContent` endpoints with `functionCall` /
+`functionResponse` parts.
 
 ### Structured Output
 
@@ -463,19 +580,28 @@ All providers support streaming (SSE) and report token usage. Gemini uses the na
 All providers accept the same high-level request shape.
 
 ```go
-agent := agentcore.New(agentcore.Config{
-    Model:    "gpt-5.6",
-    Provider: chatcompat.New(chatcompat.Config{APIKey: os.Getenv("OPENAI_API_KEY")}),
-    ResponseFormat: agentcore.NewJSONSchemaResponseFormat("answer", map[string]any{
-        "type": "object",
-        "properties": map[string]any{
-            "answer": map[string]any{"type": "string"},
-        },
-        "required": []string{"answer"},
-    }),
+agent, err := agentcore.NewWithError(agentcore.Config{
+    ModelConfig: agentcore.ModelConfig{
+        Model: model,
+        Provider: provider,
+        ResponseFormat: agentcore.NewJSONSchemaResponseFormat("answer", map[string]any{
+            "type": "object",
+            "properties": map[string]any{
+                "answer": map[string]any{"type": "string"},
+            },
+            "required": []string{"answer"},
+        }),
+    },
 })
+if err != nil {
+    return err
+}
+defer agent.Close()
 
 out, err := agent.Run(ctx, "Reply with JSON only")
+if err != nil {
+    return err
+}
 // out will be the raw JSON string, e.g. {"answer":"ok"}
 ```
 
@@ -485,7 +611,7 @@ responses populate `ProviderResponse.Structured` when the returned content is va
 - `chatcompat`: uses native `response_format`
 - `gemini`: uses native `generationConfig.responseMimeType` / `responseSchema`
 - `anthropic`: currently uses a schema-aware system instruction fallback and extracts valid JSON from the model text response
-- `bedrock`: uses native Converse API `toolConfig` / `confluenceConfig`
+- `bedrock`: currently does not forward `ResponseFormat`; do not rely on native schema enforcement through this adapter
 
 You can also decode directly into a typed result:
 
@@ -495,6 +621,9 @@ type Answer struct {
 }
 
 result, err := agentcore.RunStructured[Answer](ctx, agent, "Reply with JSON only")
+if err != nil {
+    return err
+}
 ```
 
 ### Provider Thinking Controls
@@ -502,17 +631,17 @@ result, err := agentcore.RunStructured[Answer](ctx, agent, "Reply with JSON only
 You can request provider-native reasoning / thought summaries through `agentcore.Config.Thinking`:
 
 ```go
-agent := agentcore.New(agentcore.Config{
-    Name:     "reasoner",
-    Model:    "gemini-2.5-flash",
-    Provider: provider,
-    Thinking: &agentcore.ThinkingConfig{
-        IncludeThoughts: true,
-        Display:         agentcore.ThinkingDisplaySummarized,
-        Effort:          agentcore.ThinkingEffortMedium,
-        Budget:          2048,
+cfg := agentcore.Config{
+    ModelConfig: agentcore.ModelConfig{
+        Name: "reasoner", Model: "gemini-2.5-flash", Provider: provider,
+        Thinking: &agentcore.ThinkingConfig{
+            IncludeThoughts: true,
+            Display:         agentcore.ThinkingDisplaySummarized,
+            Effort:          agentcore.ThinkingEffortMedium,
+            Budget:          2048,
+        },
     },
-})
+}
 ```
 
 - `Display` controls whether visible reasoning summaries are returned (`summarized` / `omitted`)
@@ -525,7 +654,8 @@ agent := agentcore.New(agentcore.Config{
 ### Richer Message Blocks
 
 `agentcore.Message` blocks support image inputs in addition to text and thinking segments.
-All providers send these blocks as native multimodal content.
+Supported providers send these blocks as native multimodal content; the current
+Bedrock adapter sends text only.
 
 ```go
 msg := agentcore.Message{
@@ -550,7 +680,7 @@ Interoperate with any A2A-compliant agent — including Google ADK agents.
 // Expose your agent as an A2A server
 handler := a2a.NewDefaultAgentHandler(card, agent, agent.Config())
 server := a2a.NewServer(handler)
-log.Fatal(server.ListenAndServe(":8080"))
+return server.ListenAndServe(":8080")
 ```
 
 ```go
@@ -560,6 +690,9 @@ task, err := client.SendTask(ctx, a2a.SendTaskRequest{
     ID: "task-123",
     Message: a2a.Message{Role: "user", Parts: []a2a.Part{a2a.NewTextPart("Hello")}},
 })
+if err != nil {
+    return err
+}
 ```
 
 ```go
@@ -567,7 +700,10 @@ task, err := client.SendTask(ctx, a2a.SendTaskRequest{
 ext := a2a.NewRemoteHandoffExtension([]a2a.RemoteHandoffConfig{{
     Name: "math-expert", URL: "http://math-agent.example.com",
 }})
-agent := agentcore.New(agentcore.Config{Extensions: []agentcore.Extension{ext}})
+cfg := agentcore.Config{
+    ModelConfig: agentcore.ModelConfig{Model: model, Provider: provider},
+    Extensions: []agentcore.Extension{ext},
+}
 ```
 
 Features:
@@ -601,13 +737,17 @@ Event types cover: run lifecycle, step progress, text deltas, thinking blocks, t
 Declarative UI protocol for agents to render and update surfaces (forms, dashboards, live feeds) on the client side, with built-in data binding, validation, and transport over A2A or AG-UI.
 
 ```go
-env := a2ui.NewSurface("profile", a2ui.BasicCatalogID).
+envs := a2ui.NewSurface("profile", a2ui.BasicCatalogID).
     Add(a2ui.Column("root", "name", "title")).
     Add(a2ui.Text("name", a2ui.Bind("/user/name"))).
-    Add(a2ui.Text("title", "Mathematician"))
+    Add(a2ui.Text("title", "Mathematician")).
+    Data("/user/name", "Ada").
+    Build()
 
 enc := a2ui.NewEncoder(os.Stdout)
-enc.Encode(env) // → JSONL to the client
+if err := enc.EncodeAll(envs); err != nil {
+    return err
+}
 ```
 
 Full A2UI protocol support: surfaces, components, data model (JSON Pointer), validation, surface store, and both A2A and AG-UI transport bindings.
@@ -636,7 +776,8 @@ running and saves the updated state afterwards. If `Config.Checkpoint` is also c
 }
 ```
 
-Calls without `thread_id` remain stateless.
+Calls without `thread_id` remain stateless unless a session-backed store creates
+a new thread as described below.
 When `model`, `response_format`, or `thinking` are omitted, the server falls back to its default
 `agentcore.Config` values. When present, request-level fields override the server defaults for that
 call. For session-backed threads, the effective precedence is: server default < persisted thread
@@ -649,14 +790,20 @@ You can back `Config.Store` with either snapshot files or JSONL sessions:
 
 ```go
 // Snapshot store
-snapshots, _ := store.NewFileStore("./states")
+snapshots, err := store.NewFileStore("./states")
+if err != nil {
+    return err
+}
 
 // Session-backed store
-sessions, _ := session.NewFileStore("./sessions")
+sessions, err := session.NewFileStore("./sessions")
+if err != nil {
+    return err
+}
 threadStore := session.NewAgentStore(sessions, "/project")
 
 srv := server.New(agentcore.Config{
-    Provider: provider,
+    ModelConfig: agentcore.ModelConfig{Model: model, Provider: provider},
     Store:    threadStore,
 })
 ```
@@ -742,12 +889,22 @@ Key design:
 - **Dual rendering**: TUI engine (differential, Elm-architecture) + stdio layer (procedural `\r` overwriting)
 
 ```go
-app := tui.NewChatApp(tui.ChatAppConfig{
-    Chat: chatConfig,
-    TUI:  tuiConfig,
-})
-app.Run(ctx)
+app := tui.NewChatApp(chat.ChatAppConfig{Title: "Assistant"})
+if err := app.Start(); err != nil {
+    return err
+}
+defer app.Stop()
+select {
+case <-ctx.Done():
+    return ctx.Err()
+case <-app.Done():
+    return nil
+}
 ```
+
+For this fragment, import `github.com/covoyage/covonaut/tui/chat` as `chat`.
+Attach application submit handlers or an event subscriber before starting the
+app; this fragment only demonstrates terminal lifecycle management.
 
 ## Model Profiles
 
@@ -760,25 +917,26 @@ agentcore.RegisterProfile(agentcore.ModelProfile{
     ExcludedTools:      []string{"computer_use"},
 })
 
-agent := agentcore.New(agentcore.Config{
-    Model:    "claude-sonnet-4-6", // profile applied automatically
-    Provider: provider,
-})
+cfg := agentcore.Config{
+    ModelConfig: agentcore.ModelConfig{Model: "claude-sonnet-4-6", Provider: provider},
+}
 ```
 
-User-set fields always win; `SystemPromptSuffix` is additive. Profiles apply once during `New()` — runtime model changes (e.g. via `ApplyCallConfig`) do not re-apply.
+User-set fields always win; `SystemPromptSuffix` is additive. Profiles apply once during initialization; runtime model changes (e.g. via `ApplyCallConfig`) do not re-apply.
 
 ## Prompt Caching
 
-Automatically annotate messages with `cache_control` breakpoints so Anthropic-compatible providers cache stable prefixes (~75% token savings).
+Automatically annotate messages with `cache_control` breakpoints so supported
+Anthropic-compatible providers can cache stable prefixes. Actual savings depend
+on service pricing, cache hits, and request contents.
 
 ```go
-agent := agentcore.New(agentcore.Config{
-    Provider: provider,
+cfg := agentcore.Config{
+    ModelConfig: agentcore.ModelConfig{Model: model, Provider: provider},
     Extensions: []agentcore.Extension{
         agentcore.NewPromptCachingExtension(),
     },
-})
+}
 ```
 
 Defaults: 4 breakpoints max, one on the system prompt, one near the conversation tail. Tunable via `WithMaxBreakpoints`, `WithCacheSystemPrompt`, `WithCacheLastN`. A zero-value `PromptCachingExtension{}` is a safe no-op.
@@ -790,10 +948,10 @@ Load project rule files (AGENTS.md, .cursorrules, or any caller-specified file) 
 ```go
 ext := agentcore.NewRulesExtension() // defaults to AGENTS.md
 // or: agentcore.NewRulesExtension(agentcore.WithRulesPaths("AGENTS.md", ".cursorrules"))
-agent := agentcore.New(agentcore.Config{
-    Provider:   provider,
+cfg := agentcore.Config{
+    ModelConfig: agentcore.ModelConfig{Model: model, Provider: provider},
     Extensions: []agentcore.Extension{ext},
-})
+}
 ```
 
 Missing files are silently skipped. Inject a custom `FileReader` via `WithRulesReader` for sandboxed or embedded rule sources.
@@ -813,9 +971,10 @@ func (e *MyExtension) Tools() []*agentcore.Tool {
     return []*agentcore.Tool{myTool}
 }
 
-agent := agentcore.New(agentcore.Config{
+cfg := agentcore.Config{
+    ModelConfig: agentcore.ModelConfig{Model: model, Provider: provider},
     Extensions: []agentcore.Extension{&MyExtension{}},
-})
+}
 ```
 
 ## License
