@@ -174,18 +174,23 @@ func main() {
 	}
 
 	loadAgentForThread := func(ctx context.Context, threadID string) (*agentcore.Agent, error) {
-		agent := agentcore.New(coordinatorCfg)
+		agent, err := agentcore.NewWithError(coordinatorCfg)
+		if err != nil {
+			return nil, err
+		}
 		if threadID == "" || store == nil {
 			return agent, nil
 		}
 		hasState, err := storeHasKey(ctx, store, threadID)
 		if err != nil {
+			agent.Close()
 			return nil, err
 		}
 		if !hasState {
 			return agent, nil
 		}
 		if err := agent.LoadState(ctx, threadID); err != nil {
+			agent.Close()
 			return nil, err
 		}
 		return agent, nil
@@ -283,7 +288,10 @@ func main() {
 			snap = &s
 		}
 
-		agent := agentcore.New(coordinatorCfg)
+		agent, err := agentcore.NewWithError(coordinatorCfg)
+		if err != nil {
+			return err
+		}
 		if snap != nil {
 			agent.State().Restore(*snap)
 		}

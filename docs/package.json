@@ -1,0 +1,15 @@
+{
+  "name": "covonaut-docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vitepress dev .",
+    "build": "vitepress build .",
+    "check": "node --test .vitepress/language.test.mjs && npm run build && node .vitepress/check.mjs",
+    "preview": "vitepress preview ."
+  },
+  "devDependencies": {
+    "linkedom": "^0.18.12",
+    "vitepress": "^1.6.4"
+  }
+}

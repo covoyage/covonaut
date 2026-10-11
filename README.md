@@ -4,6 +4,8 @@
 
 Production-ready Agent framework for Go.
 
+[Documentation](https://covoyage.github.io/covonaut/) | [API Reference](https://pkg.go.dev/github.com/covoyage/covonaut)
+
 ## Install
 
 ```bash
@@ -21,6 +23,7 @@ import (
     "context"
     "encoding/json"
     "fmt"
+    "os"
 
     "github.com/covoyage/covonaut/agentcore"
     "github.com/covoyage/covonaut/provider/chatcompat"
@@ -28,9 +31,12 @@ import (
 
 func main() {
     agent := agentcore.New(agentcore.Config{
-        Name:         "assistant",
+        ModelConfig: agentcore.ModelConfig{
+            Name:     "assistant",
+            Model:    os.Getenv("AGENT_MODEL"),
+            Provider: chatcompat.New(chatcompat.Config{APIKey: os.Getenv("OPENAI_API_KEY")}),
+        },
         SystemPrompt: "You are a helpful assistant.",
-        Provider:     chatcompat.New(chatcompat.Config{APIKey: "sk-..."}),
         Tools: []*agentcore.Tool{{
             Name:        "greet",
             Description: "Say hello",
@@ -40,6 +46,7 @@ func main() {
             },
         }},
     })
+    defer agent.Close()
 
     output, err := agent.Run(context.Background(), "Hi there")
     if err != nil {
@@ -48,6 +55,9 @@ func main() {
     fmt.Println(output)
 }
 ```
+
+Set `OPENAI_API_KEY` and `AGENT_MODEL` to a tool-capable model available to your account.
+For a complete checked example, run `go run ./example/quickstart` from this repository.
 
 ## Core Concepts
 

@@ -27,6 +27,12 @@ func (stubProvider) Stream(ctx context.Context, req *agentcore.ProviderRequest) 
 }
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -42,7 +48,11 @@ func main() {
 	}
 
 	// Create a simple agent
-	agent := agentcore.New(cfg)
+	agent, err := agentcore.NewWithError(cfg)
+	if err != nil {
+		return err
+	}
+	defer agent.Close()
 
 	// Define agent card
 	card := a2a.AgentCard{
@@ -75,9 +85,7 @@ func main() {
 	server := a2a.NewServer(handler)
 
 	log.Printf("A2A server starting on :%s", port)
-	log.Printf("Agent Card: http://localhost:%s/.well-known/agent.json", port)
+	log.Printf("Agent Card: http://localhost:%s/.well-known/agent-card.json", port)
 
-	if err := server.ListenAndServe(":" + port); err != nil {
-		log.Fatalf("Server error: %v", err)
-	}
+	return server.ListenAndServe(":" + port)
 }

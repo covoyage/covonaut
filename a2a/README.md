@@ -33,8 +33,8 @@ a2a/
 package main
 
 import (
-    "context"
     "log"
+    "os"
 
     "github.com/covoyage/covonaut/agentcore"
     "github.com/covoyage/covonaut/a2a"
@@ -42,12 +42,25 @@ import (
 )
 
 func main() {
+    if err := run(); err != nil {
+        log.Fatal(err)
+    }
+}
+
+func run() error {
     // Create your agent
-    agent := agentcore.New(agentcore.Config{
-        Name:         "weather-agent",
+    agent, err := agentcore.NewWithError(agentcore.Config{
+        ModelConfig: agentcore.ModelConfig{
+            Name:     "weather-agent",
+            Model:    os.Getenv("AGENT_MODEL"),
+            Provider: chatcompat.New(chatcompat.Config{APIKey: os.Getenv("OPENAI_API_KEY")}),
+        },
         SystemPrompt: "You are a weather assistant.",
-        Provider:     chatcompat.New(chatcompat.Config{APIKey: "sk-..."}),
     })
+    if err != nil {
+        return err
+    }
+    defer agent.Close()
 
     // Define your agent card
     card := a2a.AgentCard{
@@ -73,7 +86,7 @@ func main() {
     server := a2a.NewServer(handler)
 
     log.Println("A2A server listening on :8080")
-    log.Fatal(server.ListenAndServe(":8080"))
+    return server.ListenAndServe(":8080")
 }
 ```
 
@@ -84,20 +97,29 @@ package main
 
 import (
     "context"
+    "errors"
     "fmt"
     "log"
+    "time"
 
     "github.com/covoyage/covonaut/a2a"
 )
 
 func main() {
-    ctx := context.Background()
+    if err := run(); err != nil {
+        log.Fatal(err)
+    }
+}
+
+func run() error {
+    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+    defer cancel()
     client := a2a.NewClient("http://remote-agent.example.com")
 
     // Discover agent capabilities
     card, err := client.GetAgentCard(ctx)
     if err != nil {
-        log.Fatal(err)
+        return err
     }
     fmt.Printf("Connected to: %s\n", card.Name)
 
@@ -110,18 +132,23 @@ func main() {
         },
     })
     if err != nil {
-        log.Fatal(err)
+        return err
     }
 
     if response.Message != nil {
         fmt.Printf("Direct response: %+v\n", response.Message)
-    } else {
+    } else if response.Task != nil {
         fmt.Printf("Task state: %s\n", response.Task.Status.State)
+    } else {
+        return errors.New("response contains neither a message nor a task")
     }
+    return nil
 }
 ```
 
 ### 3. Streaming Task Updates
+
+Place this fragment in a function returning an error, and pass a context with a deadline.
 
 ```go
 stream, err := client.V1().SendStreamingMessage(ctx, a2a.V1SendMessageRequest{
@@ -132,7 +159,7 @@ stream, err := client.V1().SendStreamingMessage(ctx, a2a.V1SendMessageRequest{
     },
 })
 if err != nil {
-    log.Fatal(err)
+    return err
 }
 defer stream.Close()
 
@@ -142,7 +169,7 @@ for {
         break
     }
     if err != nil {
-        log.Fatal(err)
+        return err
     }
     if ev.Task != nil {
         fmt.Printf("Initial state: %s\n", ev.Task.Status.State)
@@ -163,7 +190,7 @@ import (
     "github.com/covoyage/covonaut/a2a"
 )
 
-func setupAgent() *agentcore.Agent {
+func setupAgent(model string, provider agentcore.Provider) (*agentcore.Agent, error) {
     // Create remote handoff extension
     remoteAgents := []a2a.RemoteHandoffConfig{
         {
@@ -180,24 +207,24 @@ func setupAgent() *agentcore.Agent {
 
     ext := a2a.NewRemoteHandoffExtension(remoteAgents)
 
-    agent := agentcore.New(agentcore.Config{
-        Name:         "coordinator",
+    return agentcore.NewWithError(agentcore.Config{
+        ModelConfig: agentcore.ModelConfig{
+            Name: "coordinator", Model: model, Provider: provider,
+        },
         SystemPrompt: "You coordinate tasks between specialized agents.",
         Extensions:   []agentcore.Extension{ext},
     })
-
-    return agent
 }
 ```
 
-Now the LLM can use tools like `transfer_to_math-expert` and `transfer_to_code-reviewer` to delegate tasks to remote A2A agents.
+The caller must check the returned error and close the agent when finished. The LLM can then use tools like `transfer_to_math-expert` and `transfer_to_code-reviewer` to delegate tasks to remote A2A agents.
 
 ### 5. Advanced Adapter with Callbacks
 
 ```go
 adapter := a2a.NewAgentAdapter(card, agent, cfg, &a2a.AdapterCallbacks{
     BeforeRun: func(ctx context.Context, taskID, input string) (string, error) {
-        log.Printf("Processing task %s: %s", taskID, input)
+        log.Printf("Processing task %s", taskID)
         return input, nil
     },
     AfterRun: func(ctx context.Context, taskID, output string, err error) (*a2a.Task, error) {
@@ -259,16 +286,16 @@ The server accepts `A2A-Version: 1.0`. Empty version headers and `0.3` retain le
 
 ```go
 // Text
-part := a2a.NewTextPart("Hello world")
+textPart := a2a.NewTextPart("Hello world")
 
 // Structured data
-part := a2a.NewDataPart(map[string]any{"key": "value"})
+dataPart := a2a.NewDataPart(map[string]any{"key": "value"})
 
 // File (base64)
-part := a2a.NewFilePartBytes("report.pdf", "application/pdf", base64Data)
+inlineFilePart := a2a.NewFilePartBytes("report.pdf", "application/pdf", base64Data)
 
 // File (URI)
-part := a2a.NewFilePartURI("image.png", "image/png", "http://example.com/image.png")
+remoteFilePart := a2a.NewFilePartURI("image.png", "image/png", "http://example.com/image.png")
 ```
 
 ## Task States

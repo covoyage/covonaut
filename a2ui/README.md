@@ -60,12 +60,19 @@ a2ui/
 package main
 
 import (
+  "log"
     "os"
 
     "github.com/covoyage/covonaut/a2ui"
 )
 
 func main() {
+  if err := run(); err != nil {
+    log.Fatal(err)
+  }
+}
+
+func run() error {
     envs := a2ui.NewSurface("profile", a2ui.BasicCatalogID).
         Theme(map[string]any{"primaryColor": "#00BFFF"}).
         Add(a2ui.Column("root", "name", "title")).
@@ -76,7 +83,10 @@ func main() {
 
     // Stream as JSON Lines.
     enc := a2ui.NewEncoder(os.Stdout)
-    _ = enc.EncodeAll(envs)
+    if err := enc.EncodeAll(envs); err != nil {
+      return err
+    }
+    return nil
 }
 ```
 
@@ -92,16 +102,26 @@ for {
         break
     }
     if err != nil {
-        log.Fatal(err)
+      return err
     }
     if err := store.Apply(env); err != nil {
-        log.Printf("apply: %v", err)
+      return err
     }
 }
 
-surface, _ := store.Surface("profile")
-root, _ := surface.Root()          // walk the adjacency list from here
-name, _ := surface.Get("/user/name") // resolve a data binding
+surface, ok := store.Surface("profile")
+if !ok {
+    return errors.New("profile surface not found")
+}
+root, ok := surface.Root()
+if !ok {
+    return errors.New("profile root not found")
+}
+name, ok := surface.Get("/user/name")
+if !ok {
+    return errors.New("profile name not found")
+}
+fmt.Println(root, name)
 ```
 
 ### Validate before rendering
@@ -112,11 +132,18 @@ for _, env := range envs {
     if errs := a2ui.ValidateEnvelope(env, cat); len(errs) > 0 {
         // Each error marshals to the protocol's VALIDATION_FAILED format,
         // ready to feed back to an LLM for self-correction.
+        return fmt.Errorf("invalid envelope: %v", errs)
     }
 }
 
-surface, _ := store.Surface("profile")
+surface, ok := store.Surface("profile")
+if !ok {
+    return errors.New("profile surface not found")
+}
 treeErrs := a2ui.ValidateSurfaceTree(surface, cat) // root, refs, cycles
+if len(treeErrs) > 0 {
+    return fmt.Errorf("invalid surface tree: %v", treeErrs)
+}
 ```
 
 ## Transport Bindings
@@ -130,8 +157,15 @@ Each A2UI envelope maps to a single A2A message `Part` (a data part tagged with
 the `application/a2ui+json` MIME type):
 
 ```go
-msg, _ := a2ui.EnvelopesToMessage(string(a2a.RoleAgent), envs) // → a2a.Message
-envs, _ := a2ui.MessageEnvelopes(msg)                          // ← a2a.Message
+msg, err := a2ui.EnvelopesToMessage(string(a2a.RoleAgent), envs)
+if err != nil {
+    return err
+}
+decodedEnvs, err := a2ui.MessageEnvelopes(msg)
+if err != nil {
+    return err
+}
+fmt.Println(len(decodedEnvs))
 ```
 
 ### AG-UI
@@ -139,8 +173,15 @@ envs, _ := a2ui.MessageEnvelopes(msg)                          // ← a2a.Messag
 Each envelope rides on AG-UI's `CUSTOM` event channel:
 
 ```go
-ev := a2ui.ToCustomEvent(env)               // → agui.CustomEvent
-env, ok, _ := a2ui.FromCustomEvent(ev)      // ← agui.CustomEvent
+ev := a2ui.ToCustomEvent(env)
+decodedEnv, ok, err := a2ui.FromCustomEvent(ev)
+if err != nil {
+  return err
+}
+if !ok {
+  return errors.New("event does not contain an A2UI envelope")
+}
+fmt.Println(decodedEnv.Kind())
 ```
 
 ## Protocol Notes
