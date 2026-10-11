@@ -507,11 +507,32 @@ router := &workflow.Router{
 
 ### Providers
 
+Choose the API protocol your service exposes, not just its vendor name:
+
+| API protocol | Provider | Configuration |
+| --- | --- | --- |
+| OpenAI Chat Completions | `chatcompat` | `APIProtocolChat` (default), optional compatible `BaseURL` |
+| OpenAI Responses | `chatcompat` | `APIProtocolResponses` |
+| Anthropic Messages | `anthropic` | Anthropic API key |
+| Gemini `generateContent` | `gemini` | Gemini API key |
+| AWS Bedrock Converse | `bedrock` | AWS credentials and region |
+| Gemini / Anthropic on Vertex AI | `vertex` | `NewGemini` / `NewAnthropic`, project, region and access token |
+
+Import the selected package from `github.com/covoyage/covonaut/provider/<name>`.
+Each configuration below is an independent alternative; do not paste them all into the same scope.
+
 ```go
 // OpenAI / Chat Completions protocol (also works with DeepSeek, Qwen, Moonshot, Groq, Together...)
 p := chatcompat.New(chatcompat.Config{
-    APIKey: os.Getenv("OPENAI_API_KEY"),
-)
+    APIKey:   os.Getenv("OPENAI_API_KEY"),
+    Protocol: chatcompat.APIProtocolChat,
+})
+
+// OpenAI Responses API (requires a service that supports /responses)
+p := chatcompat.New(chatcompat.Config{
+    APIKey:   os.Getenv("OPENAI_API_KEY"),
+    Protocol: chatcompat.APIProtocolResponses,
+})
 
 // DeepSeek (OpenAI-compatible)
 p := chatcompat.New(chatcompat.Config{
@@ -543,22 +564,43 @@ p := gemini.New(gemini.Config{
 })
 
 // AWS Bedrock
-p := bedrock.New(bedrock.Config{
-    Region:  "us-east-1",
-    ModelID: "anthropic.claude-sonnet-4-20250514",
+p, err := bedrock.New(bedrock.Config{
+    AccessKey:    os.Getenv("AWS_ACCESS_KEY_ID"),
+    SecretKey:    os.Getenv("AWS_SECRET_ACCESS_KEY"),
+    SessionToken: os.Getenv("AWS_SESSION_TOKEN"),
+    Region:       "us-east-1",
 })
+if err != nil {
+    return err
+}
 
-// GCP Vertex AI
-p := vertex.New(vertex.Config{
-    ProjectID: "my-project",
-    Location:  "us-central1",
-    Model:     "gemini-2.5-flash",
+// Gemini on GCP Vertex AI
+p, err := vertex.NewGemini(vertex.Config{
+    Project:     "my-project",
+    Region:      "us-central1",
+    AccessToken: os.Getenv("VERTEX_ACCESS_TOKEN"),
 })
+if err != nil {
+    return err
+}
+
+// Anthropic Messages on GCP Vertex AI
+p, err := vertex.NewAnthropic(vertex.Config{
+    Project:     "my-project",
+    Region:      "us-east5",
+    AccessToken: os.Getenv("VERTEX_ACCESS_TOKEN"),
+})
+if err != nil {
+    return err
+}
 
 // GitHub Copilot
-p := copilot.New(copilot.Config{
+p, err := copilot.New(copilot.Config{
     Token: os.Getenv("GITHUB_TOKEN"),
 })
+if err != nil {
+    return err
+}
 
 // Mistral AI
 p := mistral.New(mistral.Config{
@@ -566,8 +608,31 @@ p := mistral.New(mistral.Config{
 })
 ```
 
-The provider configurations above are independent alternatives: choose one,
-rather than declaring `p` repeatedly in the same scope. Providers support
+Pass the selected provider to an Agent. Set `MODEL` to a model ID supported by
+that service (for Bedrock, use its model or inference profile ID):
+
+```go
+agent, err := agentcore.NewWithError(agentcore.NewConfig(
+    agentcore.WithModel(os.Getenv("MODEL")),
+    agentcore.WithProvider(p),
+))
+if err != nil {
+    return err
+}
+defer agent.Close()
+
+out, err := agent.Run(ctx, "Hello")
+if err != nil {
+    return err
+}
+fmt.Println(out)
+```
+
+Mistral and Copilot use Chat Completions-compatible endpoints. Changing
+`BaseURL` does not switch the protocol; select `APIProtocolResponses` explicitly
+for Responses services. Vertex uses Google bearer-token authentication;
+when `AccessToken` is empty, the adapter tries `gcloud auth print-access-token`.
+Providers support
 streaming and parse usage when the service reports it. Bedrock uses AWS event
 streams rather than SSE. Tool and multimodal support vary by implementation;
 the current Bedrock adapter sends text messages only. Gemini uses the native

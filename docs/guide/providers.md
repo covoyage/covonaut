@@ -4,11 +4,11 @@
 
 | Package | API family |
 | --- | --- |
-| `provider/chatcompat` | Chat Completions-compatible services; optional Responses API |
+| `provider/chatcompat` | OpenAI Chat Completions or Responses, selected with `Protocol` |
 | `provider/anthropic` | Anthropic Messages |
 | `provider/gemini` | Gemini native REST |
-| `provider/bedrock` | AWS Bedrock |
-| `provider/vertex` | Google Cloud Vertex AI |
+| `provider/bedrock` | AWS Bedrock Converse / ConverseStream |
+| `provider/vertex` | Gemini or Anthropic on Google Cloud Vertex AI |
 | `provider/copilot` | OAuth-authenticated Copilot chat |
 | `provider/mistral` | Mistral Conversations |
 
@@ -16,22 +16,68 @@ Adapters share the `agentcore.Provider` interface, but authentication, model
 availability, and supported features differ. Consult each package's constructors;
 some return errors and require cloud-specific configuration.
 
+Choose by the API protocol exposed by your service, not just its vendor name.
+The setup fragments below are independent alternatives. Import the selected
+package from `github.com/covoyage/covonaut/provider/<name>` and `os`.
+
 ## Chat Completions Compatibility
 
 ```go
 provider := chatcompat.New(chatcompat.Config{
-    APIKey: os.Getenv("OPENAI_API_KEY"),
-    BaseURL: os.Getenv("OPENAI_BASE_URL"),
+    APIKey:   os.Getenv("OPENAI_API_KEY"),
+    BaseURL:  os.Getenv("OPENAI_BASE_URL"),
+    Protocol: chatcompat.APIProtocolChat,
 })
 ```
 
-An empty base URL selects OpenAI. Other compatible services can provide a
-different API base URL. `Protocol: chatcompat.APIProtocolResponses` selects the
-Responses API when the service supports it.
+An empty base URL selects OpenAI. For compatible services such as DeepSeek,
+Qwen or Moonshot, supply their API key and base URL. This protocol uses
+`/chat/completions`; changing `BaseURL` does not switch API protocols.
 
 Service-specific adjustments include `ExtraHeaders`, `EndpointPath`,
 `PrepareMessages`, `BuildExtraBody`, and `DisableSystemPrompt`. Protocol
 compatibility alone does not guarantee support for every parameter or model.
+
+## OpenAI Responses API
+
+```go
+provider := chatcompat.New(chatcompat.Config{
+    APIKey:   os.Getenv("OPENAI_API_KEY"),
+    BaseURL:  os.Getenv("OPENAI_BASE_URL"),
+    Protocol: chatcompat.APIProtocolResponses,
+})
+```
+
+This selects `/responses` and its request, response and streaming event formats.
+The service must support the Responses API; Chat Completions compatibility
+alone is insufficient. `EndpointPath` customizations apply only to Chat Completions.
+
+## Run with the Selected Provider
+
+After choosing one setup fragment, pass `provider` to the Agent. Import
+`agentcore`, `fmt` and `os`, and run this fragment inside an error-returning
+function with a bounded `ctx`. Set `MODEL` to a model ID your service supports;
+for Bedrock, use the model or inference profile ID.
+
+```go
+agent, err := agentcore.NewWithError(agentcore.NewConfig(
+    agentcore.WithModel(os.Getenv("MODEL")),
+    agentcore.WithProvider(provider),
+))
+if err != nil {
+    return err
+}
+defer agent.Close()
+
+out, err := agent.Run(ctx, "Hello")
+if err != nil {
+    return err
+}
+fmt.Println(out)
+```
+
+The Agent uses the same interface for every protocol. Each adapter translates
+messages, tools and streaming responses into the service's wire format.
 
 ## Structured Output and Thinking
 
@@ -113,7 +159,23 @@ if err != nil {
 }
 ```
 
-Use `NewAnthropic` for Anthropic on Vertex. Current token resolution uses the
+For Anthropic Messages on Vertex, choose this alternative instead:
+
+```go
+provider, err := vertex.NewAnthropic(vertex.Config{
+    Project: os.Getenv("GOOGLE_CLOUD_PROJECT"),
+    Region: os.Getenv("GOOGLE_CLOUD_REGION"),
+    AccessToken: os.Getenv("VERTEX_ACCESS_TOKEN"),
+})
+if err != nil {
+    return err
+}
+```
+
+`NewGemini` uses Gemini's native content API; `NewAnthropic` uses Vertex's
+raw prediction endpoints with Anthropic Messages payloads. Choose a region
+where the selected model is available. Both use bearer-token authentication.
+Current token resolution uses the
 explicit token or invokes `gcloud auth print-access-token`. Supply the token
 explicitly for controlled deployments; do not infer automatic ADC loading or
 automatic token refresh from a generic authentication error message.

@@ -489,11 +489,32 @@ router := &workflow.Router{
 
 ### 模型服务
 
+接入时应根据服务提供的 API 协议选择 Provider，而不只是看厂商名称：
+
+| API 协议 | Provider | 配置方式 |
+| --- | --- | --- |
+| OpenAI Chat Completions | `chatcompat` | `APIProtocolChat`（默认），可设置兼容服务的 `BaseURL` |
+| OpenAI Responses | `chatcompat` | `APIProtocolResponses` |
+| Anthropic Messages | `anthropic` | Anthropic API Key |
+| Gemini `generateContent` | `gemini` | Gemini API Key |
+| AWS Bedrock Converse | `bedrock` | AWS 凭证和区域 |
+| Vertex AI 上的 Gemini / Anthropic | `vertex` | `NewGemini` / `NewAnthropic`，项目、区域和访问令牌 |
+
+按需导入 `github.com/covoyage/covonaut/provider/<name>` 中的包。
+下面的配置分别对应不同的接入方式，选择其中一项即可，不要在同一作用域中全部粘贴。
+
 ```go
 // OpenAI / Chat Completions protocol (also works with DeepSeek, Qwen, Moonshot, Groq, Together...)
 p := chatcompat.New(chatcompat.Config{
-    APIKey: os.Getenv("OPENAI_API_KEY"),
-)
+    APIKey:   os.Getenv("OPENAI_API_KEY"),
+    Protocol: chatcompat.APIProtocolChat,
+})
+
+// OpenAI Responses API (requires a service that supports /responses)
+p := chatcompat.New(chatcompat.Config{
+    APIKey:   os.Getenv("OPENAI_API_KEY"),
+    Protocol: chatcompat.APIProtocolResponses,
+})
 
 // DeepSeek (OpenAI-compatible)
 p := chatcompat.New(chatcompat.Config{
@@ -525,22 +546,43 @@ p := gemini.New(gemini.Config{
 })
 
 // AWS Bedrock
-p := bedrock.New(bedrock.Config{
-    Region:  "us-east-1",
-    ModelID: "anthropic.claude-sonnet-4-20250514",
+p, err := bedrock.New(bedrock.Config{
+    AccessKey:    os.Getenv("AWS_ACCESS_KEY_ID"),
+    SecretKey:    os.Getenv("AWS_SECRET_ACCESS_KEY"),
+    SessionToken: os.Getenv("AWS_SESSION_TOKEN"),
+    Region:       "us-east-1",
 })
+if err != nil {
+    return err
+}
 
-// GCP Vertex AI
-p := vertex.New(vertex.Config{
-    ProjectID: "my-project",
-    Location:  "us-central1",
-    Model:     "gemini-2.5-flash",
+// Gemini on GCP Vertex AI
+p, err := vertex.NewGemini(vertex.Config{
+    Project:     "my-project",
+    Region:      "us-central1",
+    AccessToken: os.Getenv("VERTEX_ACCESS_TOKEN"),
 })
+if err != nil {
+    return err
+}
+
+// Anthropic Messages on GCP Vertex AI
+p, err := vertex.NewAnthropic(vertex.Config{
+    Project:     "my-project",
+    Region:      "us-east5",
+    AccessToken: os.Getenv("VERTEX_ACCESS_TOKEN"),
+})
+if err != nil {
+    return err
+}
 
 // GitHub Copilot
-p := copilot.New(copilot.Config{
+p, err := copilot.New(copilot.Config{
     Token: os.Getenv("GITHUB_TOKEN"),
 })
+if err != nil {
+    return err
+}
 
 // Mistral AI
 p := mistral.New(mistral.Config{
@@ -548,7 +590,29 @@ p := mistral.New(mistral.Config{
 })
 ```
 
-上面分别展示了不同服务的配置方式，使用时选择你需要的一项即可。模型名称和访问权限以你的账号实际可用的内容为准。
+选好 Provider 后，将它传给 Agent。把 `MODEL` 设置为该服务支持的模型 ID；使用 Bedrock 时，填写模型或推理配置文件的 ID：
+
+```go
+agent, err := agentcore.NewWithError(agentcore.NewConfig(
+    agentcore.WithModel(os.Getenv("MODEL")),
+    agentcore.WithProvider(p),
+))
+if err != nil {
+    return err
+}
+defer agent.Close()
+
+out, err := agent.Run(ctx, "Hello")
+if err != nil {
+    return err
+}
+fmt.Println(out)
+```
+
+Mistral 和 Copilot 使用兼容 Chat Completions 的接口。修改 `BaseURL` 不会切换协议；
+接入 Responses 服务时，需要显式设置 `APIProtocolResponses`。
+Vertex 使用 Google 访问令牌认证；不填写 `AccessToken` 时，适配器会尝试执行 `gcloud auth print-access-token`。
+模型名称和访问权限以你的账号实际可用的内容为准。
 这些 Provider 支持流式输出，并读取服务返回的 token 用量。如果服务没有返回用量或缓存明细，框架无法补出准确的统计数据。
 Bedrock 使用 AWS 事件流而不是 SSE。工具调用和多模态能力取决于具体实现，当前 Bedrock 适配器只发送文本消息。
 Gemini 使用自己的 `generateContent`、`streamGenerateContent` 接口，工具调用和结果分别通过 `functionCall`、`functionResponse` 传递。
