@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/covoyage/covonaut/agentcore"
@@ -137,7 +138,7 @@ func NewGrepTool(cwd string, cfg *GrepToolConfig) *agentcore.Tool {
 }
 
 func runRipgrep(ctx context.Context, rgPath, searchPath string, input GrepToolInput, limit int, isDir bool, cfg *GrepToolConfig) (any, error) {
-	args := []string{"--json", "--line-number", "--color=never", "--hidden"}
+	args := []string{"--json", "--line-number", "--color=never", "--hidden", "--sort", "path"}
 	if input.IgnoreCase {
 		args = append(args, "--ignore-case")
 	}
@@ -243,7 +244,7 @@ func runGoGrep(ctx context.Context, searchPath string, input GrepToolInput, limi
 			lines := strings.Split(content, "\n")
 			for i, line := range lines {
 				if matchCount >= limit {
-					return filepath.SkipDir
+					return filepath.SkipAll
 				}
 				if re.MatchString(line) {
 					matches = append(matches, struct {
@@ -286,6 +287,15 @@ func formatGrepMatches(matches []struct {
 	filePath string
 	lineNum  int
 }, searchPath string, input GrepToolInput, limit int, isDir bool, cfg *GrepToolConfig) (any, error) {
+	sort.SliceStable(matches, func(i, j int) bool {
+		if matches[i].filePath != matches[j].filePath {
+			return matches[i].filePath < matches[j].filePath
+		}
+		return matches[i].lineNum < matches[j].lineNum
+	})
+	if len(matches) > limit {
+		matches = matches[:limit]
+	}
 	fileCache := make(map[string][]string)
 	getLines := func(filePath string) []string {
 		lines, ok := fileCache[filePath]

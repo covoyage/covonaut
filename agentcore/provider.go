@@ -310,6 +310,17 @@ type TokenUsage struct {
 	PromptTokens     int64 `json:"prompt_tokens"`
 	CompletionTokens int64 `json:"completion_tokens"`
 	TotalTokens      int64 `json:"total_tokens"`
+	CacheReadTokens  int64 `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens int64 `json:"cache_write_tokens,omitempty"`
+}
+
+func (u *TokenUsage) Merge(other TokenUsage) {
+	u.PromptTokens = max(u.PromptTokens, other.PromptTokens)
+	u.CompletionTokens = max(u.CompletionTokens, other.CompletionTokens)
+	u.TotalTokens = max(u.TotalTokens, other.TotalTokens)
+	u.CacheReadTokens = max(u.CacheReadTokens, other.CacheReadTokens)
+	u.CacheWriteTokens = max(u.CacheWriteTokens, other.CacheWriteTokens)
+	u.TotalTokens = max(u.TotalTokens, u.PromptTokens+u.CompletionTokens)
 }
 
 // StreamDelta is one incremental chunk from a streaming completion.

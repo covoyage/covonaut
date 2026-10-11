@@ -30,6 +30,14 @@ The `tools` package includes filesystem, shell, search, browser, and code
 execution operations. Pluggable operation interfaces let a host delegate
 execution to remote systems or sandboxes.
 
+File queries return paths in lexical order; grep orders matches by full path
+and then line number. Output limits are applied after formatting sorts results.
+The ripgrep backend sorts paths before emitting matches. The fd backend collects
+all matching paths before sorting and limiting them, which costs more time and
+memory for large trees. Custom `Glob` implementations that limit results
+internally must choose a deterministic subset before returning it; sorting a
+truncated subset cannot make its selection deterministic.
+
 ::: warning Execution boundaries
 Shell allowlists and blocklists are not strong isolation. Run untrusted tools in
 a sandbox and enforce permissions outside the model. Only expose tools needed

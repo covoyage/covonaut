@@ -35,7 +35,7 @@ func TestResponsesAPI_Complete_SimpleText(t *testing.T) {
 					]
 				}
 			],
-			"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}
+			"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8,"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":1}}
 		}`))
 	}))
 	defer srv.Close()
@@ -65,6 +65,9 @@ func TestResponsesAPI_Complete_SimpleText(t *testing.T) {
 	}
 	if resp.Usage.TotalTokens != 8 {
 		t.Fatalf("total_tokens = %d", resp.Usage.TotalTokens)
+	}
+	if resp.Usage.CacheReadTokens != 2 || resp.Usage.CacheWriteTokens != 1 {
+		t.Fatalf("cache usage = %#v", resp.Usage)
 	}
 }
 
@@ -291,10 +294,10 @@ func TestResponsesAPI_Stream_TextDelta(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte(
-			"event: response.created\ndata: {\"id\":\"resp_s1\",\"type\":\"response.created\"}\n\n"+
-				"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\n"+
-				"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n"+
-				"event: response.completed\ndata: {\"type\":\"response.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}\n\n",
+			"event: response.created\ndata: {\"id\":\"resp_s1\",\"type\":\"response.created\"}\n\n" +
+				"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\n" +
+				"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n" +
+				"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3,\"input_tokens_details\":{\"cached_tokens\":1}}}}\n\n",
 		))
 	}))
 	defer srv.Close()
@@ -323,6 +326,9 @@ func TestResponsesAPI_Stream_TextDelta(t *testing.T) {
 			if sd.Usage.TotalTokens != 3 {
 				t.Fatalf("total_tokens = %d", sd.Usage.TotalTokens)
 			}
+			if sd.Usage.CacheReadTokens != 1 {
+				t.Fatalf("cache usage=%#v", sd.Usage)
+			}
 		}
 	}
 	if content != "Hello" {
@@ -337,10 +343,10 @@ func TestResponsesAPI_Stream_FunctionCall(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte(
-			"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_xyz\",\"name\":\"search\",\"status\":\"in_progress\"}}\n\n"+
-				"event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"q\\\":\"}\n\n"+
-				"event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"\\\"test\\\"}\"}\n\n"+
-				"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_xyz\",\"name\":\"search\",\"arguments\":\"{\\\"q\\\":\\\"test\\\"}\",\"status\":\"completed\"}}\n\n"+
+			"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_xyz\",\"name\":\"search\",\"status\":\"in_progress\"}}\n\n" +
+				"event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"q\\\":\"}\n\n" +
+				"event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"\\\"test\\\"}\"}\n\n" +
+				"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_xyz\",\"name\":\"search\",\"arguments\":\"{\\\"q\\\":\\\"test\\\"}\",\"status\":\"completed\"}}\n\n" +
 				"event: response.completed\ndata: {\"type\":\"response.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}\n\n",
 		))
 	}))

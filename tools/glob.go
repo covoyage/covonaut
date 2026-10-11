@@ -59,7 +59,7 @@ func (d DefaultGlobOperations) Glob(pattern string, cwd string, limit int) ([]st
 				results = append(results, rel)
 				seen[rel] = true
 				if len(results) >= limit {
-					return filepath.SkipDir
+					return filepath.SkipAll
 				}
 			}
 		}
@@ -142,6 +142,9 @@ func NewGlobTool(cwd string, cfg *GlobToolConfig) *agentcore.Tool {
 			}
 
 			sort.Strings(results)
+			if len(results) > limit {
+				results = results[:limit]
+			}
 			output := strings.Join(results, "\n")
 			if len(results) >= limit {
 				output += fmt.Sprintf("\n\n[%d results limit reached]", limit)

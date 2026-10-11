@@ -22,7 +22,7 @@ func TestProviderComplete_SendsStructuredOutputConfig(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"candidates":[{"content":{"parts":[{"text":"{\"answer\":\"ok\"}"}]}}],
-			"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":3,"totalTokenCount":7}
+			"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":3,"totalTokenCount":7,"cachedContentTokenCount":2}
 		}`))
 	}))
 	defer srv.Close()
@@ -52,6 +52,9 @@ func TestProviderComplete_SendsStructuredOutputConfig(t *testing.T) {
 	}
 	if string(resp.Structured) != `{"answer":"ok"}` {
 		t.Fatalf("structured = %s", string(resp.Structured))
+	}
+	if resp.Usage.CacheReadTokens != 2 || resp.Usage.TotalTokens != 7 {
+		t.Fatalf("usage=%#v", resp.Usage)
 	}
 
 	gc, ok := gotBody["generationConfig"].(map[string]any)

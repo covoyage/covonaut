@@ -52,6 +52,41 @@ func TestProviderStream_NormalizesCumulativeSnapshots(t *testing.T) {
 	}
 }
 
+func TestChatCacheUsage(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			payload := `{"choices":[{"message":{"role":"assistant","content":"ok"},"delta":{"content":"ok"}}],"usage":{"prompt_tokens":20,"completion_tokens":3,"total_tokens":23,"prompt_tokens_details":{"cached_tokens":10,"cache_write_tokens":4}}}`
+			if streaming {
+				payload = "data: " + payload + "\n\ndata: [DONE]\n\n"
+			}
+			_, _ = w.Write([]byte(payload))
+		}))
+		provider := New(Config{APIKey: "test", BaseURL: srv.URL, Client: srv.Client()})
+		var usage agentcore.TokenUsage
+		if streaming {
+			stream, err := provider.Stream(context.Background(), &agentcore.ProviderRequest{Model: "test"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for delta := range stream {
+				if delta.Usage != nil {
+					usage.Merge(*delta.Usage)
+				}
+			}
+		} else {
+			resp, err := provider.Complete(context.Background(), &agentcore.ProviderRequest{Model: "test"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			usage = resp.Usage
+		}
+		srv.Close()
+		if usage.CacheReadTokens != 10 || usage.CacheWriteTokens != 4 || usage.TotalTokens != 23 {
+			t.Fatalf("streaming=%t usage=%#v", streaming, usage)
+		}
+	}
+}
+
 func TestProviderStream_DropsMirroredReasoningContent(t *testing.T) {
 	const narration = "Let me inspect the two relevant files."
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

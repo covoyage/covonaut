@@ -2,8 +2,25 @@ package agentcore
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"testing"
 )
+
+type contextCheckingCheckpointSaver struct {
+	*MemoryCheckpointSaver
+	appendErr error
+}
+
+func (s *contextCheckingCheckpointSaver) Append(ctx context.Context, threadID string, snapshot StateSnapshot) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if s.appendErr != nil {
+		return 0, s.appendErr
+	}
+	return s.MemoryCheckpointSaver.Append(ctx, threadID, snapshot)
+}
 
 func TestMemoryCheckpointSaver_AppendLatest(t *testing.T) {
 	ctx := context.Background()
@@ -24,6 +41,22 @@ func TestMemoryCheckpointSaver_AppendLatest(t *testing.T) {
 	}
 	if len(got.Messages) != 2 || got.Status != StatusFinished {
 		t.Fatalf("%+v", got)
+	}
+}
+
+func TestTokenUsageMergeCacheDetails(t *testing.T) {
+	usage := TokenUsage{PromptTokens: 20, CacheReadTokens: 10, CacheWriteTokens: 4}
+	usage.Merge(TokenUsage{CompletionTokens: 5, TotalTokens: 25})
+	usage.Merge(TokenUsage{PromptTokens: 20, CompletionTokens: 3, CacheReadTokens: 8, CacheWriteTokens: 4})
+	want := TokenUsage{PromptTokens: 20, CompletionTokens: 5, TotalTokens: 25, CacheReadTokens: 10, CacheWriteTokens: 4}
+	if usage != want {
+		t.Fatalf("merged usage = %#v, want %#v", usage, want)
+	}
+	state := NewState()
+	state.AddUsage(usage)
+	state.AddUsage(usage)
+	if got := state.Snapshot().TotalUsage; got.CacheReadTokens != 20 || got.CacheWriteTokens != 8 {
+		t.Fatalf("accumulated usage = %#v", got)
 	}
 }
 
@@ -68,6 +101,113 @@ func TestMemoryCheckpointSaver_LatestMissing(t *testing.T) {
 	_, _, err := m.Latest(context.Background(), "nope")
 	if err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestToolBatchInterruptCheckpointPreservesCompletedResults(t *testing.T) {
+	for _, mode := range []ExecutionMode{ModeSerial, ModeParallel, ModeMixed} {
+		t.Run(string(mode), func(t *testing.T) {
+			saver := NewMemoryCheckpointSaver()
+			agent, err := NewWithError(StubConfig(seqStubProvider{}, WithCheckpoint(&CheckpointSettings{
+				Saver: saver, ThreadID: "batch",
+			})))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer agent.Close()
+			registry := NewRegistry()
+			registry.Register(interruptTool("pause"))
+			registry.Register(&Tool{
+				Name: "completed",
+				Func: func(context.Context, json.RawMessage) (any, error) { return "saved output", nil },
+			})
+			agent.executor = NewExecutor(registry, ExecutorConfig{Mode: mode})
+			calls := []ToolCall{
+				{ID: "pause-call", Name: "interrupt_tool", Arguments: "{}"},
+				{ID: "done-call", Name: "completed", Arguments: "{}"},
+			}
+			if err := agent.executeToolCalls(context.Background(), calls); !IsInterrupt(err) {
+				t.Fatalf("executeToolCalls error = %v, want interrupt", err)
+			}
+			snapshot, _, err := saver.Latest(context.Background(), "batch")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(snapshot.Messages) != 2 {
+				t.Fatalf("checkpoint has %d messages, want both completed results", len(snapshot.Messages))
+			}
+			if snapshot.Messages[1].ToolCallID != "done-call" || snapshot.Messages[1].Content != "saved output" {
+				t.Fatalf("completed result = %#v", snapshot.Messages[1])
+			}
+			if snapshot.InterruptReason == nil || snapshot.InterruptReason.ToolCallID != "pause-call" {
+				t.Fatalf("interrupt reason = %#v", snapshot.InterruptReason)
+			}
+			if err := agent.RestoreLatestCheckpoint(context.Background(), "batch"); err != nil {
+				t.Fatal(err)
+			}
+			if len(agent.State().Messages()) != 2 || agent.Interrupted() == nil {
+				t.Fatal("restore lost completed results or interrupt reason")
+			}
+		})
+	}
+}
+
+func TestCanceledToolRunSavesCheckpoint(t *testing.T) {
+	saveErr := errors.New("checkpoint unavailable")
+	for _, test := range []struct {
+		name      string
+		skipSave  bool
+		appendErr error
+	}{
+		{name: "save"},
+		{name: "skip", skipSave: true},
+		{name: "save_failure", appendErr: saveErr},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			saver := &contextCheckingCheckpointSaver{MemoryCheckpointSaver: NewMemoryCheckpointSaver(), appendErr: test.appendErr}
+			agent, err := NewWithError(StubConfig(newInterruptProvider("cancel_tool"), WithCheckpoint(&CheckpointSettings{
+				Saver: saver, ThreadID: "canceled", SkipSaveOnTurnEnd: test.skipSave,
+			})))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer agent.Close()
+			agent.registry.Register(&Tool{
+				Name: "cancel_tool",
+				Func: func(context.Context, json.RawMessage) (any, error) {
+					cancel()
+					return "completed before cancellation", nil
+				},
+			})
+			_, err = agent.Run(ctx, "start")
+			if test.appendErr != nil {
+				if !errors.Is(err, test.appendErr) || agent.State().Status() != StatusError {
+					t.Fatalf("failed save: error=%v status=%s", err, agent.State().Status())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.skipSave {
+				if len(saver.All("canceled")) != 0 {
+					t.Fatal("SkipSaveOnTurnEnd was ignored")
+				}
+				return
+			}
+			if err := agent.RestoreLatestCheckpoint(context.Background(), "canceled"); err != nil {
+				t.Fatal(err)
+			}
+			messages := agent.State().Messages()
+			if agent.State().Status() != StatusFinished || len(messages) != 3 {
+				t.Fatalf("restored status=%s messages=%#v", agent.State().Status(), messages)
+			}
+			if messages[2].Content != "completed before cancellation" || messages[2].ToolCallID != "call_1" {
+				t.Fatalf("restored tool result = %#v", messages[2])
+			}
+		})
 	}
 }
 

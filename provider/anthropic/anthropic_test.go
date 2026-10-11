@@ -61,6 +61,53 @@ func TestProviderComplete_UsesStructuredOutputInstruction(t *testing.T) {
 	}
 }
 
+func TestProviderCacheUsage(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		name := "complete"
+		if streaming {
+			name = "stream"
+		}
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if streaming {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = w.Write([]byte("event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":4,\"cache_read_input_tokens\":10,\"cache_creation_input_tokens\":6}}}\n\nevent: message_delta\ndata: {\"usage\":{\"output_tokens\":3}}\n\nevent: message_stop\ndata: {}\n\n"))
+					return
+				}
+				_, _ = w.Write([]byte(`{"content":[],"usage":{"input_tokens":4,"output_tokens":3,"cache_read_input_tokens":10,"cache_creation_input_tokens":6}}`))
+			}))
+			defer srv.Close()
+			provider := New(Config{APIKey: "test", BaseURL: srv.URL, Client: srv.Client()})
+			req := &agentcore.ProviderRequest{Model: "test"}
+			var usage agentcore.TokenUsage
+			if streaming {
+				stream, err := provider.Stream(context.Background(), req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for delta := range stream {
+					if delta.Err != nil {
+						t.Fatal(delta.Err)
+					}
+					if delta.Usage != nil {
+						usage.Merge(*delta.Usage)
+					}
+				}
+			} else {
+				resp, err := provider.Complete(context.Background(), req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				usage = resp.Usage
+			}
+			want := agentcore.TokenUsage{PromptTokens: 20, CompletionTokens: 3, TotalTokens: 23, CacheReadTokens: 10, CacheWriteTokens: 6}
+			if usage != want {
+				t.Fatalf("usage=%#v, want %#v", usage, want)
+			}
+		})
+	}
+}
+
 func TestProviderComplete_SendsImageBlocks(t *testing.T) {
 	var gotBody map[string]any
 

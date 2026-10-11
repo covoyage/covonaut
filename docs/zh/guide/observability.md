@@ -50,4 +50,13 @@ cfg.Tracer = agentcore.NewOtelTracer(tracer)
 
 ## 运维数据 {#operational-data}
 
+`TokenUsage.PromptTokens` 包含缓存输入。`CacheReadTokens` 和 `CacheWriteTokens`
+是输入用量的明细，不应再次加到 `TotalTokens`。服务不支持或未返回的明细为零。
+Anthropic 和 Vertex 的输入用量会归一化为包含缓存读写的总输入量。
+同一请求的累计流式用量通过 `TokenUsage.Merge` 取最大值；会话用量则累加不同请求。
+不要用 `Merge` 累加多个请求，也不要直接传入服务特有的增量计数。
+
+OpenTelemetry 使用独立的 `agentcore.model.cache.token.usage` 记录缓存读写，
+以 `agentcore.cache.operation` 区分操作，不会再次计入 `gen_ai.client.token.usage`。
+
 建议关注调用延迟、token 用量、重试和切换频率、工具失败、压缩次数、队列积压及待审核任务。不要把完整提示词或每个会话 ID 都作为指标标签，否则会产生大量不同的时间序列。链路和审计记录可能包含用户数据，也需要脱敏和访问控制。

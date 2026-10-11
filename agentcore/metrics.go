@@ -83,7 +83,10 @@ func (m *modelMetricsMiddleware) Stream(ctx context.Context, req *ProviderReques
 		var terminalErr error
 		for delta := range stream {
 			if delta.Usage != nil {
-				usage = delta.Usage
+				if usage == nil {
+					usage = &TokenUsage{}
+				}
+				usage.Merge(*delta.Usage)
 			}
 			if delta.Err != nil {
 				terminalErr = delta.Err

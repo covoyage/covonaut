@@ -982,6 +982,14 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 			// Context cancellation during tool execution — exit cleanly.
 			if errors.Is(ctx.Err(), context.Canceled) {
 				a.state.SetStatus(StatusFinished)
+				checkpointCtx, cancelCheckpoint := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				checkpointErr := a.checkpointTurnEnd(checkpointCtx, turn)
+				cancelCheckpoint()
+				if checkpointErr != nil {
+					a.state.SetStatus(StatusError)
+					a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: checkpointErr})
+					return "", checkpointErr
+				}
 				a.emit(ctx, &AgentEndEvent{
 					baseEvent: newBase(EventAgentEnd),
 					AgentName: a.config.Name,
@@ -1488,7 +1496,7 @@ func (a *Agent) runStreamingWithProvider(ctx context.Context, provider Provider,
 			}
 
 			if delta.Usage != nil {
-				usage = *delta.Usage
+				usage.Merge(*delta.Usage)
 			}
 			if delta.FinishReason != "" {
 				finishReason = delta.FinishReason
@@ -1590,6 +1598,7 @@ func (a *Agent) executeToolCalls(ctx context.Context, calls []ToolCall) error {
 	}
 	results = offloadToolResults(ctx, a.config.ArtifactOffload, results)
 
+	var interruptReason *InterruptReason
 	for i, tc := range calls {
 		r := results[i]
 
@@ -1621,19 +1630,22 @@ func (a *Agent) executeToolCalls(ctx context.Context, calls []ToolCall) error {
 			return err
 		}
 
-		if IsInterrupt(r.Err) {
-			a.interrupted = &InterruptReason{
+		if IsInterrupt(r.Err) && interruptReason == nil {
+			interruptReason = &InterruptReason{
 				ToolCallID: tc.ID,
 				ToolName:   tc.Name,
 				Reason:     InterruptMessage(r.Err),
 				Data:       InterruptData(r.Err),
 			}
-			a.state.SetInterruptReason(a.interrupted)
-			if err := a.appendCheckpoint(ctx); err != nil {
-				return err
-			}
-			return ErrInterrupt
 		}
+	}
+	if interruptReason != nil {
+		a.interrupted = interruptReason
+		a.state.SetInterruptReason(interruptReason)
+		if err := a.appendCheckpoint(ctx); err != nil {
+			return err
+		}
+		return ErrInterrupt
 	}
 	return nil
 }

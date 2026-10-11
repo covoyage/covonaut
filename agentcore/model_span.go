@@ -53,6 +53,8 @@ func modelResponseAttrs(req *ProviderRequest, usage *TokenUsage, finishReason, c
 		attrs = append(attrs,
 			Attr("gen_ai.usage.input_tokens", usage.PromptTokens),
 			Attr("gen_ai.usage.output_tokens", usage.CompletionTokens),
+			Attr("gen_ai.usage.cache_read.input_tokens", usage.CacheReadTokens),
+			Attr("gen_ai.usage.cache_creation.input_tokens", usage.CacheWriteTokens),
 			Attr("gen_ai.usage.total_tokens", usage.TotalTokens),
 		)
 	}
@@ -104,7 +106,10 @@ func (m *modelSpanMiddleware) Stream(ctx context.Context, req *ProviderRequest) 
 		var finishReason, content string
 		for delta := range stream {
 			if delta.Usage != nil {
-				usage = delta.Usage
+				if usage == nil {
+					usage = &TokenUsage{}
+				}
+				usage.Merge(*delta.Usage)
 			}
 			if delta.FinishReason != "" {
 				finishReason = delta.FinishReason

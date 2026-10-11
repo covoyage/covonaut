@@ -103,18 +103,18 @@ func (p *anthropicVertex) Close() error { return nil }
 
 // vertexAnthropicRequest mirrors the Anthropic Messages API format.
 type vertexAnthropicRequest struct {
-	Model        string           `json:"model"`
-	Messages     []vertexMessage  `json:"messages"`
-	System       string           `json:"system,omitempty"`
-	MaxTokens    int64            `json:"max_tokens"`
-	Temperature  *float64         `json:"temperature,omitempty"`
-	Stream       bool             `json:"stream,omitempty"`
-	Thinking     *vertexThinking  `json:"thinking,omitempty"`
+	Model       string          `json:"model"`
+	Messages    []vertexMessage `json:"messages"`
+	System      string          `json:"system,omitempty"`
+	MaxTokens   int64           `json:"max_tokens"`
+	Temperature *float64        `json:"temperature,omitempty"`
+	Stream      bool            `json:"stream,omitempty"`
+	Thinking    *vertexThinking `json:"thinking,omitempty"`
 }
 
 type vertexMessage struct {
-	Role    string              `json:"role"`
-	Content json.RawMessage     `json:"content"`
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
 }
 
 type vertexThinking struct {
@@ -130,11 +130,8 @@ type vertexAnthropicResponse struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	} `json:"content"`
-	StopReason string `json:"stop_reason"`
-	Usage      struct {
-		InputTokens  int64 `json:"input_tokens"`
-		OutputTokens int64 `json:"output_tokens"`
-	} `json:"usage"`
+	StopReason string      `json:"stop_reason"`
+	Usage      vertexUsage `json:"usage"`
 }
 
 func (p *anthropicVertex) call(ctx context.Context, req *agentcore.ProviderRequest, stream bool) (*agentcore.ProviderResponse, error) {
@@ -172,15 +169,9 @@ func (p *anthropicVertex) call(ctx context.Context, req *agentcore.ProviderReque
 
 	return &agentcore.ProviderResponse{
 		Content: strings.Join(textParts, ""),
-		Usage: agentcore.TokenUsage{
-			PromptTokens:     vr.Usage.InputTokens,
-			CompletionTokens: vr.Usage.OutputTokens,
-			TotalTokens:      vr.Usage.InputTokens + vr.Usage.OutputTokens,
-		},
+		Usage:   vr.Usage.tokenUsage(),
 	}, nil
 }
-
-
 
 func (p *anthropicVertex) endpoint(model string) string {
 	return fmt.Sprintf("https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/publishers/anthropic/models/%s:streamRawPredict",
@@ -232,9 +223,9 @@ func (p *anthropicVertex) buildRequest(req *agentcore.ProviderRequest, stream bo
 // --- Anthropic Vertex SSE streaming types ---
 
 type vertexAnthropicContentBlockStart struct {
-	Type         string                           `json:"type"`
-	Index        int64                            `json:"index"`
-	ContentBlock vertexAnthropicContentBlock      `json:"content_block"`
+	Type         string                      `json:"type"`
+	Index        int64                       `json:"index"`
+	ContentBlock vertexAnthropicContentBlock `json:"content_block"`
 }
 
 type vertexAnthropicContentBlock struct {
@@ -270,8 +261,15 @@ type vertexDeltaField struct {
 }
 
 type vertexUsage struct {
-	InputTokens  int64 `json:"input_tokens"`
-	OutputTokens int64 `json:"output_tokens"`
+	InputTokens      int64 `json:"input_tokens"`
+	OutputTokens     int64 `json:"output_tokens"`
+	CacheReadTokens  int64 `json:"cache_read_input_tokens"`
+	CacheWriteTokens int64 `json:"cache_creation_input_tokens"`
+}
+
+func (u vertexUsage) tokenUsage() agentcore.TokenUsage {
+	prompt := u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens
+	return agentcore.TokenUsage{PromptTokens: prompt, CompletionTokens: u.OutputTokens, TotalTokens: prompt + u.OutputTokens, CacheReadTokens: u.CacheReadTokens, CacheWriteTokens: u.CacheWriteTokens}
 }
 
 func (p *anthropicVertex) callStream(ctx context.Context, req *agentcore.ProviderRequest) (<-chan agentcore.StreamDelta, error) {
@@ -316,6 +314,21 @@ func (p *anthropicVertex) callStream(ctx context.Context, req *agentcore.Provide
 			data := strings.TrimPrefix(line, "data: ")
 
 			switch eventType {
+			case "message_start":
+				var ev struct {
+					Message struct {
+						Usage vertexUsage `json:"usage"`
+					} `json:"message"`
+				}
+				if err := json.Unmarshal([]byte(data), &ev); err != nil {
+					continue
+				}
+				usage := ev.Message.Usage.tokenUsage()
+				select {
+				case ch <- agentcore.StreamDelta{Usage: &usage}:
+				case <-ctx.Done():
+					return
+				}
 			case "content_block_start":
 				var ev vertexAnthropicContentBlockStart
 				if err := json.Unmarshal([]byte(data), &ev); err != nil {
@@ -394,11 +407,9 @@ func (p *anthropicVertex) callStream(ctx context.Context, req *agentcore.Provide
 					continue
 				}
 				if ev.Usage.OutputTokens > 0 {
+					usage := ev.Usage.tokenUsage()
 					sd := agentcore.StreamDelta{
-						Usage: &agentcore.TokenUsage{
-							CompletionTokens: ev.Usage.OutputTokens,
-							TotalTokens:      ev.Usage.InputTokens + ev.Usage.OutputTokens,
-						},
+						Usage: &usage,
 					}
 					select {
 					case ch <- sd:

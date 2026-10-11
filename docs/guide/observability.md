@@ -69,6 +69,18 @@ Retries count additional invocations. Streaming can fail after output starts,
 so track terminal errors as well as connection errors. Usage may be absent when
 the provider cannot report it.
 
+`TokenUsage.PromptTokens` includes cached input. `CacheReadTokens` and
+`CacheWriteTokens` are input breakdowns, not additional tokens to add to
+`TotalTokens`. Unsupported or unreported details remain zero. Anthropic and
+Vertex input usage is normalized to include cache reads and writes. Within a
+request, `TokenUsage.Merge` takes the maximum of cumulative stream values;
+session usage sums separate requests. Merge must not be used to sum requests
+or provider-specific incremental counters.
+
+OpenTelemetry records cache reads and writes separately in
+`agentcore.model.cache.token.usage`, labeled by `agentcore.cache.operation`,
+without adding them again to `gen_ai.client.token.usage`.
+
 ## Operational Data
 
 Track latency, token usage, retry/failover rates, tool failures, compaction,

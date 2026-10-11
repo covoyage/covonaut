@@ -125,6 +125,8 @@ func (s *AgentState) AddUsage(usage TokenUsage) {
 	defer s.mu.Unlock()
 	s.totalUsage.PromptTokens += usage.PromptTokens
 	s.totalUsage.CompletionTokens += usage.CompletionTokens
+	s.totalUsage.CacheReadTokens += usage.CacheReadTokens
+	s.totalUsage.CacheWriteTokens += usage.CacheWriteTokens
 	s.totalUsage.TotalTokens += usage.TotalTokens
 }
 

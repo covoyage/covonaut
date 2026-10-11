@@ -175,9 +175,13 @@ type chatChoice struct {
 }
 
 type chatUsage struct {
-	PromptTokens     int64 `json:"prompt_tokens"`
-	CompletionTokens int64 `json:"completion_tokens"`
-	TotalTokens      int64 `json:"total_tokens"`
+	PromptTokens        int64 `json:"prompt_tokens"`
+	CompletionTokens    int64 `json:"completion_tokens"`
+	TotalTokens         int64 `json:"total_tokens"`
+	PromptTokensDetails struct {
+		CachedTokens     int64 `json:"cached_tokens"`
+		CacheWriteTokens int64 `json:"cache_write_tokens"`
+	} `json:"prompt_tokens_details"`
 }
 
 type chatChunk struct {
@@ -364,6 +368,8 @@ func (p *Provider) Complete(ctx context.Context, req *agentcore.ProviderRequest)
 			PromptTokens:     chatResp.Usage.PromptTokens,
 			CompletionTokens: chatResp.Usage.CompletionTokens,
 			TotalTokens:      chatResp.Usage.TotalTokens,
+			CacheReadTokens:  chatResp.Usage.PromptTokensDetails.CachedTokens,
+			CacheWriteTokens: chatResp.Usage.PromptTokensDetails.CacheWriteTokens,
 		},
 		FinishReason: choice.FinishReason,
 	}
@@ -437,6 +443,8 @@ func (p *Provider) Stream(ctx context.Context, req *agentcore.ProviderRequest) (
 						PromptTokens:     chunk.Usage.PromptTokens,
 						CompletionTokens: chunk.Usage.CompletionTokens,
 						TotalTokens:      chunk.Usage.TotalTokens,
+						CacheReadTokens:  chunk.Usage.PromptTokensDetails.CachedTokens,
+						CacheWriteTokens: chunk.Usage.PromptTokensDetails.CacheWriteTokens,
 					},
 				}
 				select {

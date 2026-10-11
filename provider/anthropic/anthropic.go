@@ -77,16 +77,16 @@ type apiMessage struct {
 }
 
 type contentBlock struct {
-	Type         string                   `json:"type"`
-	Text         string                   `json:"text,omitempty"`         // text block
-	Thinking     string                   `json:"thinking,omitempty"`     // thinking block
-	Signature    string                   `json:"signature,omitempty"`    // thinking block integrity signature
-	Source       *imageSource             `json:"source,omitempty"`       // image block
-	ID           string                   `json:"id,omitempty"`           // tool_use
-	Name         string                   `json:"name,omitempty"`         // tool_use
-	Input        any                      `json:"input,omitempty"`        // tool_use
-	ToolUseID    string                   `json:"tool_use_id,omitempty"`  // tool_result
-	Content      any                      `json:"content,omitempty"`      // tool_result body: string, or multipart parts when the result carries images
+	Type         string                        `json:"type"`
+	Text         string                        `json:"text,omitempty"`        // text block
+	Thinking     string                        `json:"thinking,omitempty"`    // thinking block
+	Signature    string                        `json:"signature,omitempty"`   // thinking block integrity signature
+	Source       *imageSource                  `json:"source,omitempty"`      // image block
+	ID           string                        `json:"id,omitempty"`          // tool_use
+	Name         string                        `json:"name,omitempty"`        // tool_use
+	Input        any                           `json:"input,omitempty"`       // tool_use
+	ToolUseID    string                        `json:"tool_use_id,omitempty"` // tool_result
+	Content      any                           `json:"content,omitempty"`     // tool_result body: string, or multipart parts when the result carries images
 	CacheControl *agentcore.CacheControlMarker `json:"cache_control,omitempty"`
 }
 
@@ -110,8 +110,15 @@ type apiResponse struct {
 }
 
 type apiUsage struct {
-	InputTokens  int64 `json:"input_tokens"`
-	OutputTokens int64 `json:"output_tokens"`
+	InputTokens      int64 `json:"input_tokens"`
+	OutputTokens     int64 `json:"output_tokens"`
+	CacheReadTokens  int64 `json:"cache_read_input_tokens"`
+	CacheWriteTokens int64 `json:"cache_creation_input_tokens"`
+}
+
+func (u apiUsage) tokenUsage() agentcore.TokenUsage {
+	prompt := u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens
+	return agentcore.TokenUsage{PromptTokens: prompt, CompletionTokens: u.OutputTokens, TotalTokens: prompt + u.OutputTokens, CacheReadTokens: u.CacheReadTokens, CacheWriteTokens: u.CacheWriteTokens}
 }
 
 // --- streaming wire types ---
@@ -403,6 +410,19 @@ func (p *Provider) Stream(ctx context.Context, req *agentcore.ProviderRequest) (
 			data := strings.TrimPrefix(line, "data: ")
 
 			switch eventType {
+			case "message_start":
+				var ev struct {
+					Message apiResponse `json:"message"`
+				}
+				if err := json.Unmarshal([]byte(data), &ev); err != nil {
+					continue
+				}
+				usage := ev.Message.Usage.tokenUsage()
+				select {
+				case ch <- agentcore.StreamDelta{Usage: &usage}:
+				case <-ctx.Done():
+					return
+				}
 			case "content_block_start":
 				var ev contentBlockStartData
 				if err := json.Unmarshal([]byte(data), &ev); err != nil {
@@ -487,11 +507,9 @@ func (p *Provider) Stream(ctx context.Context, req *agentcore.ProviderRequest) (
 					continue
 				}
 				if ev.Usage.OutputTokens > 0 {
+					usage := ev.Usage.tokenUsage()
 					sd := agentcore.StreamDelta{
-						Usage: &agentcore.TokenUsage{
-							CompletionTokens: ev.Usage.OutputTokens,
-							TotalTokens:      ev.Usage.InputTokens + ev.Usage.OutputTokens,
-						},
+						Usage: &usage,
 					}
 					select {
 					case ch <- sd:
@@ -552,11 +570,7 @@ func (p *Provider) buildRequest(req *agentcore.ProviderRequest, stream bool) api
 
 func (p *Provider) parseResponse(resp apiResponse, format *agentcore.ResponseFormat) *agentcore.ProviderResponse {
 	pr := &agentcore.ProviderResponse{
-		Usage: agentcore.TokenUsage{
-			PromptTokens:     resp.Usage.InputTokens,
-			CompletionTokens: resp.Usage.OutputTokens,
-			TotalTokens:      resp.Usage.InputTokens + resp.Usage.OutputTokens,
-		},
+		Usage: resp.Usage.tokenUsage(),
 	}
 
 	var textParts []string

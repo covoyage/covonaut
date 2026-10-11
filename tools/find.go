@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/covoyage/covonaut/agentcore"
@@ -49,7 +50,7 @@ func (d DefaultFindOperations) Glob(pattern string, cwd string, ignore []string,
 		if matched {
 			results = append(results, path)
 			if len(results) >= limit {
-				return filepath.SkipDir
+				return filepath.SkipAll
 			}
 		}
 		return nil
@@ -141,7 +142,7 @@ func NewFindTool(cwd string, cfg *FindToolConfig) *agentcore.Tool {
 }
 
 func runFd(ctx context.Context, fdPath, searchPath, pattern string, limit int, cfg *FindToolConfig) (any, error) {
-	args := []string{"--glob", "--color=never", "--hidden", "--max-results", fmt.Sprintf("%d", limit)}
+	args := []string{"--glob", "--color=never", "--hidden"}
 
 	// Collect .gitignore files.
 	gitignoreFiles := []string{}
@@ -204,6 +205,10 @@ func formatFindResults(results []string, searchPath string, limit int, cfg *Find
 		relativized = append(relativized, filepath.ToSlash(relPath))
 	}
 
+	sort.Strings(relativized)
+	if len(relativized) > limit {
+		relativized = relativized[:limit]
+	}
 	rawOutput := strings.Join(relativized, "\n")
 	truncation := TruncateHead(rawOutput, TruncationOptions{MaxBytes: int(cfg.MaxBytes), MaxLines: 1<<31 - 1})
 	output := truncation.Content

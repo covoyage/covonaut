@@ -15,22 +15,22 @@ import (
 type APIProtocol string
 
 const (
-	APIProtocolChat     APIProtocol = ""
+	APIProtocolChat      APIProtocol = ""
 	APIProtocolResponses APIProtocol = "responses"
 )
 
 type responsesRequest struct {
-	Model              string                `json:"model"`
-	Input              any                   `json:"input"`
-	Instructions       string                `json:"instructions,omitempty"`
-	Tools              []responsesTool       `json:"tools,omitempty"`
-	Stream             bool                  `json:"stream,omitempty"`
-	Temperature        *float64              `json:"temperature,omitempty"`
-	MaxOutputTokens    *int64                `json:"max_output_tokens,omitempty"`
-	Text               *responsesTextConfig  `json:"text,omitempty"`
-	PreviousResponseID string                `json:"previous_response_id,omitempty"`
-	Store              *bool                 `json:"store,omitempty"`
-	Reasoning          *responsesReasoning   `json:"reasoning,omitempty"`
+	Model              string               `json:"model"`
+	Input              any                  `json:"input"`
+	Instructions       string               `json:"instructions,omitempty"`
+	Tools              []responsesTool      `json:"tools,omitempty"`
+	Stream             bool                 `json:"stream,omitempty"`
+	Temperature        *float64             `json:"temperature,omitempty"`
+	MaxOutputTokens    *int64               `json:"max_output_tokens,omitempty"`
+	Text               *responsesTextConfig `json:"text,omitempty"`
+	PreviousResponseID string               `json:"previous_response_id,omitempty"`
+	Store              *bool                `json:"store,omitempty"`
+	Reasoning          *responsesReasoning  `json:"reasoning,omitempty"`
 }
 
 type responsesTextConfig struct {
@@ -38,10 +38,10 @@ type responsesTextConfig struct {
 }
 
 type responsesTextFormat struct {
-	Type       string         `json:"type"`
-	Name       string         `json:"name,omitempty"`
-	Strict     bool           `json:"strict,omitempty"`
-	Schema     map[string]any `json:"schema,omitempty"`
+	Type   string         `json:"type"`
+	Name   string         `json:"name,omitempty"`
+	Strict bool           `json:"strict,omitempty"`
+	Schema map[string]any `json:"schema,omitempty"`
 }
 
 type responsesReasoning struct {
@@ -49,9 +49,9 @@ type responsesReasoning struct {
 }
 
 type responsesTool struct {
-	Type     string               `json:"type"`
-	Name     string               `json:"name,omitempty"`
-	Function *responsesToolFunc   `json:"function,omitempty"`
+	Type     string             `json:"type"`
+	Name     string             `json:"name,omitempty"`
+	Function *responsesToolFunc `json:"function,omitempty"`
 }
 
 type responsesToolFunc struct {
@@ -79,12 +79,12 @@ type responsesFunctionCallOutput struct {
 }
 
 type responsesResponse struct {
-	ID     string               `json:"id"`
-	Object string               `json:"object"`
-	Status string               `json:"status"`
+	ID     string                `json:"id"`
+	Object string                `json:"object"`
+	Status string                `json:"status"`
 	Output []responsesOutputItem `json:"output"`
-	Usage  *responsesUsage      `json:"usage,omitempty"`
-	Error  *responsesError      `json:"error,omitempty"`
+	Usage  *responsesUsage       `json:"usage,omitempty"`
+	Error  *responsesError       `json:"error,omitempty"`
 }
 
 type responsesError struct {
@@ -93,14 +93,14 @@ type responsesError struct {
 }
 
 type responsesOutputItem struct {
-	Type      string                    `json:"type"`
-	ID        string                    `json:"id,omitempty"`
-	Status    string                    `json:"status,omitempty"`
-	Role      string                    `json:"role,omitempty"`
-	Content   []responsesOutputContent  `json:"content,omitempty"`
-	Name      string                    `json:"name,omitempty"`
-	CallID    string                    `json:"call_id,omitempty"`
-	Arguments string                    `json:"arguments,omitempty"`
+	Type      string                   `json:"type"`
+	ID        string                   `json:"id,omitempty"`
+	Status    string                   `json:"status,omitempty"`
+	Role      string                   `json:"role,omitempty"`
+	Content   []responsesOutputContent `json:"content,omitempty"`
+	Name      string                   `json:"name,omitempty"`
+	CallID    string                   `json:"call_id,omitempty"`
+	Arguments string                   `json:"arguments,omitempty"`
 }
 
 type responsesOutputContent struct {
@@ -109,17 +109,22 @@ type responsesOutputContent struct {
 }
 
 type responsesUsage struct {
-	InputTokens  int64 `json:"input_tokens"`
-	OutputTokens int64 `json:"output_tokens"`
-	TotalTokens  int64 `json:"total_tokens"`
+	InputTokens        int64 `json:"input_tokens"`
+	OutputTokens       int64 `json:"output_tokens"`
+	TotalTokens        int64 `json:"total_tokens"`
+	InputTokensDetails struct {
+		CachedTokens     int64 `json:"cached_tokens"`
+		CacheWriteTokens int64 `json:"cache_write_tokens"`
+	} `json:"input_tokens_details"`
 }
 
 type responsesStreamEvent struct {
-	Type   string          `json:"type"`
-	Delta  string          `json:"delta,omitempty"`
-	Item   json.RawMessage `json:"item,omitempty"`
-	Output json.RawMessage `json:"output,omitempty"`
-	Usage  *responsesUsage `json:"usage,omitempty"`
+	Type     string             `json:"type"`
+	Response *responsesResponse `json:"response,omitempty"`
+	Delta    string             `json:"delta,omitempty"`
+	Item     json.RawMessage    `json:"item,omitempty"`
+	Output   json.RawMessage    `json:"output,omitempty"`
+	Usage    *responsesUsage    `json:"usage,omitempty"`
 }
 
 func ToResponsesInput(msgs []agentcore.Message) any {
@@ -297,10 +302,10 @@ func (p *Provider) streamResponses(ctx context.Context, req *agentcore.ProviderR
 		defer close(ch)
 
 		var currentFunctionCall struct {
-			ID       string
-			CallID   string
-			Name     string
-			ArgsBuf  strings.Builder
+			ID      string
+			CallID  string
+			Name    string
+			ArgsBuf strings.Builder
 		}
 
 		scanner := bufio.NewScanner(httpResp.Body)
@@ -388,12 +393,17 @@ func (p *Provider) streamResponses(ctx context.Context, req *agentcore.ProviderR
 				}
 
 			case "response.completed":
+				if evt.Usage == nil && evt.Response != nil {
+					evt.Usage = evt.Response.Usage
+				}
 				if evt.Usage != nil {
 					sd := agentcore.StreamDelta{
 						Usage: &agentcore.TokenUsage{
 							PromptTokens:     evt.Usage.InputTokens,
 							CompletionTokens: evt.Usage.OutputTokens,
 							TotalTokens:      evt.Usage.TotalTokens,
+							CacheReadTokens:  evt.Usage.InputTokensDetails.CachedTokens,
+							CacheWriteTokens: evt.Usage.InputTokensDetails.CacheWriteTokens,
 						},
 					}
 					select {
@@ -449,6 +459,8 @@ func (p *Provider) convertResponsesOutput(resp *responsesResponse, req *agentcor
 			PromptTokens:     resp.Usage.InputTokens,
 			CompletionTokens: resp.Usage.OutputTokens,
 			TotalTokens:      resp.Usage.TotalTokens,
+			CacheReadTokens:  resp.Usage.InputTokensDetails.CachedTokens,
+			CacheWriteTokens: resp.Usage.InputTokensDetails.CacheWriteTokens,
 		}
 	}
 

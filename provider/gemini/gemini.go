@@ -132,9 +132,10 @@ type candidate struct {
 }
 
 type usageMetadata struct {
-	PromptTokenCount     int64 `json:"promptTokenCount"`
-	CandidatesTokenCount int64 `json:"candidatesTokenCount"`
-	TotalTokenCount      int64 `json:"totalTokenCount"`
+	PromptTokenCount        int64 `json:"promptTokenCount"`
+	CandidatesTokenCount    int64 `json:"candidatesTokenCount"`
+	TotalTokenCount         int64 `json:"totalTokenCount"`
+	CachedContentTokenCount int64 `json:"cachedContentTokenCount"`
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +374,7 @@ func (p *Provider) Stream(ctx context.Context, req *agentcore.ProviderRequest) (
 					sd := agentcore.StreamDelta{
 						Usage: &agentcore.TokenUsage{
 							PromptTokens:     chunk.UsageMetadata.PromptTokenCount,
+							CacheReadTokens:  chunk.UsageMetadata.CachedContentTokenCount,
 							CompletionTokens: chunk.UsageMetadata.CandidatesTokenCount,
 							TotalTokens:      chunk.UsageMetadata.TotalTokenCount,
 						},
@@ -427,6 +429,7 @@ func (p *Provider) Stream(ctx context.Context, req *agentcore.ProviderRequest) (
 			if chunk.UsageMetadata != nil {
 				sd.Usage = &agentcore.TokenUsage{
 					PromptTokens:     chunk.UsageMetadata.PromptTokenCount,
+					CacheReadTokens:  chunk.UsageMetadata.CachedContentTokenCount,
 					CompletionTokens: chunk.UsageMetadata.CandidatesTokenCount,
 					TotalTokens:      chunk.UsageMetadata.TotalTokenCount,
 				}
@@ -519,6 +522,7 @@ func (p *Provider) parseResponse(resp generateResponse, format *agentcore.Respon
 	if resp.UsageMetadata != nil {
 		pr.Usage = agentcore.TokenUsage{
 			PromptTokens:     resp.UsageMetadata.PromptTokenCount,
+			CacheReadTokens:  resp.UsageMetadata.CachedContentTokenCount,
 			CompletionTokens: resp.UsageMetadata.CandidatesTokenCount,
 			TotalTokens:      resp.UsageMetadata.TotalTokenCount,
 		}

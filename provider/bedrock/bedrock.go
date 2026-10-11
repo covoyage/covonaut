@@ -68,14 +68,16 @@ type converseResponse struct {
 			Content json.RawMessage `json:"content"`
 		} `json:"message"`
 	} `json:"output"`
-	StopReason string       `json:"stopReason"`
+	StopReason string        `json:"stopReason"`
 	Usage      converseUsage `json:"usage"`
 }
 
 type converseUsage struct {
-	InputTokens  int64 `json:"inputTokens"`
-	OutputTokens int64 `json:"outputTokens"`
-	TotalTokens  int64 `json:"totalTokens"`
+	InputTokens      int64 `json:"inputTokens"`
+	OutputTokens     int64 `json:"outputTokens"`
+	TotalTokens      int64 `json:"totalTokens"`
+	CacheReadTokens  int64 `json:"cacheReadInputTokens"`
+	CacheWriteTokens int64 `json:"cacheWriteInputTokens"`
 }
 
 func (p *bedrockProvider) converse(ctx context.Context, req *agentcore.ProviderRequest) (*agentcore.ProviderResponse, error) {
@@ -106,6 +108,8 @@ func (p *bedrockProvider) converse(ctx context.Context, req *agentcore.ProviderR
 			PromptTokens:     cr.Usage.InputTokens,
 			CompletionTokens: cr.Usage.OutputTokens,
 			TotalTokens:      cr.Usage.TotalTokens,
+			CacheReadTokens:  cr.Usage.CacheReadTokens,
+			CacheWriteTokens: cr.Usage.CacheWriteTokens,
 		},
 	}, nil
 }
@@ -165,6 +169,8 @@ func (p *bedrockProvider) converseStream(ctx context.Context, req *agentcore.Pro
 						PromptTokens:     ev.Metadata.Usage.InputTokens,
 						CompletionTokens: ev.Metadata.Usage.OutputTokens,
 						TotalTokens:      ev.Metadata.Usage.TotalTokens,
+						CacheReadTokens:  ev.Metadata.Usage.CacheReadTokens,
+						CacheWriteTokens: ev.Metadata.Usage.CacheWriteTokens,
 					},
 				}
 			}

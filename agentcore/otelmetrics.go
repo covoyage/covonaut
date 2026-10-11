@@ -42,11 +42,16 @@ func NewOtelMetrics(meter metric.Meter) Metrics {
 	if err != nil {
 		errors, _ = meter.Int64Counter("agentcore.errors")
 	}
-	return &otelMetrics{tokenUsage: tokenUsage, opDuration: opDuration, errors: errors}
+	cacheUsage, err := meter.Int64Counter("agentcore.model.cache.token.usage", metric.WithUnit("{token}"))
+	if err != nil {
+		cacheUsage, _ = meter.Int64Counter("agentcore.model.cache.token.usage")
+	}
+	return &otelMetrics{tokenUsage: tokenUsage, cacheUsage: cacheUsage, opDuration: opDuration, errors: errors}
 }
 
 type otelMetrics struct {
 	tokenUsage metric.Int64Counter
+	cacheUsage metric.Int64Counter
 	opDuration metric.Float64Histogram
 	errors     metric.Int64Counter
 }
@@ -61,6 +66,12 @@ func (m *otelMetrics) RecordModelCall(ctx context.Context, req *ProviderRequest,
 	}
 
 	if usage != nil {
+		if usage.CacheReadTokens > 0 {
+			m.cacheUsage.Add(ctx, usage.CacheReadTokens, metric.WithAttributes(append(base, attribute.String("agentcore.cache.operation", "read"))...))
+		}
+		if usage.CacheWriteTokens > 0 {
+			m.cacheUsage.Add(ctx, usage.CacheWriteTokens, metric.WithAttributes(append(base, attribute.String("agentcore.cache.operation", "write"))...))
+		}
 		if usage.PromptTokens > 0 {
 			m.tokenUsage.Add(ctx, usage.PromptTokens,
 				metric.WithAttributes(append(base, attribute.String("gen_ai.token.type", "input"))...))

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -589,6 +591,35 @@ func TestFindToolLimit(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestQueryFormattingSortsBeforeLimit(t *testing.T) {
+	dir := t.TempDir()
+	findConfig := &FindToolConfig{MaxBytes: 1024}
+	output, err := formatFindResults([]string{filepath.Join(dir, "z.go"), filepath.Join(dir, "a.go")}, dir, 1, findConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := output.(ToolResult).Content; !strings.HasPrefix(got, "a.go\n\n[") || strings.Contains(got, "z.go") {
+		t.Fatalf("find=%s", got)
+	}
+	grepConfig := &GrepToolConfig{MaxBytes: 1024, MaxLineLength: 100, Operations: &mockGrepOps{
+		readFileFunc: func(string) (string, error) { return "first\nsecond", nil },
+	}}
+	output, err = formatGrepMatches([]struct {
+		filePath string
+		lineNum  int
+	}{
+		{filepath.Join(dir, "z", "a.go"), 1},
+		{filepath.Join(dir, "a", "z.go"), 2},
+		{filepath.Join(dir, "a", "z.go"), 1},
+	}, dir, GrepToolInput{}, 2, true, grepConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := output.(ToolResult).Content; !strings.HasPrefix(got, "a/z.go:1: first\na/z.go:2: second") || strings.Contains(got, "z/a.go") {
+		t.Fatalf("grep=%s", got)
 	}
 }
 

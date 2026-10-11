@@ -68,3 +68,47 @@ func TestGlobToolLimit(t *testing.T) {
 		t.Errorf("expected limit notice, got: %s", r.Content)
 	}
 }
+
+func TestDefaultQueriesStopAtGlobalLimit(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"a/first.go", "b/second.go", "z.go"} {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("match"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	glob, err := (DefaultGlobOperations{}).Glob("*.go", dir, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(glob) != 1 || glob[0] != filepath.Join("a", "first.go") {
+		t.Fatalf("glob=%v", glob)
+	}
+	find, err := (DefaultFindOperations{}).Glob("*.go", dir, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(find) != 1 || find[0] != filepath.Join(dir, "a", "first.go") {
+		t.Fatalf("find=%v", find)
+	}
+}
+
+type unorderedGlobOperations struct{}
+
+func (unorderedGlobOperations) Glob(string, string, int) ([]string, error) {
+	return []string{"z.go", "a.go", "m.go"}, nil
+}
+
+func TestGlobSortsCustomResultsBeforeLimit(t *testing.T) {
+	tool := NewGlobTool(t.TempDir(), &GlobToolConfig{Operations: unorderedGlobOperations{}, Limit: 1})
+	output, err := tool.Func(context.Background(), json.RawMessage(`{"pattern":"*.go"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := output.(ToolResult).Content; !strings.HasPrefix(got, "a.go\n\n[") || strings.Contains(got, "z.go") {
+		t.Fatalf("glob=%s", got)
+	}
+}

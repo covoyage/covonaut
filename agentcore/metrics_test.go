@@ -25,6 +25,8 @@ type modelCall struct {
 	model            string
 	promptTokens     int64
 	completionTokens int64
+	cacheReadTokens  int64
+	cacheWriteTokens int64
 	durationRecorded bool
 }
 
@@ -40,6 +42,8 @@ func (r *recordingMetrics) RecordModelCall(_ context.Context, req *ProviderReque
 	if usage != nil {
 		mc.promptTokens = usage.PromptTokens
 		mc.completionTokens = usage.CompletionTokens
+		mc.cacheReadTokens = usage.CacheReadTokens
+		mc.cacheWriteTokens = usage.CacheWriteTokens
 	}
 	r.modelCalls = append(r.modelCalls, mc)
 }
@@ -64,8 +68,10 @@ func (u *usageProvider) Complete(_ context.Context, _ *ProviderRequest) (*Provid
 }
 
 func (u *usageProvider) Stream(_ context.Context, _ *ProviderRequest) (<-chan StreamDelta, error) {
-	ch := make(chan StreamDelta, 2)
-	ch <- StreamDelta{Content: "ok", Usage: &TokenUsage{PromptTokens: 50, CompletionTokens: 10}}
+	ch := make(chan StreamDelta, 4)
+	ch <- StreamDelta{Content: "ok", Usage: &TokenUsage{PromptTokens: 50, CacheReadTokens: 20, CacheWriteTokens: 5}}
+	ch <- StreamDelta{Usage: &TokenUsage{PromptTokens: 50, CacheReadTokens: 20, CacheWriteTokens: 5}}
+	ch <- StreamDelta{Usage: &TokenUsage{CompletionTokens: 10}}
 	ch <- StreamDelta{Done: true}
 	close(ch)
 	return ch, nil
@@ -122,6 +128,9 @@ func TestNewModelMetricsMiddlewareRecordsStream(t *testing.T) {
 	rec.mu.Unlock()
 	if mc.promptTokens != 50 || mc.completionTokens != 10 {
 		t.Errorf("tokens = %d/%d, want 50/10", mc.promptTokens, mc.completionTokens)
+	}
+	if mc.cacheReadTokens != 20 || mc.cacheWriteTokens != 5 {
+		t.Fatalf("cache tokens=%d/%d", mc.cacheReadTokens, mc.cacheWriteTokens)
 	}
 	if len(errs) != 0 {
 		t.Errorf("unexpected errors: %v", errs)
@@ -235,7 +244,7 @@ func TestNewOtelMetricsSemantics(t *testing.T) {
 	metrics := NewOtelMetrics(mp.Meter("test"))
 	req := &ProviderRequest{Model: "gpt-4o"}
 	metrics.RecordModelCall(context.Background(), req,
-		&TokenUsage{PromptTokens: 100, CompletionTokens: 25}, time.Now().Add(-2*time.Second))
+		&TokenUsage{PromptTokens: 100, CompletionTokens: 25, CacheReadTokens: 40, CacheWriteTokens: 10}, time.Now().Add(-2*time.Second))
 	metrics.RecordError(context.Background(), "tool", errors.New("boom"))
 
 	var rm metricdata.ResourceMetrics
@@ -245,11 +254,17 @@ func TestNewOtelMetricsSemantics(t *testing.T) {
 
 	got := map[string]bool{}
 	var tokenPoints int
+	cacheValues := map[string]int64{}
 	var errComponent string
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
 			got[m.Name] = true
 			switch m.Name {
+			case "agentcore.model.cache.token.usage":
+				for _, point := range m.Data.(metricdata.Sum[int64]).DataPoints {
+					operation, _ := point.Attributes.Value(attribute.Key("agentcore.cache.operation"))
+					cacheValues[operation.AsString()] = point.Value
+				}
 			case "gen_ai.client.token.usage":
 				sum := m.Data.(metricdata.Sum[int64])
 				for _, dp := range sum.DataPoints {
@@ -282,6 +297,9 @@ func TestNewOtelMetricsSemantics(t *testing.T) {
 	}
 	if tokenPoints != 2 {
 		t.Errorf("token data points = %d, want 2 (input+output)", tokenPoints)
+	}
+	if cacheValues["read"] != 40 || cacheValues["write"] != 10 {
+		t.Fatalf("cache metrics=%v", cacheValues)
 	}
 	if errComponent != "tool" {
 		t.Errorf("error component = %q, want tool", errComponent)
