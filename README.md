@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-[![CI](https://github.com/covoyage/covonaut/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/covoyage/covonaut/actions/workflows/ci.yml)
+[![CI](https://github.com/covoyage/covonaut/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/covoyage/covonaut/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/covoyage/covonaut)](https://github.com/covoyage/covonaut/releases/latest) [![Website](https://img.shields.io/badge/website-covonaut-18794e)](https://covoyage.github.io/covonaut/) [![License](https://img.shields.io/github/license/covoyage/covonaut)](LICENSE)
 
 Production-ready Agent framework for Go.
 
