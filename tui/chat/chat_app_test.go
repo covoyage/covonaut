@@ -378,7 +378,78 @@ func TestChatAppBusyIdle(t *testing.T) {
 }
 
 // TestChatAppHorizontalMarginPropagates 验证配置边距同时作用于 layout
+func TestChatAppInterruptClearsExecutionDisplay(t *testing.T) {
+	app, _ := newTestChatApp(t, ChatAppConfig{})
+	app.onAgentStart(AgentStartChatEvent{})
+	app.onMessageDelta(MessageDeltaChatEvent{Delta: "partial"})
+	app.onToolStart(ToolCallStartChatEvent{ToolCall: ToolCallInfo{ID: "fetch", Name: "web_fetch"}})
+	app.PrintStatus("fetching web content...")
+	app.SetThinkingTail("old thinking")
+	app.Interrupt()
+	app.Interrupt()
+	if app.loader.IsRunning() || app.isRunning() || len(app.snapshot().ActiveTools) != 0 {
+		t.Fatal("interrupt left running state active")
+	}
+	messages := app.History().Messages()
+	for _, message := range messages {
+		if message.Pending {
+			t.Fatalf("unfinished message after interrupt: %+v", message)
+		}
+	}
+	if len(messages) != 2 || core.StripAnsi(messages[1].Text) != "cancelled" {
+		t.Fatalf("active tool not cancelled: %+v", messages)
+	}
+	app.Busy("late compaction")
+	app.PrintStatus("late tool status")
+	app.SetThinkingTail("late thinking")
+	app.onMessageDelta(MessageDeltaChatEvent{Delta: "late delta"})
+	app.onToolStart(ToolCallStartChatEvent{ToolCall: ToolCallInfo{ID: "late", Name: "web_fetch"}})
+	app.onToolEnd(ToolCallEndChatEvent{ToolCallID: "fetch", ToolName: "web_fetch", Result: "late result"})
+	if app.loader.IsRunning() || app.isRunning() || len(app.History().Messages()) != 2 {
+		t.Fatal("late event restarted cancelled display")
+	}
+	if rendered := core.StripAnsi(strings.Join(app.loader.Render(80), "\n")); strings.Contains(rendered, "late") || strings.Contains(rendered, "thinking") || strings.Contains(rendered, "fetching") {
+		t.Fatalf("stale loader content: %q", rendered)
+	}
+	app.onAgentEnd(AgentEndChatEvent{})
+	app.onAgentStart(AgentStartChatEvent{})
+	if !app.loader.IsRunning() || !app.isRunning() {
+		t.Fatal("new run did not restart normally")
+	}
+	app.onMessageDelta(MessageDeltaChatEvent{Delta: "new answer"})
+	app.onAgentEnd(AgentEndChatEvent{})
+	messages = app.History().Messages()
+	if len(messages) != 3 || messages[2].Text != "new answer" || messages[2].Pending {
+		t.Fatalf("new run affected by interrupt: %+v", messages)
+	}
+}
+
 // （editor/footer 等）与 history（正文缩进、rail 仍贴窗缘）。
+func TestChatAppInterruptConcurrentUpdates(t *testing.T) {
+	app, _ := newTestChatApp(t, ChatAppConfig{})
+	app.onAgentStart(AgentStartChatEvent{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for attempt := 0; attempt < 100; attempt++ {
+			app.Busy("working")
+			app.PrintStatus("fetching")
+			app.SetThinkingTail("thinking")
+			app.onToolStart(ToolCallStartChatEvent{ToolCall: ToolCallInfo{ID: "racing", Name: "web_fetch"}})
+			app.onToolEnd(ToolCallEndChatEvent{ToolCallID: "racing", ToolName: "web_fetch"})
+		}
+	}()
+	app.Interrupt()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("interrupt deadlocked with status updates")
+	}
+	if app.loader.IsRunning() || app.isRunning() || len(app.snapshot().ActiveTools) != 0 {
+		t.Fatal("concurrent events restarted interrupted display")
+	}
+}
+
 func TestChatAppHorizontalMarginPropagates(t *testing.T) {
 	app, _ := newTestChatApp(t, ChatAppConfig{HorizontalMargin: 2})
 	if app.layout.hMargin != 2 {

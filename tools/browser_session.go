@@ -319,6 +319,11 @@ func (bm *BrowserManager) CreateSession(ctx context.Context, sessionID string, t
 	if bm.config.RecordSessions && bm.config.RecordingDir != "" {
 		session.recorder = NewCDPRecorder(bm.config.RecordingDir)
 	}
+	if err := session.startNetworkCapture(bm.config.NetworkObservation); err != nil {
+		if bm.config.NetworkObservation.OnError != nil {
+			bm.config.NetworkObservation.OnError(err)
+		}
+	}
 
 	bm.sessions[sessionID] = session
 	bm.activeSession = sessionID

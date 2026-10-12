@@ -580,6 +580,7 @@ const (
 
 type BrowserConfig struct {
 	Headless            bool
+	NetworkObservation  *BrowserNetworkConfig
 	AllowPrivate        bool
 	CommandTimeout      time.Duration
 	CDPURL              string

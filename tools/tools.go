@@ -109,8 +109,9 @@ func (c *ExtensionConfig) setDefaults() {
 
 // Extension is a covonaut Extension that registers built-in filesystem and shell tools.
 type Extension struct {
-	config ExtensionConfig
-	tools  []*agentcore.Tool
+	config         ExtensionConfig
+	tools          []*agentcore.Tool
+	browserManager *BrowserManager
 }
 
 // NewExtension creates a new built-in tools extension with the given configuration.
@@ -124,13 +125,25 @@ func (e *Extension) Name() string { return "builtin-tools" }
 
 // Init initializes the extension and registers all tools with the agent.
 func (e *Extension) Init(_ context.Context, agent *agentcore.Agent) error {
-	e.tools = BuildTools(e.config)
+	cfg := e.config
+	cfg.Browser = nil
+	e.tools = BuildTools(cfg)
+	if e.config.Browser != nil {
+		browser, manager := newBrowserTool(e.config.Browser)
+		e.browserManager = manager
+		e.tools = append(e.tools, browser)
+	}
 	agent.RegisterTools(e.tools...)
 	return nil
 }
 
 // Dispose tears down the extension.
-func (e *Extension) Dispose() error { return nil }
+func (e *Extension) Dispose() error {
+	if e.browserManager != nil {
+		e.browserManager.CloseAll()
+	}
+	return nil
+}
 
 // Tools returns the tools managed by this extension.
 func (e *Extension) Tools() []*agentcore.Tool { return e.tools }

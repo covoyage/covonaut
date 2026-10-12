@@ -13,13 +13,19 @@ import (
 )
 
 func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
+	tool, _ := newBrowserTool(cfg)
+	return tool
+}
+
+func newBrowserTool(cfg *BrowserToolConfig) (*agentcore.Tool, *BrowserManager) {
 	if cfg == nil {
 		cfg = &BrowserToolConfig{}
 	}
 	cfg.defaults()
 
-	defaultBrowserManager = NewBrowserManager(&BrowserConfig{
+	defaultBrowserManager := NewBrowserManager(&BrowserConfig{
 		Headless:            cfg.Headless,
+		NetworkObservation:  cfg.NetworkObservation,
 		AllowPrivate:        cfg.AllowPrivate,
 		CommandTimeout:      cfg.CommandTimeout,
 		CDPURL:              cfg.CDPURL,
@@ -923,7 +929,7 @@ func NewBrowserTool(cfg *BrowserToolConfig) *agentcore.Tool {
 				return nil, fmt.Errorf("unknown browser action: %s. Valid actions: navigate, snapshot, click, type, scroll, back, press, screenshot, evaluate, dialog, vision, console, cdp, get_images", input.Action)
 			}
 		},
-	}
+	}, defaultBrowserManager
 }
 
 func cdpParamsToJSON(params map[string]interface{}) string {

@@ -44,6 +44,34 @@ a sandbox and enforce permissions outside the model. Only expose tools needed
 for the task.
 :::
 
+## Browser Network Observation
+
+`BrowserToolConfig.NetworkObservation` optionally accepts a `BrowserNetworkConfig`
+with `AllowURL`, `OnExchange`, and `OnError` callbacks. It is disabled by default.
+The browser installs Network observation on the same CDP target used by its tool
+instance before ordinary navigation. No additional target HTTP requests are sent.
+Redirect hops are emitted separately; incomplete request headers, missing post
+data, unavailable response bodies, and failed loads retain explicit flags.
+
+`AllowURL` runs synchronously on the event path and must return promptly without
+calling browser commands. `OnExchange` and `OnError` run on a serial worker and
+must also return promptly. Exchanges can contain sensitive original headers and
+bodies: the host owns authorization, redaction, retention, and persistence. This
+interface does not enforce network destinations or grant replay permission.
+
+Limits are 128 in-flight records, 64 queued completions, 2,000 header bytes,
+4,000 request-body bytes, and 8,000 returned response bytes, with bounded CDP
+buffers. Overflow and unfinished work at shutdown are reported through `OnError`;
+always configure this callback when completeness matters. Slow callbacks can
+cause loss. Unsupported non-CDP backends and Network enablement failures report
+errors without claiming observation succeeded. Separate popup targets, independent
+workers, and traffic issued before observation starts are not guaranteed.
+
+Built-in tool instances use independent browser managers. `tools.Extension.Dispose`
+closes its owned sessions; manually constructed `BrowserManager` instances must
+be closed by their owner. Local Chrome is covered by integration tests; other
+CDP backends require compatible Network event and body APIs.
+
 ## Extensions and Hooks
 
 ### Execution Order

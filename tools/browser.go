@@ -127,6 +127,7 @@ func init() {
 
 type BrowserToolConfig struct {
 	Headless            bool
+	NetworkObservation  *BrowserNetworkConfig
 	AllowPrivate        bool
 	CommandTimeout      time.Duration
 	CDPURL              string

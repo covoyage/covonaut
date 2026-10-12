@@ -203,6 +203,7 @@ func (l DisplayLimits) withDefaults() DisplayLimits {
 var ghostGeneration atomic.Int64
 
 type chatModel struct {
+		Interrupted bool
 	StreamID       string
 	AttemptID      string
 	ActiveTools    map[string]time.Time
@@ -211,6 +212,7 @@ type chatModel struct {
 }
 
 type ChatApp struct {
+		activityMu sync.Mutex
 	cfg ChatAppConfig
 
 	host      AppHost
@@ -563,6 +565,14 @@ func (a *ChatApp) PrintUser(input string) {
 }
 
 func (a *ChatApp) Busy(message string) {
+	a.activityMu.Lock()
+	defer a.activityMu.Unlock()
+	a.mu.Lock()
+	interrupted := a.model.Interrupted
+	a.mu.Unlock()
+	if interrupted {
+		return
+	}
 	if message != "" {
 		a.loader.SetMessage(theme.CurrentPalette().Dim.Render(message))
 	}
@@ -579,6 +589,12 @@ func (a *ChatApp) Busy(message string) {
 }
 
 func (a *ChatApp) Idle() {
+	a.activityMu.Lock()
+	defer a.activityMu.Unlock()
+	a.idle()
+}
+
+func (a *ChatApp) idle() {
 	a.loader.Stop()
 	a.mu.Lock()
 	a.model.Running = false
@@ -589,6 +605,26 @@ func (a *ChatApp) Idle() {
 	}
 	a.editor.SetPlaceholder(a.idlePlaceholder())
 	a.host.RequestRender()
+}
+
+func (a *ChatApp) Interrupt() {
+	a.activityMu.Lock()
+	defer a.activityMu.Unlock()
+	a.mu.Lock()
+	a.model.Interrupted = true
+	a.finalizeStreamLocked()
+	for id := range a.model.ActiveTools {
+		a.history.PatchMessage("tool-"+id, func(message *ChatMessage) {
+			message.Text = theme.CurrentPalette().Dim.Render("cancelled")
+			message.Pending = false
+		})
+	}
+	clear(a.model.ActiveTools)
+	clear(a.model.ActiveToolArgs)
+	a.mu.Unlock()
+	a.loader.SetMessage("")
+	a.loader.SetTicker("")
+	a.idle()
 }
 
 func (a *ChatApp) idlePlaceholder() string {
@@ -613,6 +649,14 @@ func (a *ChatApp) busyPlaceholder() string {
 }
 
 func (a *ChatApp) PrintStatus(message string) {
+	a.activityMu.Lock()
+	defer a.activityMu.Unlock()
+	a.mu.Lock()
+	interrupted := a.model.Interrupted
+	a.mu.Unlock()
+	if interrupted && message != "" {
+		return
+	}
 	a.loader.SetMessage(theme.CurrentPalette().Dim.Render(message))
 	a.host.RequestRender()
 }
@@ -621,6 +665,14 @@ func (a *ChatApp) PrintStatus(message string) {
 // 数据来自 thinking delta 流：Loader 只存最新文本并贴尾截取，滚动感
 // 由内容增长自然产生，动画帧负责刷新节拍。
 func (a *ChatApp) SetThinkingTail(text string) {
+	a.activityMu.Lock()
+	defer a.activityMu.Unlock()
+	a.mu.Lock()
+	interrupted := a.model.Interrupted
+	a.mu.Unlock()
+	if interrupted && text != "" {
+		return
+	}
 	a.loader.SetTicker(text)
 }
 
@@ -759,6 +811,7 @@ func (a *ChatApp) onAgentStart(e ChatEvent) {
 		return
 	}
 	a.mu.Lock()
+	a.model.Interrupted = false
 	a.model.StreamID = ""
 	a.model.AttemptID = ""
 	a.mu.Unlock()
@@ -776,6 +829,9 @@ func (a *ChatApp) onMessageDelta(e ChatEvent) {
 	// and both append to the same baseline — corrupting the stream.
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.model.Interrupted {
+		return
+	}
 	if a.model.AttemptID != "" && d.AttemptID != "" && a.model.AttemptID != d.AttemptID {
 		a.finalizeStreamLocked()
 	}
@@ -811,7 +867,13 @@ func (a *ChatApp) onToolStart(e ChatEvent) {
 	if !ok {
 		return
 	}
+	a.activityMu.Lock()
+	defer a.activityMu.Unlock()
 	a.mu.Lock()
+	if a.model.Interrupted {
+		a.mu.Unlock()
+		return
+	}
 	a.model.ActiveTools[tc.ToolCall.ID] = time.Now()
 	a.model.ActiveToolArgs[tc.ToolCall.ID] = tc.ToolCall.Arguments
 	a.finalizeStreamLocked()
@@ -830,7 +892,13 @@ func (a *ChatApp) onToolEnd(e ChatEvent) {
 	if !ok {
 		return
 	}
+	a.activityMu.Lock()
+	defer a.activityMu.Unlock()
 	a.mu.Lock()
+	if a.model.Interrupted {
+		a.mu.Unlock()
+		return
+	}
 	delete(a.model.ActiveTools, tc.ToolCallID)
 	args := a.model.ActiveToolArgs[tc.ToolCallID]
 	delete(a.model.ActiveToolArgs, tc.ToolCallID)
