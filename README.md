@@ -737,6 +737,19 @@ Provider responses preserve block structure on output via `ProviderResponse.Bloc
 including streaming aggregation, and the agent persists assistant blocks into `Message.Blocks`
 alongside the legacy `Content` string.
 
+## ARD Resource Discovery
+
+The optional `ard` package supports ARD v0.91 resource descriptions, JSON-LD
+validation, manifest publishing, web discovery, Registry search/pagination,
+and explicit bounded referrals. Its read-only Agent Extension searches
+application-configured registries. Resource use requires separate application
+authorization; discovery never launches MCP commands or installs Skills.
+No Registry server is included.
+
+Run the offline example with `go run ./example/ard`. See the
+[ARD guide](https://covoyage.github.io/covonaut/integrations/ard) and
+[package README](ard/README.md) for scope, network policy, and MCP/A2A adapters.
+
 ## A2A Protocol (Agent-to-Agent)
 
 Interoperate with any A2A-compliant agent — including Google ADK agents.

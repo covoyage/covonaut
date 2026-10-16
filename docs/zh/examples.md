@@ -51,6 +51,7 @@ go run ./example/tui-demo3
 | 命令 | 演示 | 凭据 |
 | --- | --- | --- |
 | `go run ./example/recovery` | 中断、检查点、恢复、继续 | 无 |
+| `go run ./example/ard` | ARD 清单发布、发现与只读搜索工具 | 无 |
 | `go run ./example/orchestration` | 类型图、Pipeline／Router、流聚合 | 无 |
 | `go run ./example/http-server` | 认证 HTTP、持久化线程 | 模型密钥／名称和 API token |
 

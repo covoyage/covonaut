@@ -710,6 +710,15 @@ msg := agentcore.Message{
 模型返回的内容块保存在 `ProviderResponse.Blocks` 中，流式回复也会按同样的结构汇总。
 Agent 会将它们写入助手消息的 `Message.Blocks`，同时保留 `Content` 字符串，兼容只处理文本的代码。
 
+## ARD 资源发现
+
+可选的 `ard` 包支持 ARD v0.91 资源描述、JSON-LD 校验、清单发布、网页发现、Registry 搜索与分页，
+以及显式有界的转介遍历。只读 Agent 扩展只搜索应用配置的 Registry；实际使用资源需要应用另行授权，
+发现过程不会启动 MCP 命令或安装 Skill，也不包含 Registry 服务端。
+
+运行 `go run ./example/ard` 可体验离线示例。支持范围、网络策略及 MCP/A2A 接入方式见
+[ARD 指南](https://covoyage.github.io/covonaut/zh/integrations/ard)和[包说明](ard/README.md)。
+
 ## A2A 协议（Agent-to-Agent）
 
 通过 A2A，可以把本地 Agent 发布为服务，也可以调用远程 Agent，包括使用 Google ADK 构建的 Agent。

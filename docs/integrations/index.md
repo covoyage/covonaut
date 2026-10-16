@@ -6,6 +6,7 @@ The protocols cover different boundaries and are not interchangeable.
 | --- | --- | --- |
 | MCP | External tools into an agent | [MCP guide](./mcp) |
 | A2A | Agent discovery and remote task execution | [A2A guide](./a2a) |
+| ARD | Resource publishing, discovery, and Registry search | [ARD guide](./ard) |
 | ACP | Editor/client agent sessions | [ACP guide](./acp) |
 | AG-UI | Execution events to a web client | [AG-UI guide](./agui) |
 | A2UI | Declarative UI structure and state | [A2UI guide](./a2ui) |

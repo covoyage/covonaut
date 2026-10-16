@@ -27,6 +27,7 @@
 | [tui](https://pkg.go.dev/github.com/covoyage/covonaut/tui) | 终端引擎 |
 | [mcp](https://pkg.go.dev/github.com/covoyage/covonaut/mcp) | 客户端和工具扩展 |
 | [a2a](https://pkg.go.dev/github.com/covoyage/covonaut/a2a) | 远程 Agent 发现和任务管理 |
+| [ard](https://pkg.go.dev/github.com/covoyage/covonaut/ard) | ARD 资源发布、发现与搜索 |
 | [acp](https://pkg.go.dev/github.com/covoyage/covonaut/acp) | 编辑器与 Agent 的会话通信 |
 | [agui](https://pkg.go.dev/github.com/covoyage/covonaut/agui) | 向 Web 客户端传输执行事件 |
 | [a2ui](https://pkg.go.dev/github.com/covoyage/covonaut/a2ui) | 声明式界面、数据绑定与传输适配 |

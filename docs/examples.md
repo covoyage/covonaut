@@ -62,6 +62,7 @@ for its configuration and behavior.
 | Command | What it demonstrates | Credentials |
 | --- | --- | --- |
 | `go run ./example/recovery` | Interrupt, checkpoint, restore, resume | None |
+| `go run ./example/ard` | ARD publishing, discovery, and a read-only search tool | None |
 | `go run ./example/orchestration` | Typed graph, pipeline/router, stream aggregation | None |
 | `go run ./example/http-server` | Authenticated local HTTP chat with persisted threads | Provider key/model and local API token |
 

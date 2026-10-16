@@ -55,6 +55,7 @@ const config = defineConfig({
         { text: 'HTTP API', link: '/integrations/http' },
         { text: 'MCP', link: '/integrations/mcp' },
         { text: 'A2A', link: '/integrations/a2a' },
+        { text: 'ARD', link: '/integrations/ard' },
         { text: 'ACP', link: '/integrations/acp' },
         { text: 'AG-UI', link: '/integrations/agui' },
         { text: 'A2UI', link: '/integrations/a2ui' }
@@ -121,6 +122,7 @@ const labels: Record<string, string> = {
   'HTTP API': 'HTTP API',
   'MCP': 'MCP',
   'A2A': 'A2A',
+  'ARD': 'ARD',
   'ACP': 'ACP',
   'AG-UI': 'AG-UI',
   'A2UI': 'A2UI',

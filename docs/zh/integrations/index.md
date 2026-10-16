@@ -6,6 +6,7 @@
 | --- | --- | --- |
 | MCP | 向 Agent 导入外部工具 | [MCP](./mcp) |
 | A2A | Agent 发现和远程任务 | [A2A](./a2a) |
+| ARD | 资源发布、发现与 Registry 搜索 | [ARD](./ard) |
 | ACP | 编辑器／客户端会话 | [ACP](./acp) |
 | AG-UI | 向 Web 客户端发送执行事件 | [AG-UI](./agui) |
 | A2UI | 描述界面结构及数据更新 | [A2UI](./a2ui) |

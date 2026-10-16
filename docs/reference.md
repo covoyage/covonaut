@@ -29,6 +29,7 @@ installed dependency.
 | [tui](https://pkg.go.dev/github.com/covoyage/covonaut/tui) | Terminal UI engine |
 | [mcp](https://pkg.go.dev/github.com/covoyage/covonaut/mcp) | MCP clients and tool extensions |
 | [a2a](https://pkg.go.dev/github.com/covoyage/covonaut/a2a) | Remote agent tasks and discovery |
+| [ard](https://pkg.go.dev/github.com/covoyage/covonaut/ard) | ARD resource publishing, discovery, and search |
 | [acp](https://pkg.go.dev/github.com/covoyage/covonaut/acp) | Session-based communication |
 | [agui](https://pkg.go.dev/github.com/covoyage/covonaut/agui) | UI execution events |
 | [a2ui](https://pkg.go.dev/github.com/covoyage/covonaut/a2ui) | Declarative UI surfaces and data binding |
