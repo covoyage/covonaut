@@ -47,21 +47,27 @@ func ParseSGR(params string, base Style) Style {
 		// ESC[m is equivalent to ESC[0m.
 		return DefaultStyle
 	}
-	// Normalise ':' to ';' so we can split on a single delimiter. The colon
-	// form (ITU T.416) is semantically richer but the subset we accept
-	// (38:5:n and 38:2:r:g:b) maps cleanly to the semicolon form.
-	normalised := strings.ReplaceAll(params, ":", ";")
-	parts := strings.Split(normalised, ";")
+	// The colon form (ITU T.416) is semantically richer than the semicolon
+	// form: "38:2::r:g:b" carries a colorspace ID that the semicolon form
+	// "38;2;r;g;b" does not. Split on both delimiters and remember which
+	// values came from a colon group, so the colorspace field can be told
+	// apart from a plain colour channel later. (An empty field means 0,
+	// matching the semicolon normalisation.)
+	parts := strings.Split(params, ";")
 	nums := make([]int, 0, len(parts))
+	colon := make([]bool, 0, len(parts))
 	for _, p := range parts {
-		if p == "" {
-			nums = append(nums, 0)
-			continue
+		isColon := strings.Contains(p, ":")
+		for _, q := range strings.Split(p, ":") {
+			if q == "" {
+				nums = append(nums, 0)
+			} else {
+				nums = append(nums, atoiSafe(q))
+			}
+			colon = append(colon, isColon)
 		}
-		n := atoiSafe(p)
-		nums = append(nums, n)
 	}
-	applySGR(nums, &out)
+	applySGR(nums, colon, &out)
 	return out
 }
 
@@ -80,16 +86,16 @@ func atoiSafe(s string) int {
 	return n
 }
 
-func applySGR(nums []int, s *Style) {
+func applySGR(nums []int, colon []bool, s *Style) {
 	for i := 0; i < len(nums); {
-		i = applyOneSGR(nums, i, s)
+		i = applyOneSGR(nums, colon, i, s)
 	}
 }
 
 // applyOneSGR applies one SGR code starting at index i and returns the
 // index of the next code to process. Multi-parameter codes (38/48) consume
 // their arguments.
-func applyOneSGR(nums []int, i int, s *Style) int {
+func applyOneSGR(nums []int, colon []bool, i int, s *Style) int {
 	code := nums[i]
 	switch {
 	case code == 0:
@@ -138,7 +144,7 @@ func applyOneSGR(nums []int, i int, s *Style) int {
 		s.Fg = Palette(uint8(code - 30))
 		return i + 1
 	case code == 38:
-		return applyExtended(nums, i, &s.Fg)
+		return applyExtended(nums, colon, i, &s.Fg)
 	case code == 39:
 		s.Fg = ColorDefault
 		return i + 1
@@ -146,7 +152,7 @@ func applyOneSGR(nums []int, i int, s *Style) int {
 		s.Bg = Palette(uint8(code - 40))
 		return i + 1
 	case code == 48:
-		return applyExtended(nums, i, &s.Bg)
+		return applyExtended(nums, colon, i, &s.Bg)
 	case code == 49:
 		s.Bg = ColorDefault
 		return i + 1
@@ -166,7 +172,7 @@ func applyOneSGR(nums []int, i int, s *Style) int {
 
 // applyExtended handles 38;5;n (256-color) and 38;2;r;g;b (truecolor),
 // returning the next index to process. Same form for bg via the 48 prefix.
-func applyExtended(nums []int, i int, c *Color) int {
+func applyExtended(nums []int, colon []bool, i int, c *Color) int {
 	// Need at least one more parameter (the sub-mode 5 or 2).
 	if i+1 >= len(nums) {
 		return i + 1
@@ -181,13 +187,17 @@ func applyExtended(nums []int, i int, c *Color) int {
 		return i + 3
 	case 2:
 		// 38;2;r;g;b — truecolor. The ITU T.416 colon form
-		// (38:2:CS:r:g:b) carries a colorspace ID; when normalised to
-		// semicolons it becomes 38;2;CS;r;g;b (6 params). Detect by
-		// parameter count: if there are 4 values after the sub-mode, the
-		// first is the colorspace ID and must be skipped.
+		// (38:2:CS:r:g:b) carries a colorspace ID that the semicolon
+		// form does not, so a colon-written spec has one extra leading
+		// value to skip.
+		//
+		// The extra value must be detected from the delimiter, not from
+		// the parameter count: a count heuristic cannot tell a
+		// colorspace ID from the red channel of a following
+		// 48;2;... background, and would then read the background's
+		// "48" as the blue channel — losing the background entirely.
 		base := i + 2
-		// 4 trailing values (base..base+3) ⇒ leading one is colorspace.
-		if base+3 < len(nums) {
+		if colon[i] && base+3 < len(nums) {
 			base++
 		}
 		if base+2 >= len(nums) {

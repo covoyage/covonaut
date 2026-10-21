@@ -89,6 +89,111 @@ func TestParseSGRTruecolorColon(t *testing.T) {
 	}
 }
 
+func TestParseSGRTruecolorForegroundAndBackground(t *testing.T) {
+	// A truecolor foreground followed by a truecolor background in the
+	// same sequence. The background must survive: a parser that mistakes
+	// the background's "48" for the foreground's blue channel also drops
+	// the background, which silently renders styled text unreadable.
+	s := ParseSGR("1;38;2;26;26;26;48;2;212;168;67", DefaultStyle)
+	if !s.Fg.IsRGB() {
+		t.Fatalf("fg = %+v, want RGB", s.Fg)
+	}
+	r, g, b := s.Fg.RGBComponents()
+	if r != 26 || g != 26 || b != 26 {
+		t.Fatalf("fg rgb = %d,%d,%d, want 26,26,26", r, g, b)
+	}
+	if !s.Bg.IsRGB() {
+		t.Fatalf("bg = %+v, want RGB", s.Bg)
+	}
+	r, g, b = s.Bg.RGBComponents()
+	if r != 212 || g != 168 || b != 67 {
+		t.Fatalf("bg rgb = %d,%d,%d, want 212,168,67", r, g, b)
+	}
+	if s.Attrs&AttrBold == 0 {
+		t.Fatal("bold should be set")
+	}
+	if s.Attrs&AttrDim != 0 {
+		t.Fatal("dim should not be set")
+	}
+}
+
+func TestParseSGRTruecolorBackgroundThenForeground(t *testing.T) {
+	// Same as above with the background first.
+	s := ParseSGR("1;48;2;212;168;67;38;2;26;26;26", DefaultStyle)
+	if !s.Fg.IsRGB() {
+		t.Fatalf("fg = %+v, want RGB", s.Fg)
+	}
+	r, g, b := s.Fg.RGBComponents()
+	if r != 26 || g != 26 || b != 26 {
+		t.Fatalf("fg rgb = %d,%d,%d, want 26,26,26", r, g, b)
+	}
+	if !s.Bg.IsRGB() {
+		t.Fatalf("bg = %+v, want RGB", s.Bg)
+	}
+	r, g, b = s.Bg.RGBComponents()
+	if r != 212 || g != 168 || b != 67 {
+		t.Fatalf("bg rgb = %d,%d,%d, want 212,168,67", r, g, b)
+	}
+}
+
+func TestParseSGRTruecolorForegroundAlone(t *testing.T) {
+	s := ParseSGR("38;2;26;26;26", DefaultStyle)
+	if !s.Fg.IsRGB() {
+		t.Fatalf("fg = %+v, want RGB", s.Fg)
+	}
+	r, g, b := s.Fg.RGBComponents()
+	if r != 26 || g != 26 || b != 26 {
+		t.Fatalf("fg rgb = %d,%d,%d, want 26,26,26", r, g, b)
+	}
+	if !s.Bg.IsDefault() {
+		t.Fatalf("bg = %+v, want default", s.Bg)
+	}
+}
+
+func TestParseSGRTruecolorBackgroundAlone(t *testing.T) {
+	s := ParseSGR("48;2;212;168;67", DefaultStyle)
+	if !s.Bg.IsRGB() {
+		t.Fatalf("bg = %+v, want RGB", s.Bg)
+	}
+	r, g, b := s.Bg.RGBComponents()
+	if r != 212 || g != 168 || b != 67 {
+		t.Fatalf("bg rgb = %d,%d,%d, want 212,168,67", r, g, b)
+	}
+	if !s.Fg.IsDefault() {
+		t.Fatalf("fg = %+v, want default", s.Fg)
+	}
+}
+
+func TestParseSGRTruecolorColonForegroundAndBackground(t *testing.T) {
+	// Colon form carries a colorspace ID; it must still skip exactly one
+	// value, and a following background must survive.
+	s := ParseSGR("1;38:2::26:26:26;48;2;212;168;67", DefaultStyle)
+	if !s.Fg.IsRGB() {
+		t.Fatalf("fg = %+v, want RGB", s.Fg)
+	}
+	r, g, b := s.Fg.RGBComponents()
+	if r != 26 || g != 26 || b != 26 {
+		t.Fatalf("fg rgb = %d,%d,%d, want 26,26,26", r, g, b)
+	}
+	if !s.Bg.IsRGB() {
+		t.Fatalf("bg = %+v, want RGB", s.Bg)
+	}
+	r, g, b = s.Bg.RGBComponents()
+	if r != 212 || g != 168 || b != 67 {
+		t.Fatalf("bg rgb = %d,%d,%d, want 212,168,67", r, g, b)
+	}
+}
+
+func TestParseSGR256ForegroundAndBackground(t *testing.T) {
+	s := ParseSGR("1;38;5;234;48;5;179", DefaultStyle)
+	if s.Fg.PaletteIndex() != 234 {
+		t.Fatalf("fg = %+v, want palette 234", s.Fg)
+	}
+	if s.Bg.PaletteIndex() != 179 {
+		t.Fatalf("bg = %+v, want palette 179", s.Bg)
+	}
+}
+
 func TestParseSGRDefaultColors(t *testing.T) {
 	s := ParseSGR("31;42;1", DefaultStyle)
 	s = ParseSGR("39;49", s)
