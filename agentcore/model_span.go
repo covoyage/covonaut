@@ -2,6 +2,7 @@ package agentcore
 
 import (
 	"context"
+	"strings"
 )
 
 // NewModelSpanMiddleware wraps every provider call in a "model" component span
@@ -91,20 +92,53 @@ func (m *modelSpanMiddleware) Stream(ctx context.Context, req *ProviderRequest) 
 		return m.inner.Stream(ctx, req)
 	}
 	ctx, span, _ := StartComponentRun(ctx, m.tracer, "model", req.Model, modelRequestAttrs(req)...)
+	ctx, cancel := context.WithCancel(ctx)
+	started := false
+	defer func() {
+		if !started {
+			cancel()
+			span.End()
+		}
+	}()
 	stream, err := m.inner.Stream(ctx, req)
 	if err != nil {
+		cancel()
 		span.RecordError(err)
-		span.End()
 		return stream, err
 	}
 
 	out := make(chan StreamDelta)
 	go func() {
 		defer close(out)
+		defer cancel()
 		defer span.End()
 		var usage *TokenUsage
-		var finishReason, content string
-		for delta := range stream {
+		var finishReason string
+		var content strings.Builder
+		var terminalErr error
+		defer func() {
+			if terminalErr == nil {
+				terminalErr = ctx.Err()
+			}
+			if terminalErr != nil {
+				span.RecordError(terminalErr)
+			}
+			span.SetAttributes(modelResponseAttrs(req, usage, finishReason, content.String(), genAIPromptFromMessages(req.Messages))...)
+		}()
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			var delta StreamDelta
+			var ok bool
+			select {
+			case <-ctx.Done():
+				return
+			case delta, ok = <-stream:
+			}
+			if !ok {
+				return
+			}
 			if delta.Usage != nil {
 				if usage == nil {
 					usage = &TokenUsage{}
@@ -115,11 +149,23 @@ func (m *modelSpanMiddleware) Stream(ctx context.Context, req *ProviderRequest) 
 				finishReason = delta.FinishReason
 			}
 			if delta.Content != "" {
-				content += delta.Content
+				content.WriteString(delta.Content)
 			}
-			out <- delta
+			if delta.Err != nil {
+				terminalErr = delta.Err
+				select {
+				case out <- delta:
+				case <-ctx.Done():
+				}
+				return
+			}
+			select {
+			case out <- delta:
+			case <-ctx.Done():
+				return
+			}
 		}
-		span.SetAttributes(modelResponseAttrs(req, usage, finishReason, content, genAIPromptFromMessages(req.Messages))...)
 	}()
+	started = true
 	return out, nil
 }

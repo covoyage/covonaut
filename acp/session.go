@@ -279,7 +279,9 @@ func (sm *SessionManager) Cleanup() {
 		if cancel != nil {
 			cancel()
 		}
-		if state.Agent != nil && state.Agent.Core() != nil {
+		if closer, ok := state.Agent.(interface{ Close() }); ok {
+			closer.Close()
+		} else if state.Agent != nil && state.Agent.Core() != nil {
 			state.Agent.Core().Close()
 		}
 		delete(sm.sessions, id)

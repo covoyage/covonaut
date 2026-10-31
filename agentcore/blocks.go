@@ -294,7 +294,7 @@ func (s StructuredCompactionSummary) ToReadableSummary() string {
 	w("Remaining Work", s.RemainingWork)
 	w("Critical Context", s.CriticalContext)
 	if b.Len() == 0 {
-		return "(empty structured summary)"
+		return emptyStructuredSummary
 	}
 	return b.String()
 }

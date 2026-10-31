@@ -38,12 +38,13 @@ func (t *Tool) Definition() ToolDefinition {
 
 // Registry is a thread-safe collection of available tools.
 type Registry struct {
-	mu    sync.RWMutex
-	tools map[string]*Tool
+	mu            sync.RWMutex
+	tools         map[string]*Tool
+	registrations map[string]*toolRegistration
 }
 
 func NewRegistry() *Registry {
-	return &Registry{tools: make(map[string]*Tool)}
+	return &Registry{tools: make(map[string]*Tool), registrations: make(map[string]*toolRegistration)}
 }
 
 func (r *Registry) Register(tools ...*Tool) {
@@ -51,6 +52,7 @@ func (r *Registry) Register(tools ...*Tool) {
 	defer r.mu.Unlock()
 	for _, t := range tools {
 		r.tools[t.Name] = t
+		r.registrations[t.Name] = &toolRegistration{tool: t}
 	}
 }
 
@@ -66,7 +68,7 @@ func (r *Registry) Definitions() []ToolDefinition {
 	defer r.mu.RUnlock()
 	defs := make([]ToolDefinition, 0, len(r.tools))
 	for _, t := range r.tools {
-		defs = append(defs, t.Definition())
+		defs = append(defs, cloneRegisteredTool(t).Definition())
 	}
 	sort.Slice(defs, func(i, j int) bool {
 		return defs[i].Name < defs[j].Name
@@ -79,6 +81,7 @@ func (r *Registry) Unregister(names ...string) {
 	defer r.mu.Unlock()
 	for _, name := range names {
 		delete(r.tools, name)
+		delete(r.registrations, name)
 	}
 }
 

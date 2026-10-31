@@ -231,6 +231,24 @@ cfg.Provider = agentcore.NewModelMetricsMiddleware(cfg.Metrics)(cfg.Provider)
 配置 `Metrics` 后，工具错误和 Agent 执行失败会自动计入 `agentcore.errors`。
 如果还要统计模型的 token 用量、耗时和错误，需要用 `agentcore.NewModelMetricsMiddleware(cfg.Metrics)` 包装 Provider；仅设置 `Config.Metrics` 并不足够。这个中间件也会记录流式输出过程中发生的终止错误。
 
+模型 metrics/span 的流式包装器在接收和转发时都响应取消，在 EOF、终止错误或取消时只收尾一次，并合并实际观察到的用量，包括部分用量；结束后释放自有 Provider context。消费者停止读取时必须取消调用 context，慢消费者只施加背压，不丢帧。忽略取消的 Provider 或自定义包装器仍须自行管理其协程；框架不估算缺失的最终用量。
+
+### 逐步工具注册
+
+模型步骤在选择与准备之前捕获完整本地注册身份，并脱离复制 schema、Hook 和并发属性。替换、移除或重新注册同名工具会使待执行调用返回 `ErrStaleToolRegistration`，相同 schema 或相同 Tool 指针也不会复用旧身份。调度、Hook、中间件、校验和最终分发统一绑定；中间件不能将已审批名称重定向到另一工具。已获得分发准入的调用仍在原实现和 after-hook 上完成。嵌套 `InvokeTool` 继承当前步骤，独立执行器/宿主入口捕获新作用域。中途新增注册须等下一步，结束步骤残留的 context 返回 `ErrToolStepClosed`，不会悄悄采用新注册。
+
+`ToolRegistrationIdentitySupported()` 声明支持该行为；`GetToolForContext`、`ToolDefinitionsForContext` 检查所属步骤，后者包含未直接列给模型的已注册工具；步骤外则检查当前注册表。工具选择仍只是可见性，不新增权限白名单。重试保留原步骤，结束步骤释放其注册视图。Tool 和包装器应在运行前配置；运行中变更须使用注册 API，不能并发直接修改指针。闭包内部状态、可信代码直接调用 Func，以及本地注册表之外的自定义未知工具分发，仍由宿主负责。
+
+### 读取观察与结构化工具失败
+
+宿主可实现 `tools.ReadOperationsSnapshotter` 固定读取后端，并通过 `tools.TextReadObserver` 在线选择/截断前观察成功文本读取的原始字节；目录、媒体与二进制分发不调用该观察器。SDK 不把观察自动视为写权限或 CAS，版本校验和后端策略由宿主负责。
+
+工具错误可显式实现 `agentcore.FailureResultCarrier` 提供结构化失败载荷。执行器、直接 `InvokeTool` 和模型工具消息会将载荷与真实错误一起保留，包括部分修改后的取消；未标记的普通工具错误仍丢弃附带返回值。
+
+### 模型切换准备
+
+`Agent.PreviewModelRequest` 复用正常的上下文转换/工具选择，不调用 Provider 或生命周期 Hook；转换和选择回调仍须遵守自身约定。`CompressorEngine.CompressForTransition` 用于私有切换历史：Provider/JSON 摘要错误会向上传递，结果必须真正缩小，不以丢弃历史作降级；普通压缩语义不变。ACP 重建失败会先返回协议错误，不提前修改模型/模式元数据；可选的 `ContextRebuildable` 传递服务端取消，会话清理优先调用可选的 Agent `Close()`，否则只关闭 core。
+
 ### 事件
 
 订阅事件可以实时接收模型输出和工具执行结果，适合更新聊天界面或记录任务进度。不同事件有各自的 Go 类型：

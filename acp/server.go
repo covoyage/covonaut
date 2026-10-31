@@ -365,9 +365,9 @@ func (s *Server) handleRequest(ctx context.Context, req *JSONRPCRequest) {
 	case "session/cancel":
 		s.handleCancel(req)
 	case "session/set_mode":
-		s.handleSetMode(req)
+		s.handleSetMode(ctx, req)
 	case "session/set_model":
-		s.handleSetModel(req)
+		s.handleSetModel(ctx, req)
 	default:
 		s.logger.Warn("unknown ACP method", "method", req.Method)
 		s.writeError(req.ID, -32601, "Method not found", req.Method)
@@ -681,7 +681,7 @@ func (s *Server) handleCancel(req *JSONRPCRequest) {
 
 }
 
-func (s *Server) handleSetMode(req *JSONRPCRequest) {
+func (s *Server) handleSetMode(ctx context.Context, req *JSONRPCRequest) {
 	var params SetSessionModeParams
 	if req.Params != nil {
 		if err := json.Unmarshal(req.Params, &params); err != nil {
@@ -690,28 +690,28 @@ func (s *Server) handleSetMode(req *JSONRPCRequest) {
 		}
 	}
 
-	if s.sessionMgr.GetSession(params.SessionID) == nil {
+	state := s.sessionMgr.GetSession(params.SessionID)
+	if state == nil {
 		s.writeError(req.ID, -32002, "Session not found", params.SessionID)
 		return
 	}
-
+	if state.IsRunning() {
+		s.writeError(req.ID, -32003, "Session is running", "stop the current run before switching")
+		return
+	}
+	if err := rebuildSessionAgent(ctx, state.Agent, params.ModeID, state.Model); err != nil {
+		s.writeError(req.ID, -32003, "Update mode failed", err.Error())
+		return
+	}
 	if err := s.sessionMgr.UpdateMode(params.SessionID, params.ModeID); err != nil {
 		s.writeError(req.ID, -32003, "Update mode failed", err.Error())
 		return
 	}
 
-	// Rebuild agent so the new mode's system prompt takes effect
-	state := s.sessionMgr.GetSession(params.SessionID)
-	if r, ok := state.Agent.(Rebuildable); ok {
-		if err := r.Rebuild(params.ModeID, state.Model); err != nil {
-			slog.Error("rebuild agent for mode change", "err", err)
-		}
-	}
-
 	s.writeResponse(req.ID, nil)
 }
 
-func (s *Server) handleSetModel(req *JSONRPCRequest) {
+func (s *Server) handleSetModel(ctx context.Context, req *JSONRPCRequest) {
 	var params SetSessionModelParams
 	if req.Params != nil {
 		if err := json.Unmarshal(req.Params, &params); err != nil {
@@ -720,25 +720,36 @@ func (s *Server) handleSetModel(req *JSONRPCRequest) {
 		}
 	}
 
-	if s.sessionMgr.GetSession(params.SessionID) == nil {
+	state := s.sessionMgr.GetSession(params.SessionID)
+	if state == nil {
 		s.writeError(req.ID, -32002, "Session not found", params.SessionID)
 		return
 	}
 
+	if state.IsRunning() {
+		s.writeError(req.ID, -32003, "Session is running", "stop the current run before switching")
+		return
+	}
+	if err := rebuildSessionAgent(ctx, state.Agent, state.Mode, params.ModelID); err != nil {
+		s.writeError(req.ID, -32003, "Update model failed", err.Error())
+		return
+	}
 	if err := s.sessionMgr.UpdateModel(params.SessionID, params.ModelID); err != nil {
 		s.writeError(req.ID, -32003, "Update model failed", err.Error())
 		return
 	}
 
-	// Rebuild agent so the new model takes effect
-	state := s.sessionMgr.GetSession(params.SessionID)
-	if r, ok := state.Agent.(Rebuildable); ok {
-		if err := r.Rebuild(state.Mode, params.ModelID); err != nil {
-			slog.Error("rebuild agent for model change", "err", err)
-		}
-	}
-
 	s.writeResponse(req.ID, nil)
+}
+
+func rebuildSessionAgent(ctx context.Context, instance AgentInstance, mode, model string) error {
+	if r, ok := instance.(ContextRebuildable); ok {
+		return r.RebuildContext(ctx, mode, model)
+	}
+	if r, ok := instance.(Rebuildable); ok {
+		return r.Rebuild(mode, model)
+	}
+	return nil
 }
 
 func (s *Server) buildModelState(state *sessionState) *SessionModelState {

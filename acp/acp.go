@@ -51,6 +51,12 @@ type Rebuildable interface {
 	Rebuild(mode, model string) error
 }
 
+// ContextRebuildable allows model/mode preparation to stop when the server
+// request context is cancelled. Legacy Rebuildable remains supported.
+type ContextRebuildable interface {
+	RebuildContext(ctx context.Context, mode, model string) error
+}
+
 // FileSystemAware is an optional interface an AgentInstance can implement to
 // route file reads/writes through the ACP client (editor). Set only when the
 // client advertised filesystem capability.

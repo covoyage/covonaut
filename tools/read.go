@@ -19,6 +19,13 @@ type ReadOperations interface {
 	Stat(path string) (os.FileInfo, error)
 }
 
+// Optional interfaces let hosts pin one read backend and observe the exact
+// original bytes used by a successful text read, before slicing/truncation.
+type ReadOperationsSnapshotter interface{ SnapshotReadOperations() ReadOperations }
+type TextReadObserver interface {
+	ObserveTextRead(path string, data []byte, partial bool) error
+}
+
 // DefaultReadOperations uses the local filesystem.
 type DefaultReadOperations struct{}
 
@@ -152,7 +159,14 @@ func NewReadTool(cwd string, cfg *ReadToolConfig) *agentcore.Tool {
 			}
 
 			resolved := resolveReadPath(target, cwd)
-			info, err := cfg.Operations.Stat(resolved)
+			operations := cfg.Operations
+			if pinned, ok := operations.(ReadOperationsSnapshotter); ok {
+				operations = pinned.SnapshotReadOperations()
+			}
+			if operations == nil {
+				return resultErrf("read backend snapshot is unavailable")
+			}
+			info, err := operations.Stat(resolved)
 			if err != nil {
 				return resultErrf("file not found: %s", target)
 			}
@@ -177,8 +191,11 @@ func NewReadTool(cwd string, cfg *ReadToolConfig) *agentcore.Tool {
 				}
 				return result(sb.String(), nil)
 			}
+			if !info.Mode().IsRegular() {
+				return resultErrf("cannot read non-regular file: %s", target)
+			}
 
-			data, err := cfg.Operations.ReadFile(resolved)
+			data, err := operations.ReadFile(resolved)
 			if err != nil {
 				return resultErrf("failed to read file: %w", err)
 			}
@@ -213,16 +230,33 @@ func NewReadTool(cwd string, cfg *ReadToolConfig) *agentcore.Tool {
 			if input.Offset != nil || input.Limit != nil {
 				content = sliceLines(content, input.Offset, input.Limit)
 			}
-			return truncateReadText(content, cfg)
+			return truncateObservedReadText(content, cfg, func(truncated bool) error {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if observer, ok := operations.(TextReadObserver); ok {
+					return observer.ObserveTextRead(resolved, data, truncated || input.Offset != nil || input.Limit != nil)
+				}
+				return nil
+			})
 		},
 	}
 }
 
 func truncateReadText(content string, cfg *ReadToolConfig) (any, error) {
+	return truncateObservedReadText(content, cfg, nil)
+}
+
+func truncateObservedReadText(content string, cfg *ReadToolConfig, observe func(bool) error) (any, error) {
 	truncation := TruncateHead(content, TruncationOptions{
 		MaxLines: int(cfg.MaxLines),
 		MaxBytes: int(cfg.MaxBytes),
 	})
+	if observe != nil {
+		if err := observe(truncation.Truncated); err != nil {
+			return resultErrf("record successful text-read version: %w", err)
+		}
+	}
 	output := truncation.Content
 	if truncation.Truncated {
 		notices := []string{}

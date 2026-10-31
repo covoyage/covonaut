@@ -350,6 +350,10 @@ func (a *Agent) InvokeTool(ctx context.Context, name string, args json.RawMessag
 	tc := ToolCall{Name: name, Arguments: string(args)}
 	result := a.executor.Execute(ctx, tc, a.state)
 	if result.Err != nil {
+		var failure FailureResultCarrier
+		if errors.As(result.Err, &failure) {
+			return result.EffectiveResult(), result.Err
+		}
 		return "", result.Err
 	}
 	return result.EffectiveResult(), nil
@@ -678,10 +682,22 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 	var streamRepeatAttempts int64
 	var textRecoveryAttempts int64
 	var toolRecoveryAttempts int64
+	runCtx := ctx
+	var toolStep *toolRegistrationStep
+	defer func() {
+		if toolStep != nil {
+			toolStep.close()
+		}
+	}()
 
 	for {
 		// Inner loop: process turns until the model stops calling tools
 		for a.state.Status() == StatusRunning {
+			ctx := runCtx
+			if toolStep != nil {
+				toolStep.close()
+				toolStep = nil
+			}
 			turn := a.state.NextTurn()
 
 			if turn-loopStartTurn > a.config.MaxTurns {
@@ -738,40 +754,19 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 
 			a.emit(ctx, &TurnStartEvent{baseEvent: newBase(EventTurnStart), Turn: turn})
 
-			// Build request: TransformContext → ConvertToLLM
-			msgs := a.state.Messages()
-			if tc := a.transformContext(); tc != nil {
-				msgs = tc(ctx, msgs)
-			}
-			converter := a.config.ConvertToLLM
-			if converter == nil {
-				converter = DefaultConvertToLLM
-			}
-			msgs = NormalizeToolCallHistory(converter(msgs))
-
-			allToolDefs := a.registry.Definitions()
-			toolDefs, selectErr := selectToolDefinitions(ctx, a.config.ToolSelection, msgs, allToolDefs)
+			toolStep = a.registry.captureStep()
+			ctx = withToolStep(ctx, toolStep)
+			req, selectErr := a.PreviewModelRequest(ctx, a.state.Messages())
 			if selectErr != nil {
+				if errors.Is(selectErr, context.Canceled) && ctx.Err() != nil {
+					a.state.SetStatus(StatusFinished)
+					a.emit(ctx, &AgentEndEvent{baseEvent: newBase(EventAgentEnd), AgentName: a.config.Name})
+					return "", nil
+				}
 				ne := NewNodeError("tool selection failed", selectErr, a.config.Name, fmt.Sprintf("turn:%d", turn))
 				a.state.SetStatus(StatusError)
 				a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: ne})
 				return "", ne
-			}
-			if a.config.ArtifactOffload != nil && a.config.ArtifactOffload.Store != nil {
-				toolDefs = ensureToolDefinition(toolDefs, allToolDefs, "artifact_read")
-			}
-
-			req := &ProviderRequest{
-				Model:            a.config.Model,
-				Messages:         msgs,
-				Tools:            toolDefs,
-				Temperature:      a.config.Temperature,
-				FrequencyPenalty: a.config.FrequencyPenalty,
-				PresencePenalty:  a.config.PresencePenalty,
-				MaxTokens:        a.config.MaxTokens,
-				ResponseFormat:   a.config.ResponseFormat,
-				Thinking:         a.config.Thinking,
-				FastMode:         a.config.FastMode,
 			}
 
 			// Lifecycle: BeforeModelCall
@@ -791,12 +786,16 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 				// Context overflow: attempt compaction then retry once
 				if IsContextOverflowError(err) && a.config.ContextWindow > 0 {
 					if compErr := a.ForceCompact(ctx); compErr == nil {
-						msgs = a.state.Messages()
-						if tc := a.transformContext(); tc != nil {
-							msgs = tc(ctx, msgs)
+						refreshed, previewErr := a.PreviewModelRequest(ctx, a.state.Messages())
+						if previewErr != nil {
+							if errors.Is(previewErr, context.Canceled) && ctx.Err() != nil {
+								a.state.SetStatus(StatusFinished)
+								a.emit(ctx, &AgentEndEvent{baseEvent: newBase(EventAgentEnd), AgentName: a.config.Name})
+								return "", nil
+							}
+							return "", previewErr
 						}
-						msgs = NormalizeToolCallHistory(converter(msgs))
-						req.Messages = msgs
+						req.Messages = refreshed.Messages
 						resp, err = a.callProviderWithRetry(ctx, req)
 					}
 				}
@@ -920,6 +919,7 @@ func (a *Agent) runLoop(ctx context.Context) (string, error) {
 					a.emit(ctx, &AgentErrorEvent{baseEvent: newBase(EventAgentError), Err: err})
 					return "", err
 				}
+				toolStep.close()
 				break
 			}
 
@@ -1538,6 +1538,11 @@ func hasInvalidToolCallArgs(calls []ToolCall) bool {
 }
 
 func (a *Agent) executeToolCalls(ctx context.Context, calls []ToolCall) error {
+	if toolStepFromContext(ctx, a.registry) == nil {
+		step := a.registry.captureStep()
+		ctx = withToolStep(ctx, step)
+		defer step.close()
+	}
 	// Lifecycle: BeforeToolExecution
 	if lc := a.lifecycle(); lc != nil {
 		arc := &AgentRunContext{Agent: a, Messages: a.state.Messages(), Turn: a.state.Turn()}
@@ -1609,7 +1614,11 @@ func (a *Agent) executeToolCalls(ctx context.Context, calls []ToolCall) error {
 
 		content := r.Result
 		if r.Err != nil {
-			if errors.Is(r.Err, context.Canceled) {
+			var failure FailureResultCarrier
+			if content != "" && errors.As(r.Err, &failure) {
+				// Explicit structured failures retain completed/unknown effects,
+				// including when cancellation stopped a multi-operation batch.
+			} else if errors.Is(r.Err, context.Canceled) {
 				content = "Tool execution was interrupted"
 			} else if IsInterrupt(r.Err) {
 				content = r.Result

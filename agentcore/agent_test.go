@@ -108,7 +108,7 @@ func TestTransfer_InheritsParentToolsAndExtensions(t *testing.T) {
 			Model:    "stub",
 			Provider: transferProvider,
 		},
-		Tools: []*Tool{parentTool},
+		Tools:     []*Tool{parentTool},
 		Lifecycle: LifecycleChain{parentLifecycle},
 		Handoffs: []HandoffConfig{
 			{
@@ -241,7 +241,7 @@ func TestRateLimitHook_ExceedsLimit(t *testing.T) {
 			Model:    "stub",
 			Provider: provider,
 		},
-		Tools: []*Tool{dummyTool},
+		Tools:     []*Tool{dummyTool},
 		Lifecycle: LifecycleChain{hook},
 		ExecutionConfig: ExecutionConfig{
 			MaxTurns: 10,
@@ -321,7 +321,8 @@ func TestAgent_Close_Idempotent(t *testing.T) {
 }
 
 type hangingStreamProvider struct {
-	ch chan StreamDelta
+	ch      chan StreamDelta
+	started chan struct{}
 }
 
 func (p *hangingStreamProvider) Complete(ctx context.Context, req *ProviderRequest) (*ProviderResponse, error) {
@@ -330,11 +331,14 @@ func (p *hangingStreamProvider) Complete(ctx context.Context, req *ProviderReque
 
 func (p *hangingStreamProvider) Stream(ctx context.Context, req *ProviderRequest) (<-chan StreamDelta, error) {
 	p.ch = make(chan StreamDelta) // intentionally unbuffered and never closed
+	if p.started != nil {
+		close(p.started)
+	}
 	return p.ch, nil
 }
 
 func TestAgentRun_Streaming_ContextCancellation(t *testing.T) {
-	provider := &hangingStreamProvider{}
+	provider := &hangingStreamProvider{started: make(chan struct{})}
 	agent := New(Config{
 		ModelConfig: ModelConfig{
 			Name:      "test",
@@ -351,7 +355,12 @@ func TestAgentRun_Streaming_ContextCancellation(t *testing.T) {
 		errCh <- err
 	}()
 
-	// Give the goroutine time to enter runStreaming and block on the channel
+	select {
+	case <-provider.started:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("stream never started")
+	}
 	cancel()
 
 	select {
@@ -370,7 +379,7 @@ func TestAgentRun_Streaming_ContextCancellation(t *testing.T) {
 func TestContentSimilar(t *testing.T) {
 	tests := []struct {
 		name  string
-		a, b string
+		a, b  string
 		ratio float64
 		want  bool
 	}{

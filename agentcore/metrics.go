@@ -2,6 +2,7 @@ package agentcore
 
 import (
 	"context"
+	"log/slog"
 	"time"
 )
 
@@ -63,25 +64,62 @@ func (m *modelMetricsMiddleware) Complete(ctx context.Context, req *ProviderRequ
 
 func (m *modelMetricsMiddleware) Stream(ctx context.Context, req *ProviderRequest) (<-chan StreamDelta, error) {
 	start := time.Now()
+	ctx, cancel := context.WithCancel(ctx)
+	started := false
+	defer func() {
+		if !started {
+			cancel()
+		}
+	}()
 	stream, err := m.inner.Stream(ctx, req)
 	if err != nil {
+		cancel()
 		m.metrics.RecordError(ctx, "model", err)
 		return stream, err
 	}
 
 	out := make(chan StreamDelta)
 	go func() {
+		defer close(out)
+		defer cancel()
 		defer func() {
 			// Never let observability panic kill the host process.
 			if r := recover(); r != nil {
-				close(out)
-				return
+				slog.Error("model metrics stream panic", "panic", r)
 			}
-			close(out)
 		}()
 		var usage *TokenUsage
 		var terminalErr error
-		for delta := range stream {
+		finished := false
+		finish := func() {
+			if finished {
+				return
+			}
+			finished = true
+			if terminalErr == nil {
+				terminalErr = ctx.Err()
+			}
+			recordCtx := context.WithoutCancel(ctx)
+			if terminalErr != nil {
+				m.metrics.RecordError(recordCtx, "model", terminalErr)
+			}
+			m.metrics.RecordModelCall(recordCtx, req, usage, start)
+		}
+		defer finish()
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			var delta StreamDelta
+			var ok bool
+			select {
+			case <-ctx.Done():
+				return
+			case delta, ok = <-stream:
+			}
+			if !ok {
+				return
+			}
 			if delta.Usage != nil {
 				if usage == nil {
 					usage = &TokenUsage{}
@@ -90,14 +128,21 @@ func (m *modelMetricsMiddleware) Stream(ctx context.Context, req *ProviderReques
 			}
 			if delta.Err != nil {
 				terminalErr = delta.Err
+				finish()
+				select {
+				case out <- delta:
+				case <-ctx.Done():
+				}
+				return
 			}
-			out <- delta
+			select {
+			case out <- delta:
+			case <-ctx.Done():
+				return
+			}
 		}
-		if terminalErr != nil {
-			m.metrics.RecordError(ctx, "model", terminalErr)
-		}
-		m.metrics.RecordModelCall(ctx, req, usage, start)
 	}()
+	started = true
 	return out, nil
 }
 

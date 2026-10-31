@@ -244,6 +244,45 @@ telemetry with no extra wiring. Wrap `Config.Provider` with
 `agentcore.NewModelMetricsMiddleware(cfg.Metrics)` to count the model layer
 (mid-stream terminal errors, e.g. repetition loops, are counted too).
 
+The model metrics/span streaming wrappers respect cancellation while receiving
+and forwarding deltas, finalize once on EOF, terminal error or cancellation, and
+merge the usage actually observed, including partial usage. They release their
+owned provider contexts on completion. Consumers that stop reading must cancel
+the call context; slow readers apply backpressure without dropped deltas. A
+provider or custom wrapper that ignores cancellation remains responsible for its
+own goroutines. Missing final usage is not estimated.
+
+### Step-scoped tool registrations
+
+Model steps capture complete local registration identities and detached schema/hook/concurrency metadata before selection and preparation. Replacing/removing/re-registering a name makes pending calls return `ErrStaleToolRegistration`, even for identical schemas or the same Tool pointer. Scheduling, hooks, middleware, validation and final dispatch use one binding; middleware cannot redirect an approved name. Already-admitted dispatches finish on their captured implementation and after-hooks. Nested `InvokeTool` calls inherit the step; standalone executor/host entries capture a fresh scope. Newly registered tools wait for the next step, and retained closed-step contexts return `ErrToolStepClosed` instead of silently adopting new registrations.
+
+`ToolRegistrationIdentitySupported()` advertises this behavior. `GetToolForContext` and `ToolDefinitionsForContext` inspect the owning step (the latter includes hidden registered tools); outside a step they inspect the live registry. Tool selection remains visibility, not a new permission whitelist. Retries reuse their original step, and closed steps release their registry view. Configure Tools and wrappers before running; runtime changes must use registration APIs, not concurrent in-place pointer mutation. Function closure state, direct trusted Func calls and custom unknown-tool dispatch outside the local registry remain the host's responsibility.
+
+### Read observations and structured tool failures
+
+Hosts may implement `tools.ReadOperationsSnapshotter` to pin a read backend and
+`tools.TextReadObserver` to observe the successful text read's original bytes
+before windowing/truncation. Directory/media/binary dispatch does not invoke that
+observer. The SDK does not turn the observation into a write permission or CAS;
+the host owns version validation and backend policy.
+
+`agentcore.FailureResultCarrier` is an explicit opt-in for structured payloads on
+failed tool calls. The executor, direct `InvokeTool` and model tool messages keep
+that payload with the real error, including cancellation after partial effects.
+Unmarked tool errors continue to discard incidental return values.
+
+### Model transition preparation
+
+`Agent.PreviewModelRequest` reuses normal context conversion/tool selection
+without dispatching a provider or invoking lifecycle hooks; transform/selection
+callbacks must still respect their own contracts. `CompressorEngine.CompressForTransition`
+supports private transition histories: provider/JSON-summary errors are returned,
+and results must measurably shrink instead of falling back to dropped history.
+Ordinary compaction semantics remain unchanged. ACP rebuild failures now produce
+protocol errors before changing model/mode metadata; optional `ContextRebuildable`
+propagates server cancellation, and session cleanup calls an optional agent
+`Close()` before falling back to closing only its core.
+
 ### Events
 
 Type-safe event bus for real-time observability.

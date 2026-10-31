@@ -3,6 +3,7 @@ package agentcore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -95,6 +96,10 @@ type BlockCarrier interface {
 	ToolText() string
 }
 
+// FailureResultCarrier explicitly preserves a structured failure payload
+// alongside a tool error. Other tool errors retain their existing behavior.
+type FailureResultCarrier interface{ ToolFailureResult() any }
+
 // IsDualOutput returns true when LLM and user outputs differ.
 func (r *ToolResult) IsDualOutput() bool {
 	return r.ForLLM != "" && r.ForLLM != r.Result
@@ -148,7 +153,18 @@ func (e *Executor) buildChain() ExecuteFunc {
 
 // coreExecute looks up the tool, optionally validates arguments, and invokes its Func.
 func (e *Executor) coreExecute(ctx context.Context, tc ToolCall) (string, error) {
-	tool, ok := e.registry.Get(tc.Name)
+	invocation, ok := ctx.Value(toolInvocationContextKey{}).(toolInvocationIdentity)
+	if !ok || invocation.registry != e.registry || invocation.name != tc.Name {
+		return "", fmt.Errorf("%w: middleware changed the admitted tool name", ErrStaleToolRegistration)
+	}
+	step := toolStepFromContext(ctx, e.registry)
+	if step == nil {
+		return "", fmt.Errorf("tool dispatch has no registration step")
+	}
+	tool, ok, bindingErr := step.resolve(tc.Name)
+	if bindingErr != nil {
+		return "", bindingErr
+	}
 	if !ok {
 		if e.config.UnknownToolHandler != nil {
 			return e.config.UnknownToolHandler(ctx, tc)
@@ -196,8 +212,22 @@ func (e *Executor) coreExecute(ctx context.Context, tc ToolCall) (string, error)
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if _, _, err := step.resolve(tc.Name); err != nil {
+		return "", err
+	}
 	result, err := tool.Func(ctx, json.RawMessage(tc.Arguments))
 	if err != nil {
+		var failure FailureResultCarrier
+		if errors.As(err, &failure) {
+			data, encodeErr := json.Marshal(failure.ToolFailureResult())
+			if encodeErr != nil {
+				return "", errors.Join(err, fmt.Errorf("encode tool failure result: %w", encodeErr))
+			}
+			return string(data), fmt.Errorf("tool %s execution failed: %w", tc.Name, err)
+		}
 		// Interrupt signals pass through without wrapping so the result
 		// string and the interrupt error are both preserved.
 		if IsInterrupt(err) {
@@ -247,14 +277,26 @@ func (e *Executor) coreExecute(ctx context.Context, tc ToolCall) (string, error)
 // Execute runs a single tool call: tool-before → global-before → middleware chain → global-after → tool-after.
 func (e *Executor) Execute(ctx context.Context, tc ToolCall, state *AgentState) ToolResult {
 	start := time.Now()
+	if err := ctx.Err(); err != nil {
+		return ToolResult{ToolCallID: tc.ID, ToolName: tc.Name, Err: err}
+	}
+	step := toolStepFromContext(ctx, e.registry)
+	if step == nil {
+		step = e.registry.captureStep()
+		ctx = withToolStep(ctx, step)
+		defer step.close()
+	}
+	tool, hasTool, bindingErr := step.resolve(tc.Name)
+	if bindingErr != nil {
+		return ToolResult{ToolCallID: tc.ID, ToolName: tc.Name, Err: bindingErr, Duration: time.Since(start)}
+	}
+	ctx = context.WithValue(ctx, toolInvocationContextKey{}, toolInvocationIdentity{registry: e.registry, name: tc.Name})
 
 	hc := &HookContext{
 		ToolName:  tc.Name,
 		Arguments: json.RawMessage(tc.Arguments),
 		State:     state,
 	}
-
-	tool, hasTool := e.registry.Get(tc.Name)
 
 	// tool-level before hooks
 	if hasTool {
@@ -322,11 +364,16 @@ func (e *Executor) Execute(ctx context.Context, tc ToolCall, state *AgentState) 
 // ExecuteAll runs multiple tool calls using the configured execution mode,
 // firing optional callbacks in real time for each tool.
 func (e *Executor) ExecuteAll(ctx context.Context, calls []ToolCall, state *AgentState, cb *ExecuteCallbacks) []ToolResult {
+	if toolStepFromContext(ctx, e.registry) == nil {
+		step := e.registry.captureStep()
+		ctx = withToolStep(ctx, step)
+		defer step.close()
+	}
 	switch {
 	case e.config.Mode == ModeParallel && len(calls) > 1:
-		return e.executeRolling(ctx, calls, state, cb, e.poolEligible)
+		return e.executeRolling(ctx, calls, state, cb, func(tc ToolCall) bool { return e.poolEligible(ctx, tc) })
 	case e.config.Mode == ModeMixed && len(calls) > 1:
-		return e.executeRolling(ctx, calls, state, cb, e.parallelSafe)
+		return e.executeRolling(ctx, calls, state, cb, func(tc ToolCall) bool { return e.parallelSafe(ctx, tc) })
 	default:
 		return e.executeSerial(ctx, calls, state, cb)
 	}
@@ -337,8 +384,11 @@ func (e *Executor) ExecuteAll(ctx context.Context, calls []ToolCall, state *Agen
 // tool; undeclared tools join the pool (fail-open) so that "parallel" stays
 // the widest setting. The fail-closed treatment of missing declarations is
 // exclusive to ModeMixed via parallelSafe.
-func (e *Executor) poolEligible(tc ToolCall) bool {
-	tool, ok := e.registry.Get(tc.Name)
+func (e *Executor) poolEligible(ctx context.Context, tc ToolCall) bool {
+	tool, ok, err := toolStepFromContext(ctx, e.registry).resolve(tc.Name)
+	if err != nil {
+		return false
+	}
 	if !ok || tool.ConcurrencySafe == nil {
 		return true
 	}
@@ -348,8 +398,11 @@ func (e *Executor) poolEligible(tc ToolCall) bool {
 // parallelSafe reports whether a call may join the rolling pool in ModeMixed.
 // Fail closed: unknown tools, undeclared tools, and any value other than an
 // explicit true are treated as exclusive.
-func (e *Executor) parallelSafe(tc ToolCall) bool {
-	tool, ok := e.registry.Get(tc.Name)
+func (e *Executor) parallelSafe(ctx context.Context, tc ToolCall) bool {
+	tool, ok, err := toolStepFromContext(ctx, e.registry).resolve(tc.Name)
+	if err != nil {
+		return false
+	}
 	if !ok || tool.ConcurrencySafe == nil {
 		return false
 	}

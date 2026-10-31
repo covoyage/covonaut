@@ -378,6 +378,21 @@ func runCompaction(ctx context.Context, provider Provider, model string, state *
 	}
 
 	resp, err := compProvider.Complete(ctx, summaryReq)
+	strict, _ := ctx.Value(strictCompactionKey{}).(bool)
+	if strict {
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		if err != nil {
+			return 0, fmt.Errorf("strict summary generation failed: %w", err)
+		}
+		if resp == nil {
+			return 0, fmt.Errorf("strict summary generation returned no response")
+		}
+		if strings.TrimSpace(resp.Content) == "" {
+			return 0, fmt.Errorf("strict summary generation returned empty content")
+		}
+	}
 
 	var summaryContent string
 	var summaryFailed bool
@@ -409,6 +424,12 @@ func runCompaction(ctx context.Context, provider Provider, model string, state *
 	var summaryMsg Message
 	if structured && !summaryFailed {
 		sum, perr := parseStructuredCompactionSummary(resp.Content)
+		if strict && perr != nil {
+			return 0, fmt.Errorf("strict summary parsing failed: %w", perr)
+		}
+		if strict && sum.ToReadableSummary() == emptyStructuredSummary {
+			return 0, fmt.Errorf("strict summary has no recognized non-empty fields")
+		}
 		if perr != nil {
 			nDropped := int64(len(turnsToSummarize))
 			summaryContent = fmt.Sprintf(
